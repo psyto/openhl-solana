@@ -56,6 +56,21 @@
 //!                       exhausted. The max_fills cap is the
 //!                       "pagination" response to CU pressure that
 //!                       Chapter 8 walks through.
+//!  11  CreateOracle    — written for Chapter 9 (oracle ingestion)
+//!                       Creates the per-market Oracle PDA at
+//!                       [b"oracle", market], 112 bytes.
+//!  12  SetOraclePrice  — also Chapter 9
+//!                       Writes price + conf + expo into the Oracle
+//!                       account, stamping the current slot. Stand-in
+//!                       for a real Pyth publish — auth is open here
+//!                       on purpose, the chapter flags this as the
+//!                       wrong production posture and what to do
+//!                       instead.
+//!  13  PlaceOrderChecked — also Chapter 9
+//!                       PlaceOrder + (a) oracle staleness check via
+//!                       Clock sysvar, (b) sanity band around the
+//!                       oracle mark price. The first real risk
+//!                       control in the program.
 //!
 //! The entire program is one file on purpose. Splitting it into the usual
 //! `instruction.rs` / `processor.rs` / `state.rs` modules buys nothing
@@ -65,11 +80,12 @@
 #![allow(unexpected_cfgs)] // solana_program::entrypoint! gates on `target_os = "solana"`
 
 use openhl_state::{
-    side, Market, Order, OrderBook, Stats, MARKET_DISCRIMINATOR, ORDER_BOOK_DISCRIMINATOR,
-    ORDER_CAPACITY, STATS_DISCRIMINATOR,
+    side, Market, Oracle, Order, OrderBook, Stats, MARKET_DISCRIMINATOR, ORACLE_DISCRIMINATOR,
+    ORDER_BOOK_DISCRIMINATOR, ORDER_CAPACITY, STATS_DISCRIMINATOR,
 };
 use solana_program::{
     account_info::AccountInfo,
+    clock::Clock,
     entrypoint::ProgramResult,
     hash::hash as sha256,
     instruction::{AccountMeta, Instruction},
@@ -124,6 +140,24 @@ const TOKEN_ACCOUNT_LEN: usize = 165;
 /// Full seed list: `[BOOK_SEED, market_pubkey.as_ref(), &[bump]]`.
 pub const BOOK_SEED: &[u8] = b"book";
 
+/// PDA seed prefix for the per-market price oracle.
+///
+/// Full seed list: `[ORACLE_SEED, market_pubkey.as_ref(), &[bump]]`.
+pub const ORACLE_SEED: &[u8] = b"oracle";
+
+/// How many slots an oracle price may age before it is considered stale.
+///
+/// 25 slots ≈ 10 seconds on mainnet at the current target slot time.
+/// Real perp DEXes typically tune this to the volatility of the underlying;
+/// higher-vol pairs require shorter staleness windows.
+pub const MAX_ORACLE_STALENESS_SLOTS: u64 = 25;
+
+/// Order price must stay within ±SANITY_BAND_BPS basis points of the
+/// oracle mark price. 2000 bps = 20%. A wide band on purpose — Chapter 9
+/// flags that production deployments tune this per-market, often much
+/// tighter.
+pub const SANITY_BAND_BPS: u64 = 2000;
+
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
 
@@ -153,6 +187,9 @@ pub fn process_instruction(
         8 => process_place_order(program_id, accounts, payload),
         9 => process_cancel_order(program_id, accounts, payload),
         10 => process_match(program_id, accounts, payload),
+        11 => process_create_oracle(program_id, accounts, payload),
+        12 => process_set_oracle_price(program_id, accounts, payload),
+        13 => process_place_order_checked(program_id, accounts, payload),
         unknown => {
             msg!("unknown instruction tag: {}", unknown);
             Err(ProgramError::InvalidInstructionData)
@@ -1240,5 +1277,280 @@ fn process_match(
     );
     sol_log_compute_units();
 
+    Ok(())
+}
+
+// =============================================================================
+// Oracle — CreateOracle + SetOraclePrice + PlaceOrderChecked (Chapter 9).
+// =============================================================================
+//
+// Our Oracle account is a stand-in for a real Pyth price account. It carries
+// the same shape (price + conf + expo + publish_slot) and behaves the same
+// way under the staleness check, but is owned by our own program for ease of
+// testing. Chapter 9 walks the differences carefully so the techniques
+// transfer to a real Pyth integration.
+
+const CREATE_ORACLE_PAYLOAD_LEN: usize = 0;
+const SET_ORACLE_PAYLOAD_LEN: usize = 8 + 8 + 4; // price i64 + conf u64 + expo i32
+const PLACE_ORDER_CHECKED_PAYLOAD_LEN: usize = 1 + 8 + 8; // same as PlaceOrder
+
+/// Accounts:
+///   0. `[WRITE, SIGNER]` payer
+///   1. `[]`              market
+///   2. `[WRITE]`         oracle           — PDA at [b"oracle", market]
+///   3. `[]`              system_program
+fn process_create_oracle(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != CREATE_ORACLE_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let payer_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let market_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let oracle_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let system_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !payer_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if market_ai.owner != program_id {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if system_ai.key != &system_program::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    let (expected, bump) =
+        Pubkey::find_program_address(&[ORACLE_SEED, market_ai.key.as_ref()], program_id);
+    if oracle_ai.key != &expected {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let rent = Rent::get()?.minimum_balance(Oracle::LEN);
+    let create_ix = system_instruction::create_account(
+        payer_ai.key,
+        oracle_ai.key,
+        rent,
+        Oracle::LEN as u64,
+        program_id,
+    );
+    invoke_signed(
+        &create_ix,
+        &[payer_ai.clone(), oracle_ai.clone(), system_ai.clone()],
+        &[&[ORACLE_SEED, market_ai.key.as_ref(), &[bump]]],
+    )?;
+
+    let mut data = oracle_ai.try_borrow_mut_data()?;
+    let oracle: &mut Oracle = bytemuck::from_bytes_mut(&mut data[..Oracle::LEN]);
+    oracle.discriminator = ORACLE_DISCRIMINATOR;
+    oracle.bump = bump;
+    oracle._pad0 = [0u8; 7];
+    oracle.market.copy_from_slice(market_ai.key.as_ref());
+    oracle.price = 0;
+    oracle.conf = 0;
+    oracle.expo = 0;
+    oracle._pad1 = [0u8; 4];
+    oracle.publish_slot = 0;
+    oracle._reserved = [0u8; 32];
+
+    msg!("oracle created (bump {})", bump);
+    Ok(())
+}
+
+/// Payload: [price i64 LE][conf u64 LE][expo i32 LE]
+///
+/// Accounts:
+///   0. `[SIGNER]` publisher — open auth in this demo; production would
+///                              pin to a known publisher pubkey
+///   1. `[WRITE]`  oracle    — owned by this program
+///
+/// SECURITY NOTE: in the real world this writer must be authenticated —
+/// either by checking publisher.key against a known Pyth/oracle authority,
+/// or (better) by making the oracle account owned by Pyth itself and
+/// reading it instead of writing it. We intentionally leave auth open
+/// here so the chapter can exercise it; the auth gap is called out in
+/// the chapter and as a per-instruction msg!.
+fn process_set_oracle_price(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != SET_ORACLE_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let price = i64::from_le_bytes(payload[0..8].try_into().expect("8 bytes"));
+    let conf = u64::from_le_bytes(payload[8..16].try_into().expect("8 bytes"));
+    let expo = i32::from_le_bytes(payload[16..20].try_into().expect("4 bytes"));
+
+    let publisher_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let oracle_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    if !publisher_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if oracle_ai.owner != program_id {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if oracle_ai.data_len() != Oracle::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    msg!("set_oracle_price: open-auth publisher = {}", publisher_ai.key);
+
+    let clock = Clock::get()?;
+    let mut data = oracle_ai.try_borrow_mut_data()?;
+    let oracle: &mut Oracle = bytemuck::from_bytes_mut(&mut data[..Oracle::LEN]);
+    if oracle.discriminator != ORACLE_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    oracle.price = price;
+    oracle.conf = conf;
+    oracle.expo = expo;
+    oracle.publish_slot = clock.slot;
+
+    msg!(
+        "set_oracle_price: price={} conf={} expo={} slot={}",
+        price,
+        conf,
+        expo,
+        clock.slot
+    );
+    Ok(())
+}
+
+/// Payload (same as PlaceOrder): [side u8][price u64 LE][size u64 LE]
+///
+/// Accounts:
+///   0. `[SIGNER]` user
+///   1. `[WRITE]`  book
+///   2. `[]`       oracle — must be initialized, must be fresh
+fn process_place_order_checked(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != PLACE_ORDER_CHECKED_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let order_side = payload[0];
+    let price = u64::from_le_bytes(payload[1..9].try_into().expect("8 bytes"));
+    let size = u64::from_le_bytes(payload[9..17].try_into().expect("8 bytes"));
+
+    if order_side != side::BID && order_side != side::ASK {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if price == 0 || size == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let user_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let book_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let oracle_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !user_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if book_ai.owner != program_id || book_ai.data_len() != OrderBook::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if oracle_ai.owner != program_id || oracle_ai.data_len() != Oracle::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // (1) Read the oracle. We hold the borrow only as long as we need
+    // its data, then drop it before mutating the book.
+    let mark: u64;
+    {
+        let oracle_data = oracle_ai.try_borrow_data()?;
+        let oracle: &Oracle = bytemuck::from_bytes(&oracle_data[..Oracle::LEN]);
+        if oracle.discriminator != ORACLE_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        if oracle.price <= 0 {
+            msg!("place_order_checked: oracle has non-positive price");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // (2) Staleness check via Clock sysvar. The check is the whole
+        // reason an oracle pattern works at all — a price you cannot
+        // freshness-check is a price you cannot trust.
+        let clock = Clock::get()?;
+        let age = clock.slot.saturating_sub(oracle.publish_slot);
+        if age > MAX_ORACLE_STALENESS_SLOTS {
+            msg!(
+                "place_order_checked: oracle stale ({} slots, max {})",
+                age,
+                MAX_ORACLE_STALENESS_SLOTS
+            );
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        mark = oracle.price as u64;
+    }
+
+    // (3) Sanity band check. price must lie within ±SANITY_BAND_BPS bps of mark.
+    let band = mark.saturating_mul(SANITY_BAND_BPS) / 10_000;
+    let low = mark.saturating_sub(band);
+    let high = mark.saturating_add(band);
+    if price < low || price > high {
+        msg!(
+            "place_order_checked: price {} outside sanity band [{}, {}] (mark={})",
+            price,
+            low,
+            high,
+            mark
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    msg!(
+        "place_order_checked: side={} price={} size={} mark={} (band ok)",
+        order_side,
+        price,
+        size,
+        mark
+    );
+
+    // (4) From here on, identical to PlaceOrder (Chapter 7): scan for an
+    // empty slot, write the order. Inlined rather than calling
+    // process_place_order so we don't double-pay on validation.
+    let mut data = book_ai.try_borrow_mut_data()?;
+    let book: &mut OrderBook = bytemuck::from_bytes_mut(&mut data[..OrderBook::LEN]);
+    if book.discriminator != ORDER_BOOK_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    let mut chosen_slot: Option<usize> = None;
+    for (i, slot) in book.slots.iter().enumerate() {
+        if slot.size == 0 {
+            chosen_slot = Some(i);
+            break;
+        }
+    }
+    let slot_idx = chosen_slot.ok_or(ProgramError::AccountDataTooSmall)?;
+
+    let order_id = book.next_order_id;
+    book.next_order_id = book.next_order_id.saturating_add(1);
+    book.active_count = book.active_count.saturating_add(1);
+
+    let mut owner = [0u8; 32];
+    owner.copy_from_slice(user_ai.key.as_ref());
+
+    book.slots[slot_idx] = Order {
+        order_id,
+        price,
+        size,
+        owner,
+        side: order_side,
+        _pad: [0u8; 7],
+    };
+
+    msg!(
+        "place_order_checked: placed order_id={} into slot {}",
+        order_id,
+        slot_idx
+    );
     Ok(())
 }

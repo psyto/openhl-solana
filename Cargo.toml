@@ -11,6 +11,7 @@ members = [
     "scripts/deposit",
     "scripts/init-market",
     "scripts/match",
+    "scripts/oracle",
     "scripts/stats",
 ]
 

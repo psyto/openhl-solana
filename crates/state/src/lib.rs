@@ -185,6 +185,48 @@ impl OrderBook {
     pub const LEN: usize = core::mem::size_of::<Self>();
 }
 
+/// Fixed 8-byte tag identifying an `Oracle` account.
+pub const ORACLE_DISCRIMINATOR: [u8; 8] = *b"ORACLE\0\0";
+
+/// Per-market price oracle. Mirrors the shape of a Pyth price account
+/// closely enough that the techniques Chapter 9 teaches transfer
+/// directly — `price` + `conf` + `expo` is exactly Pyth's PriceFeed
+/// surface, and `publish_slot` plays the role of Pyth's
+/// `publish_time`/`prev_publish_time` for staleness detection.
+///
+/// Layout (112 bytes):
+/// ```text
+///   0  | 0x00  discriminator   [u8; 8]   — ORACLE\0\0
+///   8  | 0x08  bump            u8        — PDA bump for [b"oracle", market]
+///   9  | 0x09  _pad0           [u8; 7]
+///  16  | 0x10  market          [u8; 32]  — the market this oracle prices
+///  48  | 0x30  price           i64       — mantissa, signed
+///  56  | 0x38  conf            u64       — confidence interval, same units
+///  64  | 0x40  expo            i32       — base-10 exponent (negative = decimals)
+///  68  | 0x44  _pad1           [u8; 4]
+///  72  | 0x48  publish_slot    u64       — slot when this price was set
+///  80  | 0x50  _reserved       [u8; 32]
+/// 112                                     — total size
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct Oracle {
+    pub discriminator: [u8; 8],
+    pub bump: u8,
+    pub _pad0: [u8; 7],
+    pub market: [u8; 32],
+    pub price: i64,
+    pub conf: u64,
+    pub expo: i32,
+    pub _pad1: [u8; 4],
+    pub publish_slot: u64,
+    pub _reserved: [u8; 32],
+}
+
+impl Oracle {
+    pub const LEN: usize = core::mem::size_of::<Self>();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +279,15 @@ mod tests {
     #[test]
     fn order_book_discriminator_is_human_readable() {
         assert_eq!(&ORDER_BOOK_DISCRIMINATOR, b"BOOK\0\0\0\0");
+    }
+
+    #[test]
+    fn oracle_size_is_112_bytes() {
+        assert_eq!(Oracle::LEN, 112);
+    }
+
+    #[test]
+    fn oracle_discriminator_is_human_readable() {
+        assert_eq!(&ORACLE_DISCRIMINATOR, b"ORACLE\0\0");
     }
 }

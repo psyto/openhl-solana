@@ -1,0 +1,23 @@
+[package]
+name = "oracle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Chapter 9 worked example: drives openhl-core's oracle instructions (CreateOracle, SetOraclePrice). Default action dumps current oracle state so staleness + sanity-band scenarios are observable."
+
+[[bin]]
+name = "oracle"
+path = "src/main.rs"
+
+[dependencies]
+openhl-state = { path = "../../crates/state" }
+openhl-core = { path = "../../programs/openhl-core", features = ["no-entrypoint"] }
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+solana-program = { workspace = true }
+solana-system-interface = { workspace = true }
+bytemuck = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
