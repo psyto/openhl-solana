@@ -37,6 +37,8 @@ use solana_sdk::{
 };
 use solana_system_interface::program as system_program;
 
+use openhl_core::{SPL_TOKEN_PROGRAM_ID, VAULT_AUTH_SEED, VAULT_SEED};
+
 #[derive(Parser, Debug)]
 #[command(name = "vault", version, about)]
 struct Cli {
@@ -56,10 +58,12 @@ struct Cli {
     #[arg(long)]
     manager: Option<String>,
 
+    /// Quote-asset SPL Mint. Required for --init / --deposit / --withdraw.
+    #[arg(long)]
+    mint: Option<String>,
+
     #[arg(long)]
     init: bool,
-    #[arg(long, requires = "init")]
-    mint: Option<String>,
 
     #[arg(long)]
     deposit: bool,
@@ -70,6 +74,11 @@ struct Cli {
     withdraw: bool,
     #[arg(long, requires = "withdraw")]
     shares: Option<u64>,
+
+    /// Depositor's SPL Token Account (source for --deposit, destination
+    /// for --withdraw). Required for both.
+    #[arg(long)]
+    user_token_account: Option<String>,
 
     #[arg(long)]
     update_nav: bool,
@@ -135,6 +144,23 @@ fn main() -> Result<()> {
         send(&client, &payer, ix)?;
     } else if cli.deposit {
         let amount = cli.amount.unwrap();
+        let mint: Pubkey = cli
+            .mint
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--mint required for --deposit"))?
+            .parse()
+            .context("parse --mint")?;
+        let user_token: Pubkey = cli
+            .user_token_account
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--user-token-account required for --deposit"))?
+            .parse()
+            .context("parse --user-token-account")?;
+        let (vault_token_pda, _) = Pubkey::find_program_address(
+            &[VAULT_SEED, market.as_ref(), mint.as_ref()],
+            &program_id,
+        );
+
         let mut data = Vec::with_capacity(1 + 8);
         data.push(20u8);
         data.extend_from_slice(&amount.to_le_bytes());
@@ -145,12 +171,38 @@ fn main() -> Result<()> {
                 AccountMeta::new(vault_pda, false),
                 AccountMeta::new(share_pda, false),
                 AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new_readonly(mint, false),
+                AccountMeta::new(user_token, false),
+                AccountMeta::new(vault_token_pda, false),
+                AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
             ],
             data,
         };
         send(&client, &payer, ix)?;
     } else if cli.withdraw {
         let shares = cli.shares.unwrap();
+        let mint: Pubkey = cli
+            .mint
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--mint required for --withdraw"))?
+            .parse()
+            .context("parse --mint")?;
+        let user_token: Pubkey = cli
+            .user_token_account
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--user-token-account required for --withdraw"))?
+            .parse()
+            .context("parse --user-token-account")?;
+        let (vault_token_pda, _) = Pubkey::find_program_address(
+            &[VAULT_SEED, market.as_ref(), mint.as_ref()],
+            &program_id,
+        );
+        let (vault_auth_pda, _) = Pubkey::find_program_address(
+            &[VAULT_AUTH_SEED, market.as_ref()],
+            &program_id,
+        );
+
         let mut data = Vec::with_capacity(1 + 8);
         data.push(21u8);
         data.extend_from_slice(&shares.to_le_bytes());
@@ -160,6 +212,12 @@ fn main() -> Result<()> {
                 AccountMeta::new_readonly(payer.pubkey(), true),
                 AccountMeta::new(vault_pda, false),
                 AccountMeta::new(share_pda, false),
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new_readonly(mint, false),
+                AccountMeta::new(user_token, false),
+                AccountMeta::new(vault_token_pda, false),
+                AccountMeta::new_readonly(vault_auth_pda, false),
+                AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
             ],
             data,
         };

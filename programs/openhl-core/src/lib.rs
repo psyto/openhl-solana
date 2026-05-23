@@ -2557,9 +2557,14 @@ fn process_create_trading_vault(
 ///
 /// Accounts:
 ///   0. `[WRITE, SIGNER]` depositor (also pays rent for share account if new)
-///   1. `[WRITE]`         vault          — TradingVault PDA
-///   2. `[WRITE]`         share          — VaultShare PDA at [b"vault_share", vault, depositor]
+///   1. `[WRITE]`         vault            — TradingVault PDA
+///   2. `[WRITE]`         share            — VaultShare PDA at [b"vault_share", vault, depositor]
 ///   3. `[]`              system_program
+///   4. `[]`              market           — must match vault.market
+///   5. `[]`              mint             — must match vault.mint
+///   6. `[WRITE]`         depositor_token  — depositor's SPL Token account (source)
+///   7. `[WRITE]`         vault_token      — per-(market, mint) vault PDA (destination)
+///   8. `[]`              token_program
 fn process_vault_deposit(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -2577,6 +2582,11 @@ fn process_vault_deposit(
     let vault_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let share_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let system_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let market_ai = accounts.get(4).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let mint_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let depositor_token_ai = accounts.get(6).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let vault_token_ai = accounts.get(7).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let token_ai = accounts.get(8).ok_or(ProgramError::NotEnoughAccountKeys)?;
 
     if !depositor_ai.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -2587,6 +2597,14 @@ fn process_vault_deposit(
     if system_ai.key != &system_program::ID {
         return Err(ProgramError::IncorrectProgramId);
     }
+    if token_ai.key != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if depositor_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        msg!("vault_deposit: depositor_token not owned by SPL Token");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    verify_vault_token_account(vault_token_ai, market_ai.key, mint_ai.key, program_id)?;
 
     let (expected_share, share_bump) = Pubkey::find_program_address(
         &[VAULT_SHARE_SEED, vault_ai.key.as_ref(), depositor_ai.key.as_ref()],
@@ -2596,40 +2614,52 @@ fn process_vault_deposit(
         return Err(ProgramError::InvalidSeeds);
     }
 
-    // (a) Read current vault state for share math.
-    let mut vault_data = vault_ai.try_borrow_mut_data()?;
-    let vault: &mut TradingVault = bytemuck::from_bytes_mut(&mut vault_data[..TradingVault::LEN]);
-    if vault.discriminator != TRADING_VAULT_DISCRIMINATOR {
-        return Err(ProgramError::UninitializedAccount);
-    }
-
-    // (b) Compute shares to mint. First deposit: 1:1. Subsequent:
-    //     shares = assets * total_shares / total_assets.
-    let shares_to_mint: u64 = if vault.total_shares == 0 || vault.total_assets == 0 {
-        assets
-    } else {
-        let numer = (assets as u128) * (vault.total_shares as u128);
-        let s = numer / (vault.total_assets as u128);
-        if s > u64::MAX as u128 {
-            return Err(ProgramError::ArithmeticOverflow);
+    // (a) Read current vault state for share math + cross-check the
+    //     market/mint the caller passed against the vault's record.
+    let shares_to_mint: u64;
+    {
+        let mut vault_data = vault_ai.try_borrow_mut_data()?;
+        let vault: &mut TradingVault =
+            bytemuck::from_bytes_mut(&mut vault_data[..TradingVault::LEN]);
+        if vault.discriminator != TRADING_VAULT_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
         }
-        s as u64
-    };
-    if shares_to_mint == 0 {
-        msg!("vault_deposit: deposit too small relative to NAV (would mint 0 shares)");
-        return Err(ProgramError::InvalidArgument);
-    }
+        if vault.market != *market_ai.key.as_ref() {
+            msg!("vault_deposit: market account does not match vault.market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if vault.mint != *mint_ai.key.as_ref() {
+            msg!("vault_deposit: mint account does not match vault.mint");
+            return Err(ProgramError::InvalidAccountData);
+        }
 
-    // (c) Update vault aggregate.
-    vault.total_shares = vault
-        .total_shares
-        .checked_add(shares_to_mint)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    vault.total_assets = vault
-        .total_assets
-        .checked_add(assets)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    drop(vault_data);
+        // (b) Compute shares to mint. First deposit: 1:1. Subsequent:
+        //     shares = assets * total_shares / total_assets.
+        shares_to_mint = if vault.total_shares == 0 || vault.total_assets == 0 {
+            assets
+        } else {
+            let numer = (assets as u128) * (vault.total_shares as u128);
+            let s = numer / (vault.total_assets as u128);
+            if s > u64::MAX as u128 {
+                return Err(ProgramError::ArithmeticOverflow);
+            }
+            s as u64
+        };
+        if shares_to_mint == 0 {
+            msg!("vault_deposit: deposit too small relative to NAV (would mint 0 shares)");
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // (c) Update vault aggregate.
+        vault.total_shares = vault
+            .total_shares
+            .checked_add(shares_to_mint)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        vault.total_assets = vault
+            .total_assets
+            .checked_add(assets)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+    }
 
     // (d) Create the share account if it doesn't exist yet, then update.
     let share_exists = share_ai.owner == program_id && share_ai.data_len() == VaultShare::LEN;
@@ -2679,8 +2709,19 @@ fn process_vault_deposit(
             .ok_or(ProgramError::ArithmeticOverflow)?;
     }
 
+    // (e) Escrow the depositor's tokens into the vault. Last step so an
+    //     InsufficientFunds (or any SPL Token error) reverts the whole tx,
+    //     including the share + aggregate updates done above.
+    spl_token_transfer_user_signed(
+        depositor_token_ai,
+        vault_token_ai,
+        depositor_ai,
+        token_ai,
+        assets,
+    )?;
+
     msg!(
-        "vault_deposit: deposited {} assets, minted {} shares",
+        "vault_deposit: deposited {} assets escrowed, minted {} shares",
         assets,
         shares_to_mint
     );
@@ -2690,9 +2731,15 @@ fn process_vault_deposit(
 /// Payload: [shares u64 LE]
 ///
 /// Accounts:
-///   0. `[SIGNER]` owner — depositor whose shares are being burned
+///   0. `[SIGNER]` owner            — depositor whose shares are being burned
 ///   1. `[WRITE]`  vault
 ///   2. `[WRITE]`  share
+///   3. `[]`       market           — must match vault.market
+///   4. `[]`       mint             — must match vault.mint
+///   5. `[WRITE]`  owner_token      — destination of the asset withdrawal
+///   6. `[WRITE]`  vault_token      — per-(market, mint) vault PDA
+///   7. `[]`       vault_authority  — PDA at [b"vault_auth", market]
+///   8. `[]`       token_program
 fn process_vault_withdraw(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -2709,6 +2756,12 @@ fn process_vault_withdraw(
     let owner_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
     let vault_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let share_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let market_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let mint_ai = accounts.get(4).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let owner_token_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let vault_token_ai = accounts.get(6).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let vault_authority_ai = accounts.get(7).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let token_ai = accounts.get(8).ok_or(ProgramError::NotEnoughAccountKeys)?;
 
     if !owner_ai.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -2719,53 +2772,84 @@ fn process_vault_withdraw(
     if share_ai.owner != program_id || share_ai.data_len() != VaultShare::LEN {
         return Err(ProgramError::InvalidAccountData);
     }
-
-    // Compute assets to return: shares_to_burn * total_assets / total_shares.
-    let mut vault_data = vault_ai.try_borrow_mut_data()?;
-    let vault: &mut TradingVault = bytemuck::from_bytes_mut(&mut vault_data[..TradingVault::LEN]);
-    if vault.discriminator != TRADING_VAULT_DISCRIMINATOR {
-        return Err(ProgramError::UninitializedAccount);
+    if token_ai.key != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
     }
-    if vault.total_shares == 0 {
-        return Err(ProgramError::InvalidAccountData);
+    if owner_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
     }
+    verify_vault_token_account(vault_token_ai, market_ai.key, mint_ai.key, program_id)?;
+    let vault_auth_bump = verify_vault_authority(vault_authority_ai, market_ai.key, program_id)?;
 
-    let assets_to_return: u64 = {
-        let numer = (shares_to_burn as u128) * (vault.total_assets as u128);
-        let a = numer / (vault.total_shares as u128);
-        if a > u64::MAX as u128 {
-            return Err(ProgramError::ArithmeticOverflow);
+    let assets_to_return: u64;
+    {
+        // Compute assets to return: shares_to_burn * total_assets / total_shares.
+        let mut vault_data = vault_ai.try_borrow_mut_data()?;
+        let vault: &mut TradingVault =
+            bytemuck::from_bytes_mut(&mut vault_data[..TradingVault::LEN]);
+        if vault.discriminator != TRADING_VAULT_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
         }
-        a as u64
-    };
+        if vault.total_shares == 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if vault.market != *market_ai.key.as_ref() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if vault.mint != *mint_ai.key.as_ref() {
+            return Err(ProgramError::InvalidAccountData);
+        }
 
-    let mut share_data = share_ai.try_borrow_mut_data()?;
-    let share: &mut VaultShare = bytemuck::from_bytes_mut(&mut share_data[..VaultShare::LEN]);
-    if share.discriminator != VAULT_SHARE_DISCRIMINATOR {
-        return Err(ProgramError::UninitializedAccount);
-    }
-    if share.owner != *owner_ai.key.as_ref() {
-        msg!("vault_withdraw: caller is not the share owner");
-        return Err(ProgramError::IllegalOwner);
-    }
-    if share.shares < shares_to_burn {
-        msg!(
-            "vault_withdraw: insufficient shares ({} < {})",
-            share.shares,
-            shares_to_burn
-        );
-        return Err(ProgramError::InsufficientFunds);
+        assets_to_return = {
+            let numer = (shares_to_burn as u128) * (vault.total_assets as u128);
+            let a = numer / (vault.total_shares as u128);
+            if a > u64::MAX as u128 {
+                return Err(ProgramError::ArithmeticOverflow);
+            }
+            a as u64
+        };
+
+        let mut share_data = share_ai.try_borrow_mut_data()?;
+        let share: &mut VaultShare =
+            bytemuck::from_bytes_mut(&mut share_data[..VaultShare::LEN]);
+        if share.discriminator != VAULT_SHARE_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        if share.owner != *owner_ai.key.as_ref() {
+            msg!("vault_withdraw: caller is not the share owner");
+            return Err(ProgramError::IllegalOwner);
+        }
+        if share.shares < shares_to_burn {
+            msg!(
+                "vault_withdraw: insufficient shares ({} < {})",
+                share.shares,
+                shares_to_burn
+            );
+            return Err(ProgramError::InsufficientFunds);
+        }
+
+        share.shares -= shares_to_burn;
+        // Reduce cost basis proportionally so partial withdrawals don't
+        // overstate gains on subsequent reports.
+        let basis_reduction = (((shares_to_burn as u128) * (share.cost_basis as u128))
+            / (share.shares as u128 + shares_to_burn as u128)) as u64;
+        share.cost_basis = share.cost_basis.saturating_sub(basis_reduction);
+
+        vault.total_shares -= shares_to_burn;
+        vault.total_assets = vault.total_assets.saturating_sub(assets_to_return);
     }
 
-    share.shares -= shares_to_burn;
-    // Reduce cost basis proportionally so partial withdrawals don't
-    // overstate gains on subsequent reports.
-    let basis_reduction = (((shares_to_burn as u128) * (share.cost_basis as u128))
-        / (share.shares as u128 + shares_to_burn as u128)) as u64;
-    share.cost_basis = share.cost_basis.saturating_sub(basis_reduction);
-
-    vault.total_shares -= shares_to_burn;
-    vault.total_assets = vault.total_assets.saturating_sub(assets_to_return);
+    // Vault → owner SPL Token Transfer. Vault authority PDA signs via
+    // invoke_signed with [VAULT_AUTH_SEED, market] seeds.
+    spl_token_transfer_vault_signed(
+        vault_token_ai,
+        owner_token_ai,
+        vault_authority_ai,
+        market_ai.key,
+        vault_auth_bump,
+        token_ai,
+        assets_to_return,
+    )?;
 
     msg!(
         "vault_withdraw: burned {} shares, returned {} assets",

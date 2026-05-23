@@ -16,13 +16,14 @@
 
 trading vault は perp DEX を、ユーザが直接取引する venue から、**基金**もホストする venue に変える概念的プリミティブだ。ポジションを自分で管理したくないユーザは vault に預金できる。vault のマネージャが戦略を走らせる。預金者はリターンを共有する。これは Solana 上のすべての yield vault の構造 — Drift の spot vault、Kamino の leveraged vault、Jupiter の perps vault、その他もろもろ。
 
-本章は vault の会計半分を組み立てる — shares、deposits、withdrawals、NAV 更新。マネージャの取引半分は組み立てない（第 11 章の `OpenPosition` を vault の PDA をポジション所有者として呼ぶ薄いラッパ命令になる）。share 会計が整えば追加は機械的だ。本章は設計を説明し、実装を宿題ピースとして残す。第 11 章が SPL Token エスクローを後送りしたのと同じやり方だ。
+本章は vault の会計半分を組み立てる — shares、deposits、withdrawals、NAV 更新。マネージャの取引半分は組み立てない（第 11 章の `OpenPosition` を vault の PDA をポジション所有者として呼ぶ薄いラッパ命令になる）。share 会計が整えば追加は機械的だ。本章は設計を説明し、実装を宿題ピースとして残す。
 
 本章が実際に扱うこと:
 
 1. **share/asset 数学** — NAV が変わるとき deposit と withdrawal が pro-rata 不変条件をどう保つか。
-2. **シングルトン書き込みの再起** — すべての deposit と withdrawal が同じ `TradingVault` アカウントを変更するので、vault 操作はスケジューラで直列化する。第 5 章のアンチパターンを**意図的に**導入したので、緩和策が実務でどう見えるかが見える。
-3. **マネージャ信用モデル** — `VaultUpdateNAV` が肝心の信用前提。それがどう構造化されるかが、vault が「マネージャが嘘をつかないと信じる」か「NAV をオンチェーン状態に対して検証する」かを決める。
+2. **帳簿 ↔ エスクローの原子性** — deposit と withdrawal の両方が `TradingVault` 集計を更新し、*かつ* SPL Token CPI で実トークンをエスクローする。両者が同じ命令内、tx 全体のリバート意味論の下で実行されるので、片方が失敗すればもう片方もロールバックする。
+3. **シングルトン書き込みの再起** — すべての deposit と withdrawal が同じ `TradingVault` アカウントを変更するので、vault 操作はスケジューラで直列化する。第 5 章のアンチパターンを**意図的に**導入したので、緩和策が実務でどう見えるかが見える。
+4. **マネージャ信用モデル** — `VaultUpdateNAV` が肝心の信用前提。それがどう構造化されるかが、vault が「マネージャが嘘をつかないと信じる」か「NAV をオンチェーン状態に対して検証する」かを決める。
 
 ---
 
@@ -179,11 +180,11 @@ vault.total_assets = new_total_assets;
 
 ## §12.3  `VaultDeposit` を歩く
 
-2282–2413 行の `process_vault_deposit` は 4 つのハンドラの中で最も複雑だ、最初の deposit で VaultShare PDA を条件付きで作成するからだ。構造を分解:
+`process_vault_deposit` は 4 つのハンドラの中で最も複雑だ、最初の deposit で VaultShare PDA を条件付きで作成し、*かつ*末尾で SPL Token Transfer CPI を走らせるからだ。5 フェーズで分解:
 
-**検証**（2293–2318 行）: ペイロード サイズ、非ゼロ deposit、預金者は signer、vault は正しい所有者 + サイズ、system プログラムは正しい、share PDA は派生と一致する。
+**検証**: ペイロード サイズ、非ゼロ deposit、預金者は signer、vault は正しい所有者 + サイズ、system プログラムは正しい、**token プログラムは SPL Token、預金者のトークン アカウントは SPL Token 所有、vault_token_account は `[VAULT_SEED, market, mint]` で派生される PDA と一致する**。渡される mint と market アカウントは vault に保存されたものと一致しなければならない — 下の借用スコープ内で `vault.mint != mint_ai.key` / `vault.market != market_ai.key` チェックが捕捉する。share PDA 派生は以前と変わらず。
 
-**vault 状態を読み mint する shares を計算**（2320–2342 行）: vault データを借用、最初の deposit（1:1）vs 以降（pro-rata）で分岐。
+**vault 状態を読み mint する shares を計算**: vault データを借用、渡された market/mint を vault.market/vault.mint と相互チェック、最初の deposit（1:1）vs 以降（pro-rata）で分岐。
 
 **vault 集約を更新**（2344–2353 行）:
 
@@ -213,19 +214,35 @@ if !share_exists {
 
 ユーザの最初の deposit が VaultShare アカウントの rent を払う（小さな一度限りのコスト）。以降の deposit はフィールドをインクリメントするだけ。これが慣例的なパターン — 代替は別の `CreateVaultShare` 命令を最初に呼ぶよう要求することだが、利益なしに摩擦が加わる。
 
-ハンドラはどちらの分岐が走ったとしても最終的に share アカウントを所有しなければならない。両分岐とも最終状態は `share.shares` が預金者の総保有を反映し、`share.cost_basis` が累積預金を反映する。deposit は外から見えなくなる — 結果として残る share 状態だけが重要だ。
+ハンドラはどちらの分岐が走ったとしても最終的に share アカウントを所有しなければならない。両分岐とも最終状態は `share.shares` が預金者の総保有を反映し、`share.cost_basis` が累積預金を反映する。
 
-> **演習 §12.3.** ユーザが 100、50、25 を 3 つの別トランザクションで預金する。間に UpdateNAV なしで vault の NAV は一定。各ステップでユーザの share アカウントをダンプせよ。shares 数は線形に成長し、cost_basis は累計和になるはず。
+**預金者のトークンをエスクローする**、最後のステップ:
+
+```rust
+spl_token_transfer_user_signed(
+    depositor_token_ai,
+    vault_token_ai,
+    depositor_ai,
+    token_ai,
+    assets,
+)?;
+```
+
+第 11 章と同じヘルパ。預金者が外側トランザクションに署名する。署名は標準の signer 特権延長パターン（第 6 章 §6.2）で SPL Token に流れる。`assets` 単位が `depositor_token` から `vault_token`（(market, mint) ごとの vault PDA — 第 11 章のポジション担保を保持する同じ vault アカウント）へ移る。
+
+**順序が肝心。** CPI は share + 集約更新の*後*に置かれる。転送が失敗（`InsufficientFunds`、アカウント凍結等）すれば、Solana はトランザクション全体をリバートする — share 作成、share フィールド更新、vault 集約インクリメントを含めて。だから失敗したエスクローは預金者に mint された share を残さず、vault 状態変更も残さない。原子性保証が、明示的なロールバックコードなしで自然なエラー処理を正しくする。
+
+> **演習 §12.3.** ユーザが 100、50、25 を 3 つの別トランザクションで預金する。間に UpdateNAV なしで vault の NAV は一定。各ステップでユーザの share アカウント*と* vault トークン アカウント残高をダンプせよ。shares 数は線形成長（100 / 150 / 175）、cost_basis は累計和、vault トークン残高は cost_basis ちょうどに等しいはず。
 
 ---
 
 ## §12.4  `VaultWithdraw` を歩く
 
-deposit より単純、作成するものがないから。2415–2500 行の `process_vault_withdraw`:
+deposit より単純、作成するものがないから — ただし vault からトークンを払い出す、つまり vault-authority PDA で署名される `invoke_signed` CPI が発生する。`process_vault_withdraw`:
 
-**返す assets を計算**、2452–2459 行 — §12.2 で扱った deposit 式の逆。
+**返す assets を計算** — §12.2 で扱った deposit 式の逆。
 
-**認可**、2470–2473 行:
+**認可**:
 
 ```rust
 if share.owner != *owner_ai.key.as_ref() {
@@ -236,7 +253,7 @@ if share.owner != *owner_ai.key.as_ref() {
 
 share の記録された所有者だけが burn できる。これは share **単位**の認可で、vault 全体ではない — UpdateNAV のマネージャ チェックと異なる。この設計には「vault 管理者が任意の share を強制清算できる」経路はない（本物の本番 vault はコンプライアンス上の理由で追加するかもしれない）。
 
-**残高十分性チェック**、2474–2480 行:
+**残高十分性チェック**:
 
 ```rust
 if share.shares < shares_to_burn {
@@ -246,7 +263,7 @@ if share.shares < shares_to_burn {
 
 保有以上の shares は burn できない。
 
-**Cost basis 削減**、2484–2489 行:
+**Cost basis 削減**:
 
 ```rust
 let basis_reduction = (((shares_to_burn as u128) * (share.cost_basis as u128))
@@ -258,9 +275,37 @@ share.cost_basis = share.cost_basis.saturating_sub(basis_reduction);
 
 分母の `as u128 + shares_to_burn as u128` は `share.shares` を**減算前**で使う（まだ減算していないから）。`share.shares -= shares_to_burn` の後の単純な `share.shares as u128` は誤った basis を計算する。
 
-**集約を更新**、2491–2493 行 — `total_shares -= shares_to_burn`、`total_assets -= assets_to_return`。両方とも防御的に `saturating_sub`、事前チェックを考えれば underflow するはずがないが。
+**集約を更新** — `total_shares -= shares_to_burn`、`total_assets -= assets_to_return`。両方とも防御的に `saturating_sub`、事前チェックを考えれば underflow するはずがないが。
 
-> **演習 §12.4.** §12.2 の演習の vault で、預金者 A に全 shares を引き出させる。A は何 assets 受け取るか。結果の vault 状態は（total_shares、total_assets）? 預金者 B の主張可能価値は変わっていないことを確認せよ。
+**vault から assets を払い出す**、最後のステップ — これが新しいエスクロー CPI:
+
+```rust
+spl_token_transfer_vault_signed(
+    vault_token_ai,
+    owner_token_ai,
+    vault_authority_ai,
+    market_ai.key,
+    vault_auth_bump,
+    token_ai,
+    assets_to_return,
+)?;
+```
+
+deposit 側との力学的な違いがひとつ、肝心:**authority がユーザではなく PDA**だ。預金者の外側トランザクション署名は SPL Token にとって意味がない、なぜなら debit されるトークン アカウント（`vault_token`）は `vault_authority` 所有 — *プログラム*が制御する PDA だから。だからプログラムが vault_authority に代わって内側 CPI に署名する、`invoke_signed` 経由で:
+
+```rust
+let market_key_bytes = market_key.to_bytes();
+let signer_seeds: &[&[u8]] = &[VAULT_AUTH_SEED, market_key_bytes.as_ref(), &[vault_auth_bump]];
+invoke_signed(&ix, &[source, dest, vault_authority, token_program], &[signer_seeds])?;
+```
+
+seeds — `[VAULT_AUTH_SEED, market, bump]` — は第 6 章 §6.2 で `create_market` が派生したもの、`process_create_market` が Market アカウントに `vault_auth_bump` として記録したものに正確に一致する。bump は呼び出し側から渡される（ハンドラが market から読み込む）、再計算する代わりに、CU 削減と署名 seeds が記録された派生と正確に一致するためだ。
+
+seeds が `vault_authority_ai.key` に等しいアドレスの有効な PDA を形成しなければ、ランタイムは signed CPI を `ProgramError::InvalidSeeds` で拒否する。だから悪意ある呼び出し側が偽の vault_authority を渡すことはできない — プログラムが署名できる唯一無二の PDA だけが受け入れられる。
+
+**ここでも順序が肝心。** CPI は最後。トークン転送が失敗（vault_token 凍結、dest クローズ等）すれば、share-burn と集約-デクリメントもリバートする。だから失敗した払い出しは預金者の shares を無傷で残し、vault も変更しない。
+
+> **演習 §12.4.** §12.2 の演習の vault で、預金者 A に全 shares を引き出させる。3 つを前後でダンプせよ: (1) 預金者 A の share アカウント、(2) vault 集約状態、(3) vault トークン アカウント残高。A が受け取るトークンが、預金者 B の主張可能価値が残り shares に対して含意するものと一致する（つまり B の価値が変わっていない）ことを確認せよ。
 
 ---
 

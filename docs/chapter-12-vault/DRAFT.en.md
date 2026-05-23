@@ -16,13 +16,16 @@ Both are reasonable uses of the word "vault." We picked the type names to disamb
 
 The trading vault is the conceptual primitive that turns a perp DEX from a venue where users trade directly into a venue that also hosts *funds*. A user who doesn't want to manage positions themselves can deposit into a vault; the vault's manager runs the strategy; depositors share returns. This is the structure behind every yield vault on Solana — Drift's spot vaults, Kamino's leveraged vaults, Jupiter's perps vault, and so on.
 
-This chapter builds the vault's accounting half — shares, deposits, withdrawals, NAV updates. It does not build the manager's trading half (which would be a thin wrapper instruction calling into Chapter 11's `OpenPosition` with the vault's PDA as the position owner). Adding that is mechanical once the share accounting is in place; the chapter explains the design and leaves implementation as a homework piece, the same way Chapter 11 deferred its SPL Token escrow.
+This chapter builds the vault's accounting half — shares, deposits, withdrawals, NAV updates — *with the real SPL Token escrow wired in*. Deposit moves actual quote tokens from the depositor's account into the per-(market, mint) vault PDA (the same vault Chapter 6 created and Chapter 11 uses for position collateral). Withdraw moves them back, signed by the vault-authority PDA via `invoke_signed`. The bookkeeping (`total_shares`, `total_assets`, `VaultShare.shares`) and the actual token balance stay in sync because each handler updates both atomically.
+
+It does not build the manager's trading half (which would be a thin wrapper instruction calling into Chapter 11's `OpenPosition` with the vault's PDA as the position owner). Adding that is mechanical once the share accounting and the escrow are in place; the chapter explains the design and leaves implementation as a homework piece.
 
 What this chapter is actually about:
 
-1. **The share/asset math** — how deposits and withdrawals preserve the pro-rata invariant when NAV changes.
-2. **The singleton-write reassertion** — every deposit and withdrawal mutates the same `TradingVault` account, so vault operations serialize at the scheduler. Chapter 5's antipattern shows up because we *deliberately* introduced it; we now see what mitigations look like in practice.
-3. **The manager-trust model** — `VaultUpdateNAV` is the load-bearing trust assumption. How that's structured determines whether the vault is "trust the manager not to lie" or "verify NAV against on-chain state."
+1. **The share/asset math** — how deposits and withdrawals preserve the pro-rata invariant when NAV changes. Independent of escrow; the math would be identical whether tokens moved or not.
+2. **Atomic bookkeeping ↔ escrow updates** — every handler that touches `total_shares` / `total_assets` also runs the matching SPL Token CPI in the same transaction. Either both succeed or both revert. The two states cannot drift.
+3. **The singleton-write reassertion** — every deposit and withdrawal mutates the same `TradingVault` account, so vault operations serialize at the scheduler. Chapter 5's antipattern shows up because we *deliberately* introduced it; we now see what mitigations look like in practice.
+4. **The manager-trust model** — `VaultUpdateNAV` is the load-bearing trust assumption. How that's structured determines whether the vault is "trust the manager not to lie" or "verify NAV against on-chain state."
 
 ---
 
@@ -179,11 +182,11 @@ This is generally acceptable for vaults because (1) the dust is rounding-error s
 
 ## §12.3  Walking `VaultDeposit`
 
-`process_vault_deposit` at lines 2282–2413 is the most complex of the four handlers because it conditionally creates the VaultShare PDA on first deposit. The structure decomposes:
+`process_vault_deposit` is the most complex of the four handlers because it conditionally creates the VaultShare PDA on first deposit *and* runs an SPL Token Transfer CPI at the end. Five phases:
 
-**Validation** (lines 2293–2318): payload size, non-zero deposit, depositor is signer, vault has correct owner + size, system program is correct, share PDA matches derivation.
+**Validation**: payload size, non-zero deposit, depositor is signer, vault has correct owner + size, system program is correct, **token program is SPL Token, depositor's token account is SPL Token-owned, and the vault_token_account matches the derived PDA at `[VAULT_SEED, market, mint]`**. The mint and market accounts passed in must match what's stored in the vault — caught by a `vault.mint != mint_ai.key` / `vault.market != market_ai.key` check inside the borrow scope below. Share PDA derivation is unchanged from before.
 
-**Read vault state and compute shares to mint** (lines 2320–2342): borrow vault data, branch on first-deposit (1:1) vs subsequent (pro-rata).
+**Read vault state and compute shares to mint**: borrow vault data, cross-check the passed market/mint against vault.market/vault.mint, branch on first-deposit (1:1) vs subsequent (pro-rata).
 
 **Update vault aggregate** (lines 2344–2353):
 
@@ -213,15 +216,31 @@ The "exists?" check is by owner + data_len — if the account is owned by us and
 
 A user's first deposit pays the rent for their VaultShare account (small one-time cost). Subsequent deposits just increment fields. This is the conventional pattern — the alternative would be requiring the user to call a separate `CreateVaultShare` instruction first, which adds friction without benefit.
 
-The handler must own the share account at the end regardless of which branch ran. In both branches the final state has `share.shares` reflecting the depositor's total holdings and `share.cost_basis` reflecting their cumulative deposits. The deposit becomes invisible from the outside — only the resulting share state matters.
+The handler must own the share account at the end regardless of which branch ran. In both branches the final state has `share.shares` reflecting the depositor's total holdings and `share.cost_basis` reflecting their cumulative deposits.
 
-> **Exercise §12.3.** A user deposits 100, then 50, then 25 in three separate transactions. The vault's NAV is constant (no UpdateNAV in between). At each step, dump the user's share account. The shares count should grow linearly; the cost_basis should be the running sum.
+**Escrow the depositor's tokens** as the final step:
+
+```rust
+spl_token_transfer_user_signed(
+    depositor_token_ai,
+    vault_token_ai,
+    depositor_ai,
+    token_ai,
+    assets,
+)?;
+```
+
+Same helper from Chapter 11. The depositor signs the outer transaction; the signature flows through to SPL Token via the standard signer-privilege-extension pattern (Chapter 6 §6.2). `assets` units move from `depositor_token` into `vault_token` (the per-(market, mint) vault PDA — same vault account that holds position collateral from Chapter 11).
+
+**Order matters.** The CPI is placed *after* the share+aggregate updates. If the transfer fails (`InsufficientFunds`, account frozen, etc.), Solana reverts the entire transaction — including the share creation, the share field updates, and the vault aggregate increment. So a failed escrow leaves the depositor with no shares minted and no vault state change. The atomicity guarantee is what makes the natural error handling correct without explicit rollback code.
+
+> **Exercise §12.3.** A user deposits 100, then 50, then 25 in three separate transactions. The vault's NAV is constant (no UpdateNAV in between). At each step, dump the user's share account *and* the vault token account balance. The shares count should grow linearly (100 / 150 / 175), the cost_basis should be the running sum, and the vault token balance should equal the cost_basis exactly.
 
 ---
 
 ## §12.4  Walking `VaultWithdraw`
 
-Simpler than deposit because there's nothing to create. `process_vault_withdraw` at lines 2415–2500:
+Simpler than deposit because there's nothing to create — but it does pay out tokens from the vault, which means an `invoke_signed` CPI signed by the vault-authority PDA. `process_vault_withdraw`:
 
 **Compute assets to return** at lines 2452–2459 — the inverse of the deposit formula, as covered in §12.2.
 
@@ -258,9 +277,37 @@ Proportional reduction. If a user has 100 shares with cost_basis 1000 and burns 
 
 The `as u128 + shares_to_burn as u128` in the denominator uses `share.shares` *before* the subtraction (because we haven't subtracted yet). A naive `share.shares as u128` after a `share.shares -= shares_to_burn` would compute the wrong basis.
 
-**Update aggregates** at lines 2491–2493 — `total_shares -= shares_to_burn`, `total_assets -= assets_to_return`. Both `saturating_sub` defensively, though both should never underflow given the prior checks.
+**Update aggregates** — `total_shares -= shares_to_burn`, `total_assets -= assets_to_return`. Both `saturating_sub` defensively, though both should never underflow given the prior checks.
 
-> **Exercise §12.4.** With the vault from §12.2's exercise, have depositor A withdraw all their shares. What assets do they receive? What's the resulting vault state (total_shares, total_assets)? Verify that depositor B's claimable value didn't change.
+**Pay the assets out from the vault** as the final step — this is the new escrow CPI:
+
+```rust
+spl_token_transfer_vault_signed(
+    vault_token_ai,
+    owner_token_ai,
+    vault_authority_ai,
+    market_ai.key,
+    vault_auth_bump,
+    token_ai,
+    assets_to_return,
+)?;
+```
+
+The mechanics differ from the deposit side in one critical way: **the authority is a PDA, not the user.** The depositor's signature on the outer transaction is meaningless to SPL Token here, because the token account that's being debited (`vault_token`) is owned by `vault_authority` — a PDA the *program* controls. So the program signs the inner CPI on the vault_authority's behalf via `invoke_signed`:
+
+```rust
+let market_key_bytes = market_key.to_bytes();
+let signer_seeds: &[&[u8]] = &[VAULT_AUTH_SEED, market_key_bytes.as_ref(), &[vault_auth_bump]];
+invoke_signed(&ix, &[source, dest, vault_authority, token_program], &[signer_seeds])?;
+```
+
+The seeds — `[VAULT_AUTH_SEED, market, bump]` — exactly match what `create_market` derived in Chapter 6 §6.2 and what `process_create_market` recorded as `vault_auth_bump` in the Market account. The bump is passed from the caller (loaded from the market by the handler) rather than recomputed, both for compute units and to make the signing seeds match the recorded derivation exactly.
+
+If the seeds don't form a valid PDA whose address equals `vault_authority_ai.key`, the runtime rejects the signed CPI with `ProgramError::InvalidSeeds`. So a malicious caller can't pass a fake vault_authority — only the one and only PDA that the program can sign for is accepted.
+
+**Order matters here too.** The CPI is last. If the token transfer fails (vault_token frozen, dest closed, etc.), the share-burn and aggregate-decrement revert with it. So a failed payout leaves the depositor with their shares intact and the vault unchanged.
+
+> **Exercise §12.4.** With the vault from §12.2's exercise, have depositor A withdraw all their shares. Dump three things before and after: (1) depositor A's share account, (2) the vault aggregate state, and (3) the vault token account balance. Verify that the tokens A receives match what depositor B's claimable value implies for the remaining shares (i.e. that B's value is unchanged).
 
 ---
 
