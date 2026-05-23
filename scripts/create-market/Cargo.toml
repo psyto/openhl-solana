@@ -1,0 +1,23 @@
+[package]
+name = "create-market"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Chapter 3 worked example: derive a market PDA from [b\"market\", base_mint, quote_mint] and call openhl-core::CreateMarket, which allocates and initializes the account in one CPI."
+
+[[bin]]
+name = "create-market"
+path = "src/main.rs"
+
+[dependencies]
+openhl-state = { path = "../../crates/state" }
+openhl-core = { path = "../../programs/openhl-core", features = ["no-entrypoint"] }
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+solana-program = { workspace = true }
+solana-system-interface = { workspace = true }
+bytemuck = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

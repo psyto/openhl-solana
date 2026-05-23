@@ -4,6 +4,7 @@ members = [
     "crates/state",
     "programs/openhl-core",
     "scripts/allocate-market",
+    "scripts/create-market",
     "scripts/init-market",
 ]
 

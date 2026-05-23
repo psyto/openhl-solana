@@ -824,6 +824,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "create-market"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "clap",
+ "openhl-core",
+ "openhl-state",
+ "solana-client",
+ "solana-program",
+ "solana-sdk",
+ "solana-system-interface",
+]
+
+[[package]]
 name = "crossbeam-channel"
 version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2300,6 +2315,7 @@ dependencies = [
  "bytemuck",
  "openhl-state",
  "solana-program",
+ "solana-system-interface",
 ]
 
 [[package]]
