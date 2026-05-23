@@ -7,19 +7,31 @@
 //!   (no mode)                                → dump position + computed
 //!                                              equity/notional/maint margin
 //!
+//! All three mutating modes now require --mint (the quote-asset SPL Mint
+//! the market vault holds) and SPL Token accounts. The vault PDA and
+//! vault-authority PDA at [b"vault", market, mint] / [b"vault_auth",
+//! market] must already exist — create them with `create-vault` from
+//! Chapter 6 if needed.
+//!
 //! Usage:
 //!   position --rpc http://127.0.0.1:8899 \
 //!            --payer ~/.config/solana/id.json \
 //!            --program <openhl-core program ID> \
 //!            --market <market PDA> \
-//!            [--open --size 5 --collateral 100 |
-//!             --close |
-//!             --liquidate --target-user <pubkey>]
+//!            --mint <quote SPL mint> \
+//!            [--open --size 5 --collateral 100
+//!                   --user-token-account <user's quote token account> |
+//!             --close
+//!                   --user-token-account <pubkey> |
+//!             --liquidate --target-user <pubkey>
+//!                         --owner-token-account <pubkey>
+//!                         --liquidator-token-account <pubkey>]
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use openhl_core::{
     FUNDING_SEED, LIQUIDATION_PENALTY_BPS, MAINT_MARGIN_BPS, ORACLE_SEED, POSITION_SEED,
+    SPL_TOKEN_PROGRAM_ID, VAULT_AUTH_SEED, VAULT_SEED,
 };
 use openhl_state::{Oracle, Position};
 use solana_client::rpc_client::RpcClient;
@@ -47,6 +59,10 @@ struct Cli {
     #[arg(long)]
     market: String,
 
+    /// Quote-asset SPL Mint. Required for --open / --close / --liquidate.
+    #[arg(long)]
+    mint: Option<String>,
+
     #[arg(long)]
     open: bool,
     #[arg(long, requires = "open")]
@@ -61,6 +77,21 @@ struct Cli {
     liquidate: bool,
     #[arg(long, requires = "liquidate")]
     target_user: Option<String>,
+
+    /// User's SPL Token Account holding the quote mint. Required for
+    /// --open (source of collateral) and --close (destination of payout).
+    #[arg(long)]
+    user_token_account: Option<String>,
+
+    /// Position owner's SPL Token Account (gets the remainder after
+    /// liquidation penalty). Required for --liquidate.
+    #[arg(long)]
+    owner_token_account: Option<String>,
+
+    /// Liquidator's SPL Token Account (gets the liquidation penalty).
+    /// Required for --liquidate. Typically the liquidator's own ATA.
+    #[arg(long)]
+    liquidator_token_account: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -72,8 +103,6 @@ fn main() -> Result<()> {
     let market: Pubkey = cli.market.parse().context("parse --market")?;
 
     // Determine whose position we're targeting.
-    // For --open / --close: the position is the payer's own.
-    // For --liquidate: --target-user names the owner.
     let position_user: Pubkey = if cli.liquidate {
         cli.target_user
             .as_deref()
@@ -103,59 +132,125 @@ fn main() -> Result<()> {
     println!("position PDA:  {position_pda}  (bump {bump})");
     println!("oracle PDA:    {oracle_pda}");
     println!("funding PDA:   {funding_pda}");
-    println!();
 
-    let modes_set = [cli.open, cli.close, cli.liquidate].iter().filter(|b| **b).count();
-    if modes_set > 1 {
-        bail!("--open, --close, --liquidate are mutually exclusive");
-    }
+    if cli.open || cli.close || cli.liquidate {
+        let mint: Pubkey = cli
+            .mint
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--mint required for --open/--close/--liquidate"))?
+            .parse()
+            .context("parse --mint")?;
+        let (vault_pda, _) = Pubkey::find_program_address(
+            &[VAULT_SEED, market.as_ref(), mint.as_ref()],
+            &program_id,
+        );
+        let (vault_auth_pda, _) = Pubkey::find_program_address(
+            &[VAULT_AUTH_SEED, market.as_ref()],
+            &program_id,
+        );
+        println!("mint:          {mint}");
+        println!("vault PDA:     {vault_pda}");
+        println!("vault_auth:    {vault_auth_pda}");
+        println!();
 
-    if cli.open {
-        let size = cli.size.ok_or_else(|| anyhow::anyhow!("--size required"))?;
-        let collateral = cli.collateral.ok_or_else(|| anyhow::anyhow!("--collateral required"))?;
+        let modes_set = [cli.open, cli.close, cli.liquidate].iter().filter(|b| **b).count();
+        if modes_set > 1 {
+            bail!("--open, --close, --liquidate are mutually exclusive");
+        }
 
-        let mut data = Vec::with_capacity(1 + 8 + 8);
-        data.push(16u8);
-        data.extend_from_slice(&size.to_le_bytes());
-        data.extend_from_slice(&collateral.to_le_bytes());
+        if cli.open {
+            let size = cli.size.ok_or_else(|| anyhow::anyhow!("--size required"))?;
+            let collateral =
+                cli.collateral.ok_or_else(|| anyhow::anyhow!("--collateral required"))?;
+            let user_token: Pubkey = cli
+                .user_token_account
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--user-token-account required for --open"))?
+                .parse()
+                .context("parse --user-token-account")?;
 
-        let ix = Instruction {
-            program_id,
-            accounts: vec![
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new_readonly(market, false),
-                AccountMeta::new(position_pda, false),
-                AccountMeta::new_readonly(oracle_pda, false),
-                AccountMeta::new_readonly(funding_pda, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-            ],
-            data,
-        };
-        send(&client, &payer, ix)?;
-    } else if cli.close {
-        let ix = Instruction {
-            program_id,
-            accounts: vec![
-                AccountMeta::new_readonly(payer.pubkey(), true),
-                AccountMeta::new(position_pda, false),
-                AccountMeta::new_readonly(oracle_pda, false),
-                AccountMeta::new_readonly(funding_pda, false),
-            ],
-            data: vec![17u8],
-        };
-        send(&client, &payer, ix)?;
-    } else if cli.liquidate {
-        let ix = Instruction {
-            program_id,
-            accounts: vec![
-                AccountMeta::new_readonly(payer.pubkey(), true),
-                AccountMeta::new(position_pda, false),
-                AccountMeta::new_readonly(oracle_pda, false),
-                AccountMeta::new_readonly(funding_pda, false),
-            ],
-            data: vec![18u8],
-        };
-        send(&client, &payer, ix)?;
+            let mut data = Vec::with_capacity(1 + 8 + 8);
+            data.push(16u8);
+            data.extend_from_slice(&size.to_le_bytes());
+            data.extend_from_slice(&collateral.to_le_bytes());
+
+            let ix = Instruction {
+                program_id,
+                accounts: vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market, false),
+                    AccountMeta::new(position_pda, false),
+                    AccountMeta::new_readonly(oracle_pda, false),
+                    AccountMeta::new_readonly(funding_pda, false),
+                    AccountMeta::new_readonly(mint, false),
+                    AccountMeta::new(user_token, false),
+                    AccountMeta::new(vault_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                    AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+                ],
+                data,
+            };
+            send(&client, &payer, ix)?;
+        } else if cli.close {
+            let user_token: Pubkey = cli
+                .user_token_account
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--user-token-account required for --close"))?
+                .parse()
+                .context("parse --user-token-account")?;
+
+            let ix = Instruction {
+                program_id,
+                accounts: vec![
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(position_pda, false),
+                    AccountMeta::new_readonly(oracle_pda, false),
+                    AccountMeta::new_readonly(funding_pda, false),
+                    AccountMeta::new_readonly(market, false),
+                    AccountMeta::new_readonly(mint, false),
+                    AccountMeta::new(user_token, false),
+                    AccountMeta::new(vault_pda, false),
+                    AccountMeta::new_readonly(vault_auth_pda, false),
+                    AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+                ],
+                data: vec![17u8],
+            };
+            send(&client, &payer, ix)?;
+        } else if cli.liquidate {
+            let owner_token: Pubkey = cli
+                .owner_token_account
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--owner-token-account required"))?
+                .parse()
+                .context("parse --owner-token-account")?;
+            let liq_token: Pubkey = cli
+                .liquidator_token_account
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--liquidator-token-account required"))?
+                .parse()
+                .context("parse --liquidator-token-account")?;
+
+            let ix = Instruction {
+                program_id,
+                accounts: vec![
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(position_pda, false),
+                    AccountMeta::new_readonly(oracle_pda, false),
+                    AccountMeta::new_readonly(funding_pda, false),
+                    AccountMeta::new_readonly(market, false),
+                    AccountMeta::new_readonly(mint, false),
+                    AccountMeta::new(owner_token, false),
+                    AccountMeta::new(liq_token, false),
+                    AccountMeta::new(vault_pda, false),
+                    AccountMeta::new_readonly(vault_auth_pda, false),
+                    AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+                ],
+                data: vec![18u8],
+            };
+            send(&client, &payer, ix)?;
+        }
+    } else {
+        println!();
     }
 
     // Always dump position post-state.

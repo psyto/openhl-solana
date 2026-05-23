@@ -1928,15 +1928,143 @@ fn read_funding_index(funding_ai: &AccountInfo, program_id: &Pubkey) -> Result<i
     Ok(funding.cumulative_funding_index)
 }
 
+// =============================================================================
+// SPL Token escrow helpers — used by Position + TradingVault handlers to
+// actually move quote tokens in/out of the per-(market, mint) vault from
+// Chapter 6. Without these, the position/vault accounting would be tracked
+// in u64 fields but no real tokens would move.
+// =============================================================================
+
+/// Verify the passed vault_token_account matches the derived PDA at
+/// `[VAULT_SEED, market, mint]` and is owned by SPL Token. Returns nothing
+/// (this is a guard; the bump is rediscovered by callers that need it).
+fn verify_vault_token_account(
+    vault_token_ai: &AccountInfo,
+    market_key: &Pubkey,
+    mint_key: &Pubkey,
+    program_id: &Pubkey,
+) -> ProgramResult {
+    let (expected, _bump) = Pubkey::find_program_address(
+        &[VAULT_SEED, market_key.as_ref(), mint_key.as_ref()],
+        program_id,
+    );
+    if vault_token_ai.key != &expected {
+        msg!("vault_token_account does not match derived PDA");
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if vault_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        msg!("vault_token_account not owned by SPL Token");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    Ok(())
+}
+
+/// Verify the passed vault_authority account matches the derived PDA at
+/// `[VAULT_AUTH_SEED, market]`. Returns the bump for use in invoke_signed
+/// transfers out of the vault.
+fn verify_vault_authority(
+    vault_authority_ai: &AccountInfo,
+    market_key: &Pubkey,
+    program_id: &Pubkey,
+) -> Result<u8, ProgramError> {
+    let (expected, bump) =
+        Pubkey::find_program_address(&[VAULT_AUTH_SEED, market_key.as_ref()], program_id);
+    if vault_authority_ai.key != &expected {
+        msg!("vault_authority does not match derived PDA");
+        return Err(ProgramError::InvalidSeeds);
+    }
+    Ok(bump)
+}
+
+/// SPL Token Transfer where the source's authority is a regular keypair
+/// already signing the outer transaction. Plain `invoke` — signer privilege
+/// extends through to SPL Token.
+fn spl_token_transfer_user_signed<'a>(
+    source: &AccountInfo<'a>,
+    dest: &AccountInfo<'a>,
+    authority: &AccountInfo<'a>,
+    token_program: &AccountInfo<'a>,
+    amount: u64,
+) -> ProgramResult {
+    if amount == 0 {
+        return Ok(());
+    }
+    let mut data = Vec::with_capacity(1 + 8);
+    data.push(spl_token_ix::TRANSFER);
+    data.extend_from_slice(&amount.to_le_bytes());
+    let ix = Instruction {
+        program_id: SPL_TOKEN_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*source.key, false),
+            AccountMeta::new(*dest.key, false),
+            AccountMeta::new_readonly(*authority.key, true),
+        ],
+        data,
+    };
+    invoke(
+        &ix,
+        &[
+            source.clone(),
+            dest.clone(),
+            authority.clone(),
+            token_program.clone(),
+        ],
+    )
+}
+
+/// SPL Token Transfer where the source's authority is the per-market
+/// vault PDA at `[VAULT_AUTH_SEED, market]`. The program signs for the PDA
+/// via `invoke_signed` with the matching seeds + bump.
+fn spl_token_transfer_vault_signed<'a>(
+    source: &AccountInfo<'a>,
+    dest: &AccountInfo<'a>,
+    vault_authority: &AccountInfo<'a>,
+    market_key: &Pubkey,
+    vault_auth_bump: u8,
+    token_program: &AccountInfo<'a>,
+    amount: u64,
+) -> ProgramResult {
+    if amount == 0 {
+        return Ok(());
+    }
+    let mut data = Vec::with_capacity(1 + 8);
+    data.push(spl_token_ix::TRANSFER);
+    data.extend_from_slice(&amount.to_le_bytes());
+    let ix = Instruction {
+        program_id: SPL_TOKEN_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*source.key, false),
+            AccountMeta::new(*dest.key, false),
+            AccountMeta::new_readonly(*vault_authority.key, true),
+        ],
+        data,
+    };
+    invoke_signed(
+        &ix,
+        &[
+            source.clone(),
+            dest.clone(),
+            vault_authority.clone(),
+            token_program.clone(),
+        ],
+        &[&[VAULT_AUTH_SEED, market_key.as_ref(), &[vault_auth_bump]]],
+    )
+}
+
 /// Payload: [size i64 LE][collateral u64 LE]
 ///
 /// Accounts:
-///   0. `[WRITE, SIGNER]` user
+///   0. `[WRITE, SIGNER]` user            — signs both outer tx and the
+///                                          collateral SPL Token Transfer
 ///   1. `[]`              market
 ///   2. `[WRITE]`         position        — PDA at [b"position", user, market]
 ///   3. `[]`              oracle
 ///   4. `[]`              funding
-///   5. `[]`              system_program
+///   5. `[]`              mint            — quote-asset SPL Mint
+///   6. `[WRITE]`         user_token      — user's quote token account (SPL)
+///   7. `[WRITE]`         vault_token     — PDA at [b"vault", market, mint]
+///   8. `[]`              system_program
+///   9. `[]`              token_program
 fn process_open_position(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -1962,7 +2090,11 @@ fn process_open_position(
     let position_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let oracle_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let funding_ai = accounts.get(4).ok_or(ProgramError::NotEnoughAccountKeys)?;
-    let system_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let mint_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let user_token_ai = accounts.get(6).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let vault_token_ai = accounts.get(7).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let system_ai = accounts.get(8).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let token_ai = accounts.get(9).ok_or(ProgramError::NotEnoughAccountKeys)?;
 
     if !user_ai.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -1973,8 +2105,16 @@ fn process_open_position(
     if system_ai.key != &system_program::ID {
         return Err(ProgramError::IncorrectProgramId);
     }
+    if token_ai.key != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if user_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        msg!("open_position: user_token_account not owned by SPL Token");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    verify_vault_token_account(vault_token_ai, market_ai.key, mint_ai.key, program_id)?;
 
-    // PDA derivation.
+    // Position PDA derivation.
     let (expected, bump) = Pubkey::find_program_address(
         &[POSITION_SEED, user_ai.key.as_ref(), market_ai.key.as_ref()],
         program_id,
@@ -2001,7 +2141,7 @@ fn process_open_position(
         return Err(ProgramError::InvalidArgument);
     }
 
-    // Allocate the position PDA.
+    // (a) Allocate the position PDA via CPI to System. Pays rent from user.
     let rent = Rent::get()?.minimum_balance(Position::LEN);
     let create_ix = system_instruction::create_account(
         user_ai.key,
@@ -2021,6 +2161,18 @@ fn process_open_position(
         ]],
     )?;
 
+    // (b) Escrow the collateral via CPI to SPL Token. User signs the outer
+    // transaction; the signature flows through to SPL Token (Chapter 6's
+    // signer-privilege-extension pattern).
+    spl_token_transfer_user_signed(
+        user_token_ai,
+        vault_token_ai,
+        user_ai,
+        token_ai,
+        collateral,
+    )?;
+
+    // (c) Write the position record.
     let mut data = position_ai.try_borrow_mut_data()?;
     let position: &mut Position = bytemuck::from_bytes_mut(&mut data[..Position::LEN]);
     position.discriminator = POSITION_DISCRIMINATOR;
@@ -2035,7 +2187,7 @@ fn process_open_position(
     position._reserved = [0u8; 32];
 
     msg!(
-        "open_position: size={} entry={} collateral={} funding_snap={}",
+        "open_position: size={} entry={} collateral={} escrowed (funding_snap={})",
         size,
         mark,
         collateral,
@@ -2047,10 +2199,16 @@ fn process_open_position(
 /// Payload: empty.
 ///
 /// Accounts:
-///   0. `[SIGNER]` user — must match the position's owner
+///   0. `[SIGNER]` user            — must match the position's owner
 ///   1. `[WRITE]`  position
 ///   2. `[]`       oracle
 ///   3. `[]`       funding
+///   4. `[]`       market          — needed for vault-PDA derivation
+///   5. `[]`       mint            — quote-asset SPL Mint
+///   6. `[WRITE]`  user_token      — destination of the payout
+///   7. `[WRITE]`  vault_token     — PDA at [b"vault", market, mint]
+///   8. `[]`       vault_authority — PDA at [b"vault_auth", market]
+///   9. `[]`       token_program
 fn process_close_position(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -2064,6 +2222,12 @@ fn process_close_position(
     let position_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let oracle_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let funding_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let market_ai = accounts.get(4).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let mint_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let user_token_ai = accounts.get(6).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let vault_token_ai = accounts.get(7).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let vault_authority_ai = accounts.get(8).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let token_ai = accounts.get(9).ok_or(ProgramError::NotEnoughAccountKeys)?;
 
     if !user_ai.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -2071,54 +2235,92 @@ fn process_close_position(
     if position_ai.owner != program_id || position_ai.data_len() != Position::LEN {
         return Err(ProgramError::InvalidAccountData);
     }
+    if token_ai.key != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if user_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    verify_vault_token_account(vault_token_ai, market_ai.key, mint_ai.key, program_id)?;
+    let vault_auth_bump = verify_vault_authority(vault_authority_ai, market_ai.key, program_id)?;
 
     let mark = read_fresh_oracle(oracle_ai, program_id)?;
     let funding_now = read_funding_index(funding_ai, program_id)?;
 
-    let mut data = position_ai.try_borrow_mut_data()?;
-    let position: &mut Position = bytemuck::from_bytes_mut(&mut data[..Position::LEN]);
+    // Compute realized payout inside a borrow-scope, then drop the borrow
+    // before doing the CPI (the CPI may need to re-borrow vault state).
+    let payout: u64;
+    {
+        let mut data = position_ai.try_borrow_mut_data()?;
+        let position: &mut Position =
+            bytemuck::from_bytes_mut(&mut data[..Position::LEN]);
 
-    if position.discriminator != POSITION_DISCRIMINATOR {
-        return Err(ProgramError::UninitializedAccount);
+        if position.discriminator != POSITION_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        if position.user != *user_ai.key.as_ref() {
+            msg!("close_position: caller is not the position owner");
+            return Err(ProgramError::IllegalOwner);
+        }
+        if position.size == 0 {
+            msg!("close_position: position already closed");
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let equity = compute_equity(position, mark, funding_now);
+        msg!(
+            "close_position: size={} entry={} mark={} equity={}",
+            position.size,
+            position.entry_price,
+            mark,
+            equity
+        );
+
+        // Underwater closes pay 0 to the user. The deposited collateral
+        // (in the vault) becomes a shortfall the protocol absorbs — the
+        // insurance-fund hook in §11.6 is the right place to socialize it.
+        payout = if equity < 0 { 0 } else { equity as u64 };
+
+        // Close the position record. collateral=0 because the value has
+        // been (or is about to be) paid out via the CPI below.
+        position.collateral = 0;
+        position.size = 0;
+        position.entry_price = 0;
+        position.funding_snapshot_index = funding_now;
     }
-    if position.user != *user_ai.key.as_ref() {
-        msg!("close_position: caller is not the position owner");
-        return Err(ProgramError::IllegalOwner);
-    }
-    if position.size == 0 {
-        msg!("close_position: position already closed");
-        return Err(ProgramError::InvalidArgument);
-    }
 
-    let equity = compute_equity(position, mark, funding_now);
-    msg!(
-        "close_position: size={} entry={} mark={} equity={}",
-        position.size,
-        position.entry_price,
-        mark,
-        equity
-    );
+    // Vault → user transfer for the realized payout. Vault PDA signs via
+    // invoke_signed with [b"vault_auth", market] seeds.
+    spl_token_transfer_vault_signed(
+        vault_token_ai,
+        user_token_ai,
+        vault_authority_ai,
+        market_ai.key,
+        vault_auth_bump,
+        token_ai,
+        payout,
+    )?;
 
-    // Realize PnL into collateral. Underwater closes wipe the collateral
-    // to zero (the program does not socialize the loss here — see chapter
-    // hook into insurance fund).
-    let new_collateral = if equity < 0 { 0 } else { equity as u64 };
-    position.collateral = new_collateral;
-    position.size = 0;
-    position.entry_price = 0;
-    position.funding_snapshot_index = funding_now;
-
-    msg!("close_position: closed. realized collateral = {}", new_collateral);
+    msg!("close_position: closed. paid out {} to user", payout);
     Ok(())
 }
 
 /// Payload: empty.
 ///
 /// Accounts:
-///   0. `[SIGNER]` liquidator — anyone; permissionless
+///   0. `[SIGNER]` liquidator        — anyone; permissionless
 ///   1. `[WRITE]`  position
 ///   2. `[]`       oracle
 ///   3. `[]`       funding
+///   4. `[]`       market            — for vault-PDA derivation
+///   5. `[]`       mint              — quote-asset SPL Mint
+///   6. `[WRITE]`  owner_token       — position owner's token account
+///                                     (gets the remainder after penalty)
+///   7. `[WRITE]`  liquidator_token  — liquidator's token account
+///                                     (gets the penalty bounty)
+///   8. `[WRITE]`  vault_token       — PDA at [b"vault", market, mint]
+///   9. `[]`       vault_authority   — PDA at [b"vault_auth", market]
+///  10. `[]`       token_program
 fn process_liquidate(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -2132,6 +2334,13 @@ fn process_liquidate(
     let position_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let oracle_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let funding_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let market_ai = accounts.get(4).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let mint_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let owner_token_ai = accounts.get(6).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let liquidator_token_ai = accounts.get(7).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let vault_token_ai = accounts.get(8).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let vault_authority_ai = accounts.get(9).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let token_ai = accounts.get(10).ok_or(ProgramError::NotEnoughAccountKeys)?;
 
     if !liquidator_ai.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -2139,64 +2348,103 @@ fn process_liquidate(
     if position_ai.owner != program_id || position_ai.data_len() != Position::LEN {
         return Err(ProgramError::InvalidAccountData);
     }
+    if token_ai.key != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if owner_token_ai.owner != &SPL_TOKEN_PROGRAM_ID
+        || liquidator_token_ai.owner != &SPL_TOKEN_PROGRAM_ID
+    {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    verify_vault_token_account(vault_token_ai, market_ai.key, mint_ai.key, program_id)?;
+    let vault_auth_bump = verify_vault_authority(vault_authority_ai, market_ai.key, program_id)?;
 
     let mark = read_fresh_oracle(oracle_ai, program_id)?;
     let funding_now = read_funding_index(funding_ai, program_id)?;
 
-    let mut data = position_ai.try_borrow_mut_data()?;
-    let position: &mut Position = bytemuck::from_bytes_mut(&mut data[..Position::LEN]);
+    let penalty_amount: u64;
+    let owner_amount: u64;
+    {
+        let mut data = position_ai.try_borrow_mut_data()?;
+        let position: &mut Position =
+            bytemuck::from_bytes_mut(&mut data[..Position::LEN]);
 
-    if position.discriminator != POSITION_DISCRIMINATOR {
-        return Err(ProgramError::UninitializedAccount);
-    }
-    if position.size == 0 {
-        msg!("liquidate: position already closed");
-        return Err(ProgramError::InvalidArgument);
-    }
+        if position.discriminator != POSITION_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        if position.size == 0 {
+            msg!("liquidate: position already closed");
+            return Err(ProgramError::InvalidArgument);
+        }
 
-    let equity = compute_equity(position, mark, funding_now);
-    let notional_val = notional(position.size, mark);
-    let maint_required = (notional_val * (MAINT_MARGIN_BPS as u128) / 10_000) as i128;
+        let equity = compute_equity(position, mark, funding_now);
+        let notional_val = notional(position.size, mark);
+        let maint_required =
+            (notional_val * (MAINT_MARGIN_BPS as u128) / 10_000) as i128;
 
-    msg!(
-        "liquidate: size={} mark={} equity={} maint_required={}",
-        position.size,
-        mark,
-        equity,
-        maint_required
-    );
-
-    if equity >= maint_required {
         msg!(
-            "liquidate: position is healthy (equity {} >= maint {}), not liquidatable",
+            "liquidate: size={} mark={} equity={} maint_required={}",
+            position.size,
+            mark,
             equity,
             maint_required
         );
-        return Err(ProgramError::InvalidArgument);
+
+        if equity >= maint_required {
+            msg!(
+                "liquidate: position is healthy (equity {} >= maint {}), not liquidatable",
+                equity,
+                maint_required
+            );
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Liquidator's penalty bounty (cap to LIQUIDATION_PENALTY_BPS of
+        // notional, but never more than the equity that survives).
+        let raw_penalty = (notional_val * (LIQUIDATION_PENALTY_BPS as u128) / 10_000)
+            .min(i64::MAX as u128) as i128;
+        let equity_positive = if equity < 0 { 0 } else { equity };
+        let penalty = raw_penalty.min(equity_positive);
+        let owner_remainder = (equity_positive - penalty).max(0);
+
+        penalty_amount = penalty as u64;
+        owner_amount = owner_remainder as u64;
+
+        msg!(
+            "liquidate: penalty={} (to {}), owner_remainder={} (to {})",
+            penalty_amount,
+            liquidator_ai.key,
+            owner_amount,
+            Pubkey::new_from_array(position.user)
+        );
+
+        position.collateral = 0;
+        position.size = 0;
+        position.entry_price = 0;
+        position.funding_snapshot_index = funding_now;
     }
 
-    // Liquidatable. Apply penalty to whatever collateral survives the
-    // close, zero the position. In production the penalty would be
-    // transferred from the vault to the liquidator's token account via
-    // SPL Token CPI; here we only update the in-account number.
-    let liquidation_penalty = ((notional_val * (LIQUIDATION_PENALTY_BPS as u128) / 10_000)
-        .min(i64::MAX as u128)) as i128;
+    // (a) Vault → liquidator transfer for the penalty.
+    spl_token_transfer_vault_signed(
+        vault_token_ai,
+        liquidator_token_ai,
+        vault_authority_ai,
+        market_ai.key,
+        vault_auth_bump,
+        token_ai,
+        penalty_amount,
+    )?;
 
-    let mut realized = if equity < 0 { 0 } else { equity };
-    realized = (realized - liquidation_penalty).max(0);
-    let new_collateral = realized as u64;
-
-    msg!(
-        "liquidate: penalty={} new_collateral={} (paid to liquidator {})",
-        liquidation_penalty,
-        new_collateral,
-        liquidator_ai.key
-    );
-
-    position.collateral = new_collateral;
-    position.size = 0;
-    position.entry_price = 0;
-    position.funding_snapshot_index = funding_now;
+    // (b) Vault → position-owner transfer for whatever's left.
+    spl_token_transfer_vault_signed(
+        vault_token_ai,
+        owner_token_ai,
+        vault_authority_ai,
+        market_ai.key,
+        vault_auth_bump,
+        token_ai,
+        owner_amount,
+    )?;
 
     Ok(())
 }

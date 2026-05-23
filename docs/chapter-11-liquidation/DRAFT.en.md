@@ -5,19 +5,19 @@
 
 ---
 
-## §11.0  Framing — and the missing CPI
+## §11.0  Framing
 
 This is the convergence chapter. Every other Phase A and Phase B primitive — oracle, funding, vault, matcher, parallelism — exists so this chapter can be written. A perp DEX without `OpenPosition` / `ClosePosition` / `Liquidate` is a collection of pieces; a perp DEX with them is a perp DEX.
 
-The chapter ships three instructions:
+The chapter ships three instructions, each of which integrates the SPL Token escrow path from Chapter 6 directly into the position lifecycle:
 
-1. **`OpenPosition`** — creates a per-(user, market) Position PDA, reads the oracle for the entry price, snapshots the cumulative funding index for later settlement, and validates that the user has posted enough collateral to meet the initial margin requirement.
-2. **`ClosePosition`** — the owner's exit. Settles funding via the snapshot pattern from Chapter 10, computes realized PnL = `size × (mark - entry)`, applies it to the collateral, zeros the position.
-3. **`Liquidate`** — anyone's exit on someone else's underwater position. Computes equity, compares to maintenance margin, and if the position has fallen below, force-closes at the current mark and pays a penalty (out of remaining collateral) to the liquidator.
+1. **`OpenPosition`** — creates a per-(user, market) Position PDA, reads the oracle for the entry price, snapshots the cumulative funding index for later settlement, validates the initial margin requirement, and **escrows the collateral** by CPI'ing an SPL Token Transfer from the user's quote token account into the market vault (the per-(market, mint) vault built in Chapter 6).
+2. **`ClosePosition`** — the owner's exit. Settles funding via the snapshot pattern from Chapter 10, computes realized PnL = `size × (mark - entry)`, **transfers the realized amount back to the user** via an SPL Token CPI signed by the vault authority PDA (`invoke_signed` with `[b"vault_auth", market]` seeds), and zeros the position.
+3. **`Liquidate`** — anyone's exit on someone else's underwater position. Computes equity, compares to maintenance margin, and if the position has fallen below, force-closes at the current mark. **Two SPL Token CPIs run inside the handler:** vault → liquidator for the penalty bounty, and vault → position-owner for whatever remains. Both signed by the vault authority PDA.
 
-One scope honesty note up front: **collateral here is tracked, not escrowed.** Real production would integrate Chapter 6's vault — `OpenPosition` would CPI an SPL Token Transfer from the user's quote token account into the market vault, and the converse on close/liquidate. The math in this chapter is exactly the math you'd run regardless of where the tokens live; what's missing is the SPL Token CPI plumbing. Adding it is mechanical (the patterns from Chapter 6's `Deposit` carry over directly) but doubles the AccountMeta count of every handler and obscures the lifecycle/math focus.
+The collateral now lives where a real perp DEX puts it — the program's vault token account, owned by SPL Token, controlled by an `invoke_signed`-only PDA. The position record holds the *bookkeeping* (size, entry price, snapshot index); the vault holds the *money*. The two stay in sync because every state transition that touches the bookkeeping also runs the matching CPI.
 
-In production you'd also split closed collateral between the liquidator and an **insurance fund** account — the fund covers shortfalls when a position closes underwater and there isn't enough collateral to satisfy the counterparty. We discuss the insurance fund's role in §11.6 but don't implement it; that's a small follow-up chapter on its own.
+One scope-honesty note remains for this chapter: **insurance fund**. When a position closes underwater (`equity < 0`), the deposited collateral is already sitting in the vault — and the program currently lets that residue absorb the loss. In production you'd route a fraction of every liquidation penalty into an `InsuranceFund` account, draw from it when underwater closes leave a shortfall, and only socialize to the LP pool once the fund is empty. We discuss this in §11.6 but don't implement it; that's a follow-up chapter on its own.
 
 ---
 
@@ -105,9 +105,9 @@ The gap between IM (10%) and MM (5%) is the **maintenance buffer** — how far t
 
 ## §11.3  Walking `OpenPosition`
 
-`process_open_position` at `programs/openhl-core/src/lib.rs:1881–1993`. The handler decomposes into five parts.
+`process_open_position` at `programs/openhl-core/src/lib.rs`. The handler decomposes into six parts: validation, oracle/funding read, initial margin check, position PDA allocation, **collateral escrow CPI**, and the position state write.
 
-**Validation** (lines 1894–1916): payload size, non-zero size and collateral, user is signer, market is owned by us, system program is the System program. PDA derivation:
+**Validation**: payload size, non-zero size and collateral, user is signer, market is owned by us, system program is the System program, **token program is SPL Token, user_token_account is owned by SPL Token, and the vault_token_account matches the derived PDA at `[VAULT_SEED, market, mint]`** (the new escrow-side checks). PDA derivation for the position itself:
 
 ```rust
 let (expected, bump) = Pubkey::find_program_address(
@@ -144,9 +144,25 @@ if (collateral as u128) < im_required {
 
 The collateral must cover at least 10% of notional. If you ask for a position of 10 at price 100 (notional = 1000) with collateral 50, the check rejects: 50 < 100 (IM). With collateral 100, accepted exactly at IM. With collateral 200, accepted with 100 of buffer above IM.
 
-**Allocate the PDA** (lines 1946–1960): standard `invoke_signed` to `System::create_account`, signing with the position PDA's seeds. Same pattern as `CreateMarket`, `CreateVault`, etc. — Chapter 3 introduced it, every subsequent chapter has reused it.
+**Allocate the position PDA**: standard `invoke_signed` to `System::create_account`, signing with `[POSITION_SEED, user.key, market.key, bump]`. Same pattern as `CreateMarket`, `CreateVault`, etc. — Chapter 3 introduced it, every subsequent chapter has reused it.
 
-**Write the layout** (lines 1962–1978):
+**Escrow the collateral via CPI to SPL Token Transfer**:
+
+```rust
+spl_token_transfer_user_signed(
+    user_token_ai,    // source — user's quote account
+    vault_token_ai,   // destination — per-(market, mint) vault PDA
+    user_ai,          // authority — the user, signing the outer tx
+    token_ai,         // SPL Token program
+    collateral,       // amount in quote base-units
+)?;
+```
+
+`spl_token_transfer_user_signed` is one of the four escrow helpers factored at the top of the position section. It builds the SPL Token Transfer instruction by hand (Chapter 6's bytes-up pattern — `[tag=3, amount_le]` data + `[source, dest, authority]` accounts), then calls plain `invoke`. The user's signature on the outer transaction extends through to SPL Token via signer-privilege extension (Chapter 6 §6.2). After this CPI commits, the user's quote balance has dropped by `collateral` and the vault's has grown by the same.
+
+The order matters: the position PDA must be allocated *before* the transfer, because if the transfer fails (insufficient funds) we want the whole transaction to revert — which it does, leaving no orphan Position account. If the order were reversed, an InsufficientFunds error on transfer would leave a half-initialized Position behind (rent paid, but no escrow). Atomicity of the whole tx is what makes the natural error handling correct.
+
+**Write the position state**:
 
 ```rust
 position.size = size;
@@ -155,7 +171,7 @@ position.collateral = collateral;
 position.funding_snapshot_index = funding_snapshot;
 ```
 
-Four data writes. `entry_price = mark` stamps the oracle's price as the position's reference. `funding_snapshot_index = funding_snapshot` captures the funding index at this moment — every future close/liquidate computes funding PnL as the delta from this snapshot.
+Four data writes. `entry_price = mark` stamps the oracle's price as the position's reference. `funding_snapshot_index = funding_snapshot` captures the funding index at this moment — every future close/liquidate computes funding PnL as the delta from this snapshot. `collateral` mirrors what's escrowed in the vault; the bookkeeping and the vault balance stay in sync because the same handler updates both atomically.
 
 > **Exercise §11.3.** What happens if you try to `OpenPosition` against a stale oracle (more than 25 slots since the last `SetOraclePrice`)? Trace the failure path through `read_fresh_oracle`. Then run `funding --update --rate 0` and `oracle --set --price ...` and re-try the open.
 
@@ -163,7 +179,7 @@ Four data writes. `entry_price = mark` stamps the oracle's price as the position
 
 ## §11.4  Walking `ClosePosition`
 
-`process_close_position` at lines 1995–2061. Simpler than open — no PDA creation, just settle and zero.
+`process_close_position`. Simpler than open in one dimension (no PDA creation) but more involved in another: it adds an outbound SPL Token CPI signed by the vault authority PDA via `invoke_signed`.
 
 **Validation + owner check** (lines 2007–2024):
 
@@ -187,34 +203,53 @@ let equity = compute_equity(position, mark, funding_now);
 
 The same oracle + funding read pattern from open. Equity is the only computation that matters at close — it tells us what the position is worth right now in quote-currency terms.
 
-**Realize PnL** (lines 2046–2058):
+**Compute the payout + zero the position record** (inside a `try_borrow_mut_data` scope so the borrow drops before the CPI):
 
 ```rust
-let new_collateral = if equity < 0 { 0 } else { equity as u64 };
-position.collateral = new_collateral;
-position.size = 0;
-position.entry_price = 0;
-position.funding_snapshot_index = funding_now;
+let payout: u64;
+{
+    let mut data = position_ai.try_borrow_mut_data()?;
+    let position: &mut Position = bytemuck::from_bytes_mut(...);
+    // ... owner check, size != 0 check ...
+    let equity = compute_equity(position, mark, funding_now);
+    payout = if equity < 0 { 0 } else { equity as u64 };
+
+    position.collateral = 0;
+    position.size = 0;
+    position.entry_price = 0;
+    position.funding_snapshot_index = funding_now;
+}
 ```
 
-Four writes:
+Note `position.collateral = 0` — the value isn't held in the position account anymore; it's about to be paid out from the vault. The position becomes a pure "closed" sentinel: size 0, entry 0, collateral 0.
 
-1. **Collateral becomes equity** (or zero if underwater). A profitable close grows the collateral; a losing close shrinks it; an underwater close wipes it to zero. In production this collateral would then move out of the vault back to the user via SPL Token CPI; here it just sits in the position account, ready to be returned by a follow-up "withdraw" instruction not implemented yet.
-2. **Size = 0** marks the position as closed. The PDA stays allocated; reopening derives the same PDA and writes over the dormant state.
-3. **Entry price = 0** is housekeeping — keeps the dormant state recognizable (a zeroed `entry_price` is impossible for an open position).
-4. **Funding snapshot = current** so a subsequent reopen starts from a fresh snapshot rather than re-applying the old delta.
+**Pay the user from the vault** via `invoke_signed`:
 
-**Underwater closes lose collateral, don't pass losses on.** A position that closes with equity = -50 (loss exceeds collateral) wipes the collateral to 0 and stops there. The counterparty (whoever was on the other side of the original trade — implicitly, the matcher / book) doesn't get notified or made whole. This is the place where a real perp DEX would tap an insurance fund: "the position closed with a 50-unit shortfall; insurance fund covers it, the other side gets paid in full." See §11.6.
+```rust
+spl_token_transfer_vault_signed(
+    vault_token_ai,
+    user_token_ai,
+    vault_authority_ai,
+    market_ai.key,
+    vault_auth_bump,
+    token_ai,
+    payout,
+)?;
+```
 
-> **Exercise §11.4.** Open a position at entry = 100, size = 5, collateral = 100. Move the oracle to mark = 80. Close. The expected equity is `100 + 5 × (80 - 100) = 0`. Verify the position post-state has `collateral = 0`.
+The vault authority is a PDA at `[VAULT_AUTH_SEED, market]`, so the program signs for it: `invoke_signed` with `[VAULT_AUTH_SEED, market_key, &[bump]]`. The vault token account drops `payout` units; the user's token account receives them. If `payout == 0` (underwater close), the helper skips the CPI — no point burning CU on a zero-amount transfer.
+
+**Underwater closes lose collateral, don't pass losses on.** A position that closes with equity = -50 (loss exceeds collateral) sends `payout = 0` to the user, but the 100 units they originally deposited are still sitting in the vault — now decoupled from any position record. That residue is the implicit subsidy to whoever was on the other side of the trade. In production an InsuranceFund draws on these residues + a fraction of liquidation penalties to cover the shortfalls properly; see §11.6.
+
+> **Exercise §11.4.** Open a position at entry = 100, size = 5, collateral = 100. Move the oracle to mark = 80. Close. The expected equity is `100 + 5 × (80 - 100) = 0`. Verify the user's quote token balance after the close is unchanged from before the open (because payout = 0 — the 100 they deposited went into the vault and stayed there).
 
 ---
 
 ## §11.5  Walking `Liquidate`
 
-`process_liquidate` at lines 2063–2152. The crucial difference from close: **anyone can call it**.
+`process_liquidate`. The crucial difference from close: **anyone can call it**. The handler runs *two* outbound SPL Token CPIs — vault → liquidator for the penalty bounty, vault → position-owner for the remainder — both signed by the vault authority PDA.
 
-**Validation** (lines 2076–2091): the *liquidator* must be a signer, but the program does *not* check that the liquidator matches the position's user. Anyone can call liquidate on anyone's position.
+**Validation**: the *liquidator* must be a signer, but the program does *not* check that the liquidator matches the position's user. Anyone can call liquidate on anyone's position. Additional escrow-side checks: token_program is SPL Token, both `owner_token` and `liquidator_token` are SPL Token-owned, vault_token matches the derived PDA, vault_authority matches the derived PDA (and the bump is captured for the two invoke_signed calls below).
 
 ```rust
 let liquidator_ai = accounts.first().ok_or(...)?;
@@ -242,23 +277,32 @@ if equity >= maint_required {
 
 If `equity >= maintenance_margin`, the position is fine and the call is rejected. The liquidator just paid tx fees for nothing — a small disincentive to spam-call liquidate against healthy positions. (Production protocols sometimes refund tx fees when this happens, or simply expect liquidators to do their own off-chain health check before submitting.)
 
-**Apply penalty and force-close** (lines 2117–2147):
+**Apply penalty + force-close + run two CPIs**:
 
 ```rust
-let liquidation_penalty = ((notional_val * (LIQUIDATION_PENALTY_BPS as u128) / 10_000)
-    .min(i64::MAX as u128)) as i128;
+// Inside a borrow scope (so position data ref drops before CPIs):
+let equity = compute_equity(position, mark, funding_now);
+let raw_penalty = (notional_val * LIQUIDATION_PENALTY_BPS as u128 / 10_000) as i128;
+let equity_positive = if equity < 0 { 0 } else { equity };
+let penalty = raw_penalty.min(equity_positive);             // cap at available equity
+let owner_remainder = (equity_positive - penalty).max(0);
 
-let mut realized = if equity < 0 { 0 } else { equity };
-realized = (realized - liquidation_penalty).max(0);
-let new_collateral = realized as u64;
+penalty_amount = penalty as u64;
+owner_amount = owner_remainder as u64;
 
-position.collateral = new_collateral;
+position.collateral = 0;
 position.size = 0;
 position.entry_price = 0;
 position.funding_snapshot_index = funding_now;
+
+// ─── outside the borrow scope ───
+// CPI 1: vault → liquidator
+spl_token_transfer_vault_signed(vault_token_ai, liquidator_token_ai, ..., penalty_amount)?;
+// CPI 2: vault → position owner
+spl_token_transfer_vault_signed(vault_token_ai, owner_token_ai, ..., owner_amount)?;
 ```
 
-The penalty is taken out of what's left of the position's equity. `LIQUIDATION_PENALTY_BPS = 100` = 1% of notional. The remaining collateral (after penalty) stays in the position account; in production the penalty amount would be transferred from the vault to the liquidator's token account via SPL Token CPI.
+The penalty is capped at the equity that survives (you can't pay a 50-unit bounty out of a position with 10 units of equity remaining). The two CPIs are sequential, both `invoke_signed` with the same vault-authority seeds. Either both succeed and the position is fully wound down, or the whole transaction reverts — atomicity is what keeps the books consistent.
 
 The penalty serves two purposes:
 
@@ -275,9 +319,9 @@ The Liquidate handler does NOT verify *why* the position is underwater. It could
 
 ---
 
-## §11.6  The missing pieces — insurance fund and SPL Token plumbing
+## §11.6  The missing piece — insurance fund
 
-Two things this chapter explicitly does not implement, with their production roles called out.
+One thing this chapter still does not implement, with its production role called out.
 
 **Insurance fund.** A separate `InsuranceFund` account per market holds a pool of quote-currency that covers underwater-close shortfalls. The pattern:
 
@@ -293,13 +337,7 @@ when ClosePosition / Liquidate computes equity < 0:
 
 The insurance fund is funded by a fraction of liquidation penalties (e.g., 50% to liquidator, 50% to insurance fund), exchange fees, and sometimes by exchange equity at launch. Without an insurance fund, every losing position with insufficient collateral imposes a hidden loss on whoever was on the other side — usually the LP pool or the rest of the book.
 
-**SPL Token escrow.** Every operation that mentions "collateral" in this chapter is currently bookkeeping-only. Real production:
-
-- `OpenPosition` CPIs SPL Token Transfer from user's quote token account into the market vault for the `collateral` amount.
-- `ClosePosition` CPIs the other direction, returning `new_collateral` to the user.
-- `Liquidate` CPIs to the liquidator for the penalty and to the user (or the insurance fund) for the remainder.
-
-Adding this is mechanical: Chapter 6's `Deposit` pattern carries over verbatim. The reason it's not here is that doing so triples the AccountMeta count on every handler (need user_token_account, vault_token_account, token_program for each) and dilutes the lifecycle/math focus this chapter is built around. The deferred chapter (call it Ch.11b) would add the vault CPIs without touching the math at all.
+In our current escrowed handlers, the residue of an underwater close stays in the vault — physically, the user's original deposit is still there, just not associated with any active position. That residue is implicitly subsidizing the counterparty. An insurance fund would route those leftovers properly: a fraction of each liquidation penalty into the fund at withdrawal time, a draw from the fund whenever an underwater close would otherwise leave a vault residue. The accounting is a small chapter on its own (15th in the track if added) — the math is simple, the wiring touches `Liquidate` and `ClosePosition`, and the new `InsuranceFund` PDA is the only state addition.
 
 ---
 
