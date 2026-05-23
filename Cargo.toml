@@ -6,6 +6,8 @@ members = [
     "scripts/allocate-market",
     "scripts/bench",
     "scripts/create-market",
+    "scripts/create-vault",
+    "scripts/deposit",
     "scripts/init-market",
     "scripts/stats",
 ]

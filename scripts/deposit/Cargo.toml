@@ -1,0 +1,20 @@
+[package]
+name = "deposit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Chapter 6 worked example: calls openhl-core::Deposit, which CPIs to SPL Token Transfer with the user as outer-tx signer (invoke, not invoke_signed)."
+
+[[bin]]
+name = "deposit"
+path = "src/main.rs"
+
+[dependencies]
+openhl-core = { path = "../../programs/openhl-core", features = ["no-entrypoint"] }
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+solana-program = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

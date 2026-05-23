@@ -25,6 +25,21 @@
 //!                     Trivial body; the interesting thing is the
 //!                     AccountMeta declaration (single WRITE on a singleton
 //!                     pubkey), which is what Sealevel sees.
+//!   5  CreateVault   — written for Chapter 6 (CPI internals)
+//!                     For a given (market, mint) pair: derives the vault
+//!                     token-account PDA and the vault-authority PDA,
+//!                     CPIs to System::create_account (invoke_signed) to
+//!                     allocate the token account, then CPIs to SPL Token
+//!                     InitializeAccount3 (invoke) to set its mint+owner.
+//!                     SPL Token instruction data is hand-rolled — no
+//!                     spl-token crate dep, in keeping with the bytes-up
+//!                     theme.
+//!   6  Deposit       — also Chapter 6
+//!                     Moves SPL tokens from user_token_account into
+//!                     vault_token_account via SPL Token Transfer CPI.
+//!                     Calls plain `invoke` because the user signs at the
+//!                     outer transaction level and signer privilege
+//!                     extends through to the SPL Token program.
 //!
 //! The entire program is one file on purpose. Splitting it into the usual
 //! `instruction.rs` / `processor.rs` / `state.rs` modules buys nothing
@@ -38,9 +53,10 @@ use solana_program::{
     account_info::AccountInfo,
     entrypoint::ProgramResult,
     hash::hash as sha256,
+    instruction::{AccountMeta, Instruction},
     log::sol_log_compute_units,
     msg,
-    program::invoke_signed,
+    program::{invoke, invoke_signed},
     program_error::ProgramError,
     pubkey::Pubkey,
     sysvar::{rent::Rent, Sysvar},
@@ -60,6 +76,29 @@ pub const MARKET_SEED: &[u8] = b"market";
 /// PDA per program ID. This is the design choice Chapter 5 critiques: a
 /// singleton write-shared account becomes a Sealevel scheduling bottleneck.
 pub const STATS_SEED: &[u8] = b"stats";
+
+/// PDA seed prefix for vault token accounts.
+///
+/// Full seed list: `[VAULT_SEED, market_pubkey.as_ref(), mint_pubkey.as_ref(), &[bump]]`.
+/// One vault per (market, mint), so a market can have a base-asset vault and
+/// a quote-asset vault that live at distinct PDAs.
+pub const VAULT_SEED: &[u8] = b"vault";
+
+/// PDA seed prefix for the per-market vault *authority*.
+///
+/// Full seed list: `[VAULT_AUTH_SEED, market_pubkey.as_ref(), &[bump]]`.
+/// The vault-authority PDA is the SPL Token "owner" of every vault token
+/// account belonging to a given market. Withdrawals require the program to
+/// sign for this PDA via `invoke_signed`.
+pub const VAULT_AUTH_SEED: &[u8] = b"vault_auth";
+
+/// SPL Token program ID. Hardcoded so we don't pull in the spl-token crate
+/// just for this constant.
+pub const SPL_TOKEN_PROGRAM_ID: Pubkey =
+    Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+
+/// Size of an SPL Token Account, per spl_token::state::Account::LEN.
+const TOKEN_ACCOUNT_LEN: usize = 165;
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
@@ -84,6 +123,8 @@ pub fn process_instruction(
         2 => process_bench(payload),
         3 => process_create_stats(program_id, accounts, payload),
         4 => process_bump_stats(program_id, accounts, payload),
+        5 => process_create_vault(program_id, accounts, payload),
+        6 => process_deposit(accounts, payload),
         unknown => {
             msg!("unknown instruction tag: {}", unknown);
             Err(ProgramError::InvalidInstructionData)
@@ -535,5 +576,224 @@ fn process_bump_stats(
 
     stats.market_count = stats.market_count.saturating_add(1);
     msg!("stats.market_count: {}", stats.market_count);
+    Ok(())
+}
+
+// =============================================================================
+// CreateVault + Deposit — SPL Token CPI mechanics (Chapter 6).
+// =============================================================================
+//
+// The SPL Token instructions are constructed by hand rather than imported
+// from the spl-token crate. Two reasons:
+//   1. Chapter 6 teaches the bytes that go on the wire — the instruction
+//      tag, the field encoding, the AccountMeta order. Importing a builder
+//      hides exactly the thing the chapter is about.
+//   2. spl-token at its current version pulls in a chunk of code we do not
+//      need for two CPI calls, and inflates the .so binary by ~25 KB.
+
+/// SPL Token instruction tags (subset used by this program).
+mod spl_token_ix {
+    pub const TRANSFER: u8 = 3;
+    pub const INITIALIZE_ACCOUNT_3: u8 = 18;
+}
+
+const CREATE_VAULT_PAYLOAD_LEN: usize = 0;
+const DEPOSIT_PAYLOAD_LEN: usize = 8; // amount: u64 LE
+
+/// Accounts:
+///   0. `[WRITE, SIGNER]` payer
+///   1. `[]`              market           — must be owned by program_id
+///   2. `[]`              mint             — SPL Mint, must be owned by Token
+///   3. `[WRITE]`         vault_token_acct — new SPL Token Account at PDA
+///                                            [b"vault", market.key, mint.key]
+///   4. `[]`              vault_authority  — PDA at
+///                                            [b"vault_auth", market.key];
+///                                            becomes the SPL Token "owner"
+///                                            of vault_token_acct
+///   5. `[]`              system_program
+///   6. `[]`              token_program    — must be SPL_TOKEN_PROGRAM_ID
+fn process_create_vault(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != CREATE_VAULT_PAYLOAD_LEN {
+        msg!("create_vault: payload must be empty");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let payer_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let market_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let mint_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let vault_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let vault_auth_ai = accounts.get(4).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let system_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let token_ai = accounts.get(6).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !payer_ai.is_signer {
+        msg!("create_vault: payer must sign");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if market_ai.owner != program_id {
+        msg!("create_vault: market not owned by this program");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if mint_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        msg!("create_vault: mint not owned by SPL Token");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if system_ai.key != &system_program::ID {
+        msg!("create_vault: account[5] is not the System program");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if token_ai.key != &SPL_TOKEN_PROGRAM_ID {
+        msg!("create_vault: account[6] is not the SPL Token program");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    // Derive both PDAs and validate the caller passed the right accounts.
+    let (expected_vault, vault_bump) = Pubkey::find_program_address(
+        &[VAULT_SEED, market_ai.key.as_ref(), mint_ai.key.as_ref()],
+        program_id,
+    );
+    if vault_ai.key != &expected_vault {
+        msg!(
+            "create_vault: passed vault {} != derived PDA {}",
+            vault_ai.key,
+            expected_vault
+        );
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let (expected_auth, _auth_bump) =
+        Pubkey::find_program_address(&[VAULT_AUTH_SEED, market_ai.key.as_ref()], program_id);
+    if vault_auth_ai.key != &expected_auth {
+        msg!(
+            "create_vault: passed vault_authority {} != derived PDA {}",
+            vault_auth_ai.key,
+            expected_auth
+        );
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // (1) System CPI: allocate the token account, owned by SPL Token Program.
+    // The new account is the vault PDA, so we sign with its seeds + bump.
+    let rent = Rent::get()?.minimum_balance(TOKEN_ACCOUNT_LEN);
+    let create_ix = system_instruction::create_account(
+        payer_ai.key,
+        vault_ai.key,
+        rent,
+        TOKEN_ACCOUNT_LEN as u64,
+        &SPL_TOKEN_PROGRAM_ID,
+    );
+    invoke_signed(
+        &create_ix,
+        &[payer_ai.clone(), vault_ai.clone(), system_ai.clone()],
+        &[&[
+            VAULT_SEED,
+            market_ai.key.as_ref(),
+            mint_ai.key.as_ref(),
+            &[vault_bump],
+        ]],
+    )?;
+
+    // (2) SPL Token CPI: InitializeAccount3. Instruction layout:
+    //   data:     [tag = 18][owner: 32 bytes Pubkey]
+    //   accounts: 0 = `[WRITE]` account to init
+    //             1 = `[]`      mint
+    //
+    // Plain `invoke` — no PDA signing needed. The new account is now owned
+    // by SPL Token at the Solana-runtime level, and InitializeAccount3 is a
+    // pure data write that requires no signatures (the program tag itself is
+    // the authorization).
+    let mut init_data = Vec::with_capacity(1 + 32);
+    init_data.push(spl_token_ix::INITIALIZE_ACCOUNT_3);
+    init_data.extend_from_slice(vault_auth_ai.key.as_ref());
+    let init_ix = Instruction {
+        program_id: SPL_TOKEN_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*vault_ai.key, false),
+            AccountMeta::new_readonly(*mint_ai.key, false),
+        ],
+        data: init_data,
+    };
+    invoke(&init_ix, &[vault_ai.clone(), mint_ai.clone(), token_ai.clone()])?;
+
+    msg!("vault created (vault bump {})", vault_bump);
+    Ok(())
+}
+
+/// Accounts:
+///   0. `[SIGNER]` user            — SPL Token authority on user_token_acct
+///   1. `[WRITE]`  user_token_acct — source
+///   2. `[WRITE]`  vault_token_acct — destination, owned by SPL Token
+///   3. `[]`       token_program   — must be SPL_TOKEN_PROGRAM_ID
+fn process_deposit(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
+    if payload.len() != DEPOSIT_PAYLOAD_LEN {
+        msg!("deposit: payload must be {} bytes (amount u64 LE)", DEPOSIT_PAYLOAD_LEN);
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let amount = u64::from_le_bytes(payload[0..8].try_into().expect("8 bytes"));
+    if amount == 0 {
+        msg!("deposit: amount must be > 0");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let user_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let user_token_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let vault_token_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let token_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !user_ai.is_signer {
+        msg!("deposit: user must sign");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if user_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        msg!("deposit: user_token_acct not owned by SPL Token");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if vault_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        msg!("deposit: vault_token_acct not owned by SPL Token");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if token_ai.key != &SPL_TOKEN_PROGRAM_ID {
+        msg!("deposit: account[3] is not the SPL Token program");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    // SPL Token Transfer. Instruction layout:
+    //   data:     [tag = 3][amount: u64 LE]
+    //   accounts: 0 = `[WRITE]`  source
+    //             1 = `[WRITE]`  destination
+    //             2 = `[SIGNER]` authority
+    //
+    // Plain `invoke`. The user is a signer at the outer tx level; the
+    // runtime carries that signer privilege through to the SPL Token program
+    // because the user appears as a signer in this program's AccountMeta
+    // for this instruction. SPL Token sees `user.is_signer == true` in the
+    // AccountInfo it receives, which is what authorizes the transfer.
+    let mut transfer_data = Vec::with_capacity(1 + 8);
+    transfer_data.push(spl_token_ix::TRANSFER);
+    transfer_data.extend_from_slice(&amount.to_le_bytes());
+    let transfer_ix = Instruction {
+        program_id: SPL_TOKEN_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*user_token_ai.key, false),
+            AccountMeta::new(*vault_token_ai.key, false),
+            AccountMeta::new_readonly(*user_ai.key, true),
+        ],
+        data: transfer_data,
+    };
+    invoke(
+        &transfer_ix,
+        &[
+            user_token_ai.clone(),
+            vault_token_ai.clone(),
+            user_ai.clone(),
+            token_ai.clone(),
+        ],
+    )?;
+
+    msg!("deposit: transferred {} units", amount);
     Ok(())
 }
