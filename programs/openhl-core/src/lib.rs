@@ -91,6 +91,17 @@
 //!                          computes equity, compares to maintenance
 //!                          margin. If liquidatable: applies liquidation
 //!                          penalty, force-closes at mark.
+//!  19  CreateTradingVault — written for Chapter 12 (native vault)
+//!                           PDA at [b"trading_vault", market, manager].
+//!                           Empty share + asset balances, manager set.
+//!  20  VaultDeposit       — also Chapter 12
+//!                           Mints shares pro-rata into VaultShare PDA
+//!                           at [b"vault_share", vault, owner].
+//!  21  VaultWithdraw      — also Chapter 12
+//!                           Burns shares, returns assets pro-rata.
+//!  22  VaultUpdateNAV     — also Chapter 12
+//!                           Manager-only. Sets total_assets to reflect
+//!                           realized PnL since last update.
 //!
 //! The entire program is one file on purpose. Splitting it into the usual
 //! `instruction.rs` / `processor.rs` / `state.rs` modules buys nothing
@@ -100,9 +111,10 @@
 #![allow(unexpected_cfgs)] // solana_program::entrypoint! gates on `target_os = "solana"`
 
 use openhl_state::{
-    side, FundingState, Market, Oracle, Order, OrderBook, Position, Stats, FUNDING_DISCRIMINATOR,
-    MARKET_DISCRIMINATOR, ORACLE_DISCRIMINATOR, ORDER_BOOK_DISCRIMINATOR, ORDER_CAPACITY,
-    POSITION_DISCRIMINATOR, STATS_DISCRIMINATOR,
+    side, FundingState, Market, Oracle, Order, OrderBook, Position, Stats, TradingVault,
+    VaultShare, FUNDING_DISCRIMINATOR, MARKET_DISCRIMINATOR, ORACLE_DISCRIMINATOR,
+    ORDER_BOOK_DISCRIMINATOR, ORDER_CAPACITY, POSITION_DISCRIMINATOR, STATS_DISCRIMINATOR,
+    TRADING_VAULT_DISCRIMINATOR, VAULT_SHARE_DISCRIMINATOR,
 };
 use solana_program::{
     account_info::AccountInfo,
@@ -209,6 +221,16 @@ pub const MAINT_MARGIN_BPS: u64 = 500;
 /// liquidation, paid to the liquidator. `100` = 1% of notional.
 pub const LIQUIDATION_PENALTY_BPS: u64 = 100;
 
+/// PDA seed prefix for the (market, manager) trading-vault aggregate.
+///
+/// Full seed list: `[TRADING_VAULT_SEED, market.key, manager.key, &[bump]]`.
+pub const TRADING_VAULT_SEED: &[u8] = b"trading_vault";
+
+/// PDA seed prefix for the per-(vault, owner) share ledger.
+///
+/// Full seed list: `[VAULT_SHARE_SEED, vault.key, owner.key, &[bump]]`.
+pub const VAULT_SHARE_SEED: &[u8] = b"vault_share";
+
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
 
@@ -246,6 +268,10 @@ pub fn process_instruction(
         16 => process_open_position(program_id, accounts, payload),
         17 => process_close_position(program_id, accounts, payload),
         18 => process_liquidate(program_id, accounts, payload),
+        19 => process_create_trading_vault(program_id, accounts, payload),
+        20 => process_vault_deposit(program_id, accounts, payload),
+        21 => process_vault_withdraw(program_id, accounts, payload),
+        22 => process_vault_update_nav(program_id, accounts, payload),
         unknown => {
             msg!("unknown instruction tag: {}", unknown);
             Err(ProgramError::InvalidInstructionData)
@@ -2139,5 +2165,378 @@ fn process_liquidate(
     position.entry_price = 0;
     position.funding_snapshot_index = funding_now;
 
+    Ok(())
+}
+
+// =============================================================================
+// Trading vault — CreateTradingVault + VaultDeposit + VaultWithdraw +
+//                 VaultUpdateNAV (Chapter 12).
+// =============================================================================
+//
+// SCOPE NOTE: like Chapter 11, asset balances here are tracked as numbers in
+// the vault account, not escrowed via SPL Token CPI. A production deployment
+// would CPI an SPL Token Transfer on every deposit/withdraw, into/out of the
+// vault's token-account PDA (Chapter 6 pattern). The share math is the
+// load-bearing part the chapter is about; the token plumbing is an
+// orthogonal extension.
+
+const CREATE_TRADING_VAULT_PAYLOAD_LEN: usize = 0;
+const VAULT_DEPOSIT_PAYLOAD_LEN: usize = 8; // assets u64
+const VAULT_WITHDRAW_PAYLOAD_LEN: usize = 8; // shares u64
+const VAULT_UPDATE_NAV_PAYLOAD_LEN: usize = 8; // new_total_assets u64
+
+/// Accounts:
+///   0. `[WRITE, SIGNER]` payer (typically == manager but doesn't have to)
+///   1. `[]`              market
+///   2. `[SIGNER]`        manager
+///   3. `[]`              mint            — the asset mint (SPL Mint)
+///   4. `[WRITE]`         vault           — PDA at [b"trading_vault", market, manager]
+///   5. `[]`              system_program
+fn process_create_trading_vault(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != CREATE_TRADING_VAULT_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let payer_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let market_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let manager_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let mint_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let vault_ai = accounts.get(4).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let system_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !payer_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if !manager_ai.is_signer {
+        msg!("create_trading_vault: manager must sign to bind themselves to vault");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if market_ai.owner != program_id {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if mint_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if system_ai.key != &system_program::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    let (expected, bump) = Pubkey::find_program_address(
+        &[
+            TRADING_VAULT_SEED,
+            market_ai.key.as_ref(),
+            manager_ai.key.as_ref(),
+        ],
+        program_id,
+    );
+    if vault_ai.key != &expected {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let rent = Rent::get()?.minimum_balance(TradingVault::LEN);
+    let create_ix = system_instruction::create_account(
+        payer_ai.key,
+        vault_ai.key,
+        rent,
+        TradingVault::LEN as u64,
+        program_id,
+    );
+    invoke_signed(
+        &create_ix,
+        &[payer_ai.clone(), vault_ai.clone(), system_ai.clone()],
+        &[&[
+            TRADING_VAULT_SEED,
+            market_ai.key.as_ref(),
+            manager_ai.key.as_ref(),
+            &[bump],
+        ]],
+    )?;
+
+    let mut data = vault_ai.try_borrow_mut_data()?;
+    let vault: &mut TradingVault = bytemuck::from_bytes_mut(&mut data[..TradingVault::LEN]);
+    vault.discriminator = TRADING_VAULT_DISCRIMINATOR;
+    vault.bump = bump;
+    vault._pad0 = [0u8; 7];
+    vault.market.copy_from_slice(market_ai.key.as_ref());
+    vault.manager.copy_from_slice(manager_ai.key.as_ref());
+    vault.mint.copy_from_slice(mint_ai.key.as_ref());
+    vault.total_shares = 0;
+    vault.total_assets = 0;
+    vault._reserved = [0u8; 32];
+
+    msg!("trading vault created (bump {})", bump);
+    Ok(())
+}
+
+/// Payload: [assets u64 LE]
+///
+/// Accounts:
+///   0. `[WRITE, SIGNER]` depositor (also pays rent for share account if new)
+///   1. `[WRITE]`         vault          — TradingVault PDA
+///   2. `[WRITE]`         share          — VaultShare PDA at [b"vault_share", vault, depositor]
+///   3. `[]`              system_program
+fn process_vault_deposit(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != VAULT_DEPOSIT_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let assets = u64::from_le_bytes(payload[0..8].try_into().expect("8 bytes"));
+    if assets == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let depositor_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let vault_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let share_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let system_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !depositor_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if vault_ai.owner != program_id || vault_ai.data_len() != TradingVault::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if system_ai.key != &system_program::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    let (expected_share, share_bump) = Pubkey::find_program_address(
+        &[VAULT_SHARE_SEED, vault_ai.key.as_ref(), depositor_ai.key.as_ref()],
+        program_id,
+    );
+    if share_ai.key != &expected_share {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // (a) Read current vault state for share math.
+    let mut vault_data = vault_ai.try_borrow_mut_data()?;
+    let vault: &mut TradingVault = bytemuck::from_bytes_mut(&mut vault_data[..TradingVault::LEN]);
+    if vault.discriminator != TRADING_VAULT_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    // (b) Compute shares to mint. First deposit: 1:1. Subsequent:
+    //     shares = assets * total_shares / total_assets.
+    let shares_to_mint: u64 = if vault.total_shares == 0 || vault.total_assets == 0 {
+        assets
+    } else {
+        let numer = (assets as u128) * (vault.total_shares as u128);
+        let s = numer / (vault.total_assets as u128);
+        if s > u64::MAX as u128 {
+            return Err(ProgramError::ArithmeticOverflow);
+        }
+        s as u64
+    };
+    if shares_to_mint == 0 {
+        msg!("vault_deposit: deposit too small relative to NAV (would mint 0 shares)");
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // (c) Update vault aggregate.
+    vault.total_shares = vault
+        .total_shares
+        .checked_add(shares_to_mint)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    vault.total_assets = vault
+        .total_assets
+        .checked_add(assets)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    drop(vault_data);
+
+    // (d) Create the share account if it doesn't exist yet, then update.
+    let share_exists = share_ai.owner == program_id && share_ai.data_len() == VaultShare::LEN;
+    if !share_exists {
+        let rent = Rent::get()?.minimum_balance(VaultShare::LEN);
+        let create_ix = system_instruction::create_account(
+            depositor_ai.key,
+            share_ai.key,
+            rent,
+            VaultShare::LEN as u64,
+            program_id,
+        );
+        invoke_signed(
+            &create_ix,
+            &[depositor_ai.clone(), share_ai.clone(), system_ai.clone()],
+            &[&[
+                VAULT_SHARE_SEED,
+                vault_ai.key.as_ref(),
+                depositor_ai.key.as_ref(),
+                &[share_bump],
+            ]],
+        )?;
+
+        let mut share_data = share_ai.try_borrow_mut_data()?;
+        let share: &mut VaultShare = bytemuck::from_bytes_mut(&mut share_data[..VaultShare::LEN]);
+        share.discriminator = VAULT_SHARE_DISCRIMINATOR;
+        share.bump = share_bump;
+        share._pad0 = [0u8; 7];
+        share.vault.copy_from_slice(vault_ai.key.as_ref());
+        share.owner.copy_from_slice(depositor_ai.key.as_ref());
+        share.shares = shares_to_mint;
+        share.cost_basis = assets;
+        share._reserved = [0u8; 32];
+    } else {
+        let mut share_data = share_ai.try_borrow_mut_data()?;
+        let share: &mut VaultShare = bytemuck::from_bytes_mut(&mut share_data[..VaultShare::LEN]);
+        if share.discriminator != VAULT_SHARE_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        share.shares = share
+            .shares
+            .checked_add(shares_to_mint)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        share.cost_basis = share
+            .cost_basis
+            .checked_add(assets)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+    }
+
+    msg!(
+        "vault_deposit: deposited {} assets, minted {} shares",
+        assets,
+        shares_to_mint
+    );
+    Ok(())
+}
+
+/// Payload: [shares u64 LE]
+///
+/// Accounts:
+///   0. `[SIGNER]` owner — depositor whose shares are being burned
+///   1. `[WRITE]`  vault
+///   2. `[WRITE]`  share
+fn process_vault_withdraw(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != VAULT_WITHDRAW_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let shares_to_burn = u64::from_le_bytes(payload[0..8].try_into().expect("8 bytes"));
+    if shares_to_burn == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let owner_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let vault_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let share_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !owner_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if vault_ai.owner != program_id || vault_ai.data_len() != TradingVault::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if share_ai.owner != program_id || share_ai.data_len() != VaultShare::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // Compute assets to return: shares_to_burn * total_assets / total_shares.
+    let mut vault_data = vault_ai.try_borrow_mut_data()?;
+    let vault: &mut TradingVault = bytemuck::from_bytes_mut(&mut vault_data[..TradingVault::LEN]);
+    if vault.discriminator != TRADING_VAULT_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+    if vault.total_shares == 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let assets_to_return: u64 = {
+        let numer = (shares_to_burn as u128) * (vault.total_assets as u128);
+        let a = numer / (vault.total_shares as u128);
+        if a > u64::MAX as u128 {
+            return Err(ProgramError::ArithmeticOverflow);
+        }
+        a as u64
+    };
+
+    let mut share_data = share_ai.try_borrow_mut_data()?;
+    let share: &mut VaultShare = bytemuck::from_bytes_mut(&mut share_data[..VaultShare::LEN]);
+    if share.discriminator != VAULT_SHARE_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+    if share.owner != *owner_ai.key.as_ref() {
+        msg!("vault_withdraw: caller is not the share owner");
+        return Err(ProgramError::IllegalOwner);
+    }
+    if share.shares < shares_to_burn {
+        msg!(
+            "vault_withdraw: insufficient shares ({} < {})",
+            share.shares,
+            shares_to_burn
+        );
+        return Err(ProgramError::InsufficientFunds);
+    }
+
+    share.shares -= shares_to_burn;
+    // Reduce cost basis proportionally so partial withdrawals don't
+    // overstate gains on subsequent reports.
+    let basis_reduction = (((shares_to_burn as u128) * (share.cost_basis as u128))
+        / (share.shares as u128 + shares_to_burn as u128)) as u64;
+    share.cost_basis = share.cost_basis.saturating_sub(basis_reduction);
+
+    vault.total_shares -= shares_to_burn;
+    vault.total_assets = vault.total_assets.saturating_sub(assets_to_return);
+
+    msg!(
+        "vault_withdraw: burned {} shares, returned {} assets",
+        shares_to_burn,
+        assets_to_return
+    );
+    Ok(())
+}
+
+/// Payload: [new_total_assets u64 LE]
+///
+/// Accounts:
+///   0. `[SIGNER]` manager
+///   1. `[WRITE]`  vault
+fn process_vault_update_nav(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != VAULT_UPDATE_NAV_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let new_total_assets = u64::from_le_bytes(payload[0..8].try_into().expect("8 bytes"));
+
+    let manager_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let vault_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !manager_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if vault_ai.owner != program_id || vault_ai.data_len() != TradingVault::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let mut vault_data = vault_ai.try_borrow_mut_data()?;
+    let vault: &mut TradingVault = bytemuck::from_bytes_mut(&mut vault_data[..TradingVault::LEN]);
+    if vault.discriminator != TRADING_VAULT_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+    if vault.manager != *manager_ai.key.as_ref() {
+        msg!("vault_update_nav: caller is not the vault manager");
+        return Err(ProgramError::IllegalOwner);
+    }
+
+    let prev = vault.total_assets;
+    vault.total_assets = new_total_assets;
+
+    msg!(
+        "vault_update_nav: total_assets {} -> {} (shares unchanged at {})",
+        prev,
+        new_total_assets,
+        vault.total_shares
+    );
     Ok(())
 }

@@ -15,6 +15,7 @@ members = [
     "scripts/oracle",
     "scripts/position",
     "scripts/stats",
+    "scripts/vault",
 ]
 
 [workspace.package]

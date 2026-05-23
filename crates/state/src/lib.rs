@@ -318,6 +318,81 @@ impl Position {
     pub const LEN: usize = core::mem::size_of::<Self>();
 }
 
+/// Fixed 8-byte tag identifying a `TradingVault` account.
+pub const TRADING_VAULT_DISCRIMINATOR: [u8; 8] = *b"TVAULT\0\0";
+
+/// Pooled trading vault — depositors share PnL via shares/assets ratio.
+/// One per (market, manager) pair. The math is ERC-4626 in spirit:
+/// `shares_minted = deposit * total_shares / total_assets` on subsequent
+/// deposits, 1:1 on the first.
+///
+/// Layout (160 bytes):
+/// ```text
+///    0 | 0x00  discriminator   [u8; 8]   — TVAULT\0\0
+///    8 | 0x08  bump            u8        — PDA bump
+///    9 | 0x09  _pad0           [u8; 7]
+///   16 | 0x10  market          [u8; 32]
+///   48 | 0x30  manager         [u8; 32]  — places trades on behalf of pool
+///   80 | 0x50  mint            [u8; 32]  — asset mint (e.g., USDC quote)
+///  112 | 0x70  total_shares    u64
+///  120 | 0x78  total_assets    u64       — NAV (set by UpdateNAV)
+///  128 | 0x80  _reserved       [u8; 32]
+///  160                                    — total size
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct TradingVault {
+    pub discriminator: [u8; 8],
+    pub bump: u8,
+    pub _pad0: [u8; 7],
+    pub market: [u8; 32],
+    pub manager: [u8; 32],
+    pub mint: [u8; 32],
+    pub total_shares: u64,
+    pub total_assets: u64,
+    pub _reserved: [u8; 32],
+}
+
+impl TradingVault {
+    pub const LEN: usize = core::mem::size_of::<Self>();
+}
+
+/// Fixed 8-byte tag identifying a `VaultShare` account.
+pub const VAULT_SHARE_DISCRIMINATOR: [u8; 8] = *b"VSHARE\0\0";
+
+/// Per-depositor share ledger. One PDA per (vault, owner) pair. Holds the
+/// depositor's share count and their cumulative cost basis (for P&L
+/// reporting; not used by program logic).
+///
+/// Layout (128 bytes):
+/// ```text
+///    0 | 0x00  discriminator   [u8; 8]   — VSHARE\0\0
+///    8 | 0x08  bump            u8
+///    9 | 0x09  _pad0           [u8; 7]
+///   16 | 0x10  vault           [u8; 32]  — the TradingVault PDA
+///   48 | 0x30  owner           [u8; 32]
+///   80 | 0x50  shares          u64
+///   88 | 0x58  cost_basis      u64       — total assets deposited
+///   96 | 0x60  _reserved       [u8; 32]
+///  128                                    — total size
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct VaultShare {
+    pub discriminator: [u8; 8],
+    pub bump: u8,
+    pub _pad0: [u8; 7],
+    pub vault: [u8; 32],
+    pub owner: [u8; 32],
+    pub shares: u64,
+    pub cost_basis: u64,
+    pub _reserved: [u8; 32],
+}
+
+impl VaultShare {
+    pub const LEN: usize = core::mem::size_of::<Self>();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +475,25 @@ mod tests {
     #[test]
     fn position_discriminator_is_human_readable() {
         assert_eq!(&POSITION_DISCRIMINATOR, b"POSITION");
+    }
+
+    #[test]
+    fn trading_vault_size_is_160_bytes() {
+        assert_eq!(TradingVault::LEN, 160);
+    }
+
+    #[test]
+    fn trading_vault_discriminator_is_human_readable() {
+        assert_eq!(&TRADING_VAULT_DISCRIMINATOR, b"TVAULT\0\0");
+    }
+
+    #[test]
+    fn vault_share_size_is_128_bytes() {
+        assert_eq!(VaultShare::LEN, 128);
+    }
+
+    #[test]
+    fn vault_share_discriminator_is_human_readable() {
+        assert_eq!(&VAULT_SHARE_DISCRIMINATOR, b"VSHARE\0\0");
     }
 }
