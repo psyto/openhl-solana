@@ -1,0 +1,23 @@
+[package]
+name = "funding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Chapter 10 worked example: drives openhl-core's funding instructions. --init creates the per-market FundingState PDA; --update --rate posts a new keeper rate. Default action dumps current cumulative_index + age."
+
+[[bin]]
+name = "funding"
+path = "src/main.rs"
+
+[dependencies]
+openhl-state = { path = "../../crates/state" }
+openhl-core = { path = "../../programs/openhl-core", features = ["no-entrypoint"] }
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+solana-program = { workspace = true }
+solana-system-interface = { workspace = true }
+bytemuck = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

@@ -1365,6 +1365,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "funding"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "clap",
+ "openhl-core",
+ "openhl-state",
+ "solana-client",
+ "solana-program",
+ "solana-sdk",
+ "solana-system-interface",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -227,6 +227,56 @@ impl Oracle {
     pub const LEN: usize = core::mem::size_of::<Self>();
 }
 
+/// Fixed 8-byte tag identifying a `FundingState` account.
+pub const FUNDING_DISCRIMINATOR: [u8; 8] = *b"FUNDING\0";
+
+/// Per-market funding-rate accumulator. The single `cumulative_funding_index`
+/// field is the load-bearing invariant: it grows monotonically with time
+/// (signed; can decrease if shorts pay longs), and a position's funding
+/// settlement is just `(current_index - position_snapshot_index) × size`.
+///
+/// All fixed-point values use a `1e9` scaling factor:
+///   - `current_rate_per_sec`: signed nanos of funding paid per second per
+///     unit of base notional. A rate of `+50_000` means 0.000_050 / sec,
+///     about 0.43% per day, ~158% annualized.
+///   - `cumulative_funding_index`: signed nanos of cumulative funding paid
+///     per unit of base notional since this market's funding began.
+///
+/// Layout (120 bytes):
+/// ```text
+///   0  | 0x00  discriminator              [u8; 8]   — FUNDING\0
+///   8  | 0x08  bump                       u8        — PDA bump
+///   9  | 0x09  _pad0                      [u8; 7]
+///  16  | 0x10  market                     [u8; 32]
+///  48  | 0x30  cumulative_funding_index   i64       — scaled by 1e9
+///  56  | 0x38  last_update_ts             i64       — Clock.unix_timestamp
+///  64  | 0x40  last_update_slot           u64       — Clock.slot
+///  72  | 0x48  current_rate_per_sec       i64       — scaled by 1e9
+///  80  | 0x50  window_seconds             u64       — funding window length
+///  88  | 0x58  _reserved                  [u8; 32]
+/// 120                                                — total size
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct FundingState {
+    pub discriminator: [u8; 8],
+    pub bump: u8,
+    pub _pad0: [u8; 7],
+    pub market: [u8; 32],
+    pub cumulative_funding_index: i64,
+    pub last_update_ts: i64,
+    pub last_update_slot: u64,
+    pub current_rate_per_sec: i64,
+    pub window_seconds: u64,
+    pub _reserved: [u8; 32],
+}
+
+impl FundingState {
+    pub const LEN: usize = core::mem::size_of::<Self>();
+    /// Default funding window: 1 hour. Production perps usually use 1h or 8h.
+    pub const DEFAULT_WINDOW_SECONDS: u64 = 3600;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +339,15 @@ mod tests {
     #[test]
     fn oracle_discriminator_is_human_readable() {
         assert_eq!(&ORACLE_DISCRIMINATOR, b"ORACLE\0\0");
+    }
+
+    #[test]
+    fn funding_state_size_is_120_bytes() {
+        assert_eq!(FundingState::LEN, 120);
+    }
+
+    #[test]
+    fn funding_discriminator_is_human_readable() {
+        assert_eq!(&FUNDING_DISCRIMINATOR, b"FUNDING\0");
     }
 }

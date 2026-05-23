@@ -9,6 +9,7 @@ members = [
     "scripts/create-market",
     "scripts/create-vault",
     "scripts/deposit",
+    "scripts/funding",
     "scripts/init-market",
     "scripts/match",
     "scripts/oracle",

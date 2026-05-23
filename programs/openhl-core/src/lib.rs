@@ -71,6 +71,13 @@
 //!                       Clock sysvar, (b) sanity band around the
 //!                       oracle mark price. The first real risk
 //!                       control in the program.
+//!  14  CreateFundingState — written for Chapter 10 (funding rate)
+//!                          PDA at [b"funding", market], 120 bytes.
+//!  15  UpdateFunding     — also Chapter 10
+//!                          Keeper-supplied rate. Computes
+//!                          cumulative_funding_index += rate × elapsed_seconds.
+//!                          Time-windowed accumulator pattern; the
+//!                          Phase A parallelism lesson made operational.
 //!
 //! The entire program is one file on purpose. Splitting it into the usual
 //! `instruction.rs` / `processor.rs` / `state.rs` modules buys nothing
@@ -80,8 +87,9 @@
 #![allow(unexpected_cfgs)] // solana_program::entrypoint! gates on `target_os = "solana"`
 
 use openhl_state::{
-    side, Market, Oracle, Order, OrderBook, Stats, MARKET_DISCRIMINATOR, ORACLE_DISCRIMINATOR,
-    ORDER_BOOK_DISCRIMINATOR, ORDER_CAPACITY, STATS_DISCRIMINATOR,
+    side, FundingState, Market, Oracle, Order, OrderBook, Stats, FUNDING_DISCRIMINATOR,
+    MARKET_DISCRIMINATOR, ORACLE_DISCRIMINATOR, ORDER_BOOK_DISCRIMINATOR, ORDER_CAPACITY,
+    STATS_DISCRIMINATOR,
 };
 use solana_program::{
     account_info::AccountInfo,
@@ -158,6 +166,18 @@ pub const MAX_ORACLE_STALENESS_SLOTS: u64 = 25;
 /// tighter.
 pub const SANITY_BAND_BPS: u64 = 2000;
 
+/// PDA seed prefix for the per-market funding-state account.
+///
+/// Full seed list: `[FUNDING_SEED, market_pubkey.as_ref(), &[bump]]`.
+pub const FUNDING_SEED: &[u8] = b"funding";
+
+/// Hard cap on the absolute value of a funding rate, in scaled 1e-9 units
+/// per second. `1_000_000` = 0.001/sec = 86.4% per day = absurd but
+/// catastrophic. Production caps are much tighter (e.g., 0.01% per hour).
+/// We pick a loose cap so the chapter can demonstrate clamp behavior
+/// without configuring per-market overrides.
+pub const MAX_FUNDING_RATE_PER_SEC_ABS: i64 = 1_000_000;
+
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
 
@@ -190,6 +210,8 @@ pub fn process_instruction(
         11 => process_create_oracle(program_id, accounts, payload),
         12 => process_set_oracle_price(program_id, accounts, payload),
         13 => process_place_order_checked(program_id, accounts, payload),
+        14 => process_create_funding_state(program_id, accounts, payload),
+        15 => process_update_funding(program_id, accounts, payload),
         unknown => {
             msg!("unknown instruction tag: {}", unknown);
             Err(ProgramError::InvalidInstructionData)
@@ -1552,5 +1574,187 @@ fn process_place_order_checked(
         order_id,
         slot_idx
     );
+    Ok(())
+}
+
+// =============================================================================
+// Funding — CreateFundingState + UpdateFunding (Chapter 10).
+// =============================================================================
+//
+// The funding pattern is a time-windowed accumulator. UpdateFunding is the
+// only mutator: it reads (current_rate, last_update_ts) from the account,
+// applies the new keeper-supplied rate over the elapsed window, and writes
+// back the updated cumulative_funding_index plus the new rate and timestamp.
+//
+// Position settlement (the half not in this chapter) is the read-side:
+// when a position is touched, you settle it by computing
+//   delta = (funding.cumulative_funding_index - position.funding_snapshot_index)
+//   pnl   = delta * position.size / 1e9
+//   position.funding_snapshot_index = funding.cumulative_funding_index
+// — a constant-time per-touch update that requires no global iteration.
+// Chapter 11 introduces Position; Chapter 10 is about the accumulator.
+
+const CREATE_FUNDING_PAYLOAD_LEN: usize = 8; // window_seconds u64
+const UPDATE_FUNDING_PAYLOAD_LEN: usize = 8; // new_rate_per_sec i64
+
+/// Accounts:
+///   0. `[WRITE, SIGNER]` payer
+///   1. `[]`              market
+///   2. `[WRITE]`         funding          — PDA at [b"funding", market]
+///   3. `[]`              system_program
+fn process_create_funding_state(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != CREATE_FUNDING_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let window_seconds = u64::from_le_bytes(payload[0..8].try_into().expect("8 bytes"));
+    if window_seconds == 0 {
+        msg!("create_funding_state: window_seconds must be > 0");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let payer_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let market_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let funding_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let system_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !payer_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if market_ai.owner != program_id {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if system_ai.key != &system_program::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    let (expected, bump) =
+        Pubkey::find_program_address(&[FUNDING_SEED, market_ai.key.as_ref()], program_id);
+    if funding_ai.key != &expected {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let rent = Rent::get()?.minimum_balance(FundingState::LEN);
+    let create_ix = system_instruction::create_account(
+        payer_ai.key,
+        funding_ai.key,
+        rent,
+        FundingState::LEN as u64,
+        program_id,
+    );
+    invoke_signed(
+        &create_ix,
+        &[payer_ai.clone(), funding_ai.clone(), system_ai.clone()],
+        &[&[FUNDING_SEED, market_ai.key.as_ref(), &[bump]]],
+    )?;
+
+    let clock = Clock::get()?;
+    let mut data = funding_ai.try_borrow_mut_data()?;
+    let funding: &mut FundingState =
+        bytemuck::from_bytes_mut(&mut data[..FundingState::LEN]);
+    funding.discriminator = FUNDING_DISCRIMINATOR;
+    funding.bump = bump;
+    funding._pad0 = [0u8; 7];
+    funding.market.copy_from_slice(market_ai.key.as_ref());
+    funding.cumulative_funding_index = 0;
+    funding.last_update_ts = clock.unix_timestamp;
+    funding.last_update_slot = clock.slot;
+    funding.current_rate_per_sec = 0;
+    funding.window_seconds = window_seconds;
+    funding._reserved = [0u8; 32];
+
+    msg!(
+        "funding state created (bump {}, window {}s)",
+        bump,
+        window_seconds
+    );
+    Ok(())
+}
+
+/// Payload: [new_rate_per_sec i64 LE]
+///
+/// Accounts:
+///   0. `[SIGNER]` keeper — open-auth in this demo; production would pin
+///   1. `[WRITE]`  funding — owned by this program
+fn process_update_funding(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != UPDATE_FUNDING_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let new_rate_raw = i64::from_le_bytes(payload[0..8].try_into().expect("8 bytes"));
+
+    let keeper_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let funding_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    if !keeper_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if funding_ai.owner != program_id || funding_ai.data_len() != FundingState::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // Clamp the keeper's proposed rate to the program's hard cap. A keeper
+    // bug or compromise should not produce arbitrarily large funding payments.
+    let new_rate = new_rate_raw
+        .max(-MAX_FUNDING_RATE_PER_SEC_ABS)
+        .min(MAX_FUNDING_RATE_PER_SEC_ABS);
+    if new_rate != new_rate_raw {
+        msg!(
+            "update_funding: keeper rate {} clamped to {}",
+            new_rate_raw,
+            new_rate
+        );
+    }
+
+    let clock = Clock::get()?;
+    let mut data = funding_ai.try_borrow_mut_data()?;
+    let funding: &mut FundingState =
+        bytemuck::from_bytes_mut(&mut data[..FundingState::LEN]);
+    if funding.discriminator != FUNDING_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    // Accumulate funding over the elapsed window using the *prior* rate.
+    // Pattern: each update commits the rate that was in effect during the
+    // preceding interval, then installs the new rate for the next one.
+    // This is the standard "step function" accumulator — cumulative_index
+    // grows in piecewise-linear segments, one segment per UpdateFunding call.
+    let elapsed = clock.unix_timestamp.saturating_sub(funding.last_update_ts);
+    if elapsed < 0 {
+        msg!("update_funding: clock went backwards (elapsed={})", elapsed);
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let elapsed_u = elapsed as u64;
+
+    let delta = (funding.current_rate_per_sec as i128) * (elapsed_u as i128);
+    let new_cumulative = (funding.cumulative_funding_index as i128).saturating_add(delta);
+    // i64 saturation if the cumulative would overflow. Practical books take
+    // years to even approach i64 range with realistic rates.
+    let new_cumulative_clamped: i64 = if new_cumulative > i64::MAX as i128 {
+        i64::MAX
+    } else if new_cumulative < i64::MIN as i128 {
+        i64::MIN
+    } else {
+        new_cumulative as i64
+    };
+
+    msg!(
+        "update_funding: prior_rate={} elapsed={}s delta={} new_cumulative={}",
+        funding.current_rate_per_sec,
+        elapsed_u,
+        delta,
+        new_cumulative_clamped
+    );
+
+    funding.cumulative_funding_index = new_cumulative_clamped;
+    funding.current_rate_per_sec = new_rate;
+    funding.last_update_ts = clock.unix_timestamp;
+    funding.last_update_slot = clock.slot;
+
     Ok(())
 }
