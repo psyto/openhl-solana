@@ -265,6 +265,30 @@ openhl-core access sets:
 
 ---
 
+## Phase B prologue — the architectural choice this curriculum makes
+
+Phase A is done. Before you commit to Phase B, it's worth being explicit about what you'd be choosing *against* — because the chapters ahead implicitly make an architectural decision that another curriculum could have made differently.
+
+A perp DEX can be built two ways. **As programs on top of an existing chain** — you write the matching, vault, funding, and liquidation logic as smart contracts; the chain handles consensus, execution, validators, networking, and wallets. This is what Phase B builds. **As a custom L1** — you bundle the same business logic with your own consensus engine, execution layer, peer network, and RPC, and ship a binary that other validators run.
+
+The two paths solve the same business problem (match orders, hold collateral, pay funding, liquidate the underwater) with the same on-chain primitives. They diverge sharply on everything else.
+
+**Program-on-Solana** (this curriculum): one-command deploy, inherit existing liquidity and wallets, ride existing validator security. The codebase fits one repository; one team can ship it. Bounded by the host chain's slot time, compute budget, and validator concentration. Value capture is partial — a real fraction of transaction value flows to actors you don't control.
+
+**Custom L1**: months of validator bootstrap, your own bridges and stablecoin economics, your own wallet integrations and listings, your own MEV policy. The codebase spans consensus + execution + networking + RPC across multiple crates. In exchange: full runtime control (block time, ordering, custom precompiles tuned to your workload) and full value capture (no validator-tier middlemen).
+
+The L1 path becomes necessary when three conditions hold *together*:
+
+1. You need a runtime property the host chain can't provide — sub-100ms confirmation, custom matching precompiles, deterministic MEV-free ordering, settlement at non-EVM-friendly precision.
+2. Your business model depends on capturing the full transaction value rather than sharing it with the host chain's validator economy.
+3. You have the team and runway to operate a chain for years, not just deploy a program.
+
+Hyperliquid is the textbook case where all three held. For most perp-DEX projects, none of them do — and the program-on-host-chain path is dramatically cheaper to reach launch on, by orders of magnitude in calendar time, infrastructure cost, and team headcount.
+
+This curriculum bets on the program path. Not because L1 is the wrong answer in absolute terms, but because the conditions that justify it are rare, and a project that hasn't shipped on a host chain yet hasn't earned the right to commit to a multi-year L1 build. Phase B teaches the path 99% of perp DEX projects will actually take.
+
+---
+
 ## Hook into Chapter 6 — Phase B begins
 
 You have finished Phase A. You can now allocate accounts, write programs without Anchor, derive predictable addresses, measure your CU envelope, and reason about whether two of your transactions can run in parallel. These are the runtime fundamentals — everything else in this track is built on them.
