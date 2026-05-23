@@ -10,6 +10,10 @@
 //!                     [b"market", base_mint, quote_mint], CPIs to System
 //!                     to allocate it with this program as owner, then
 //!                     writes the layout. No prior Assign needed.
+//!   2  Bench         — written for Chapter 4 (compute budget + heap)
+//!                     Configurable workload that allocates a heap buffer
+//!                     and iterates sha256 hashes, with sol_log_compute_units
+//!                     bracketing each phase. Touches no accounts.
 //!
 //! The entire program is one file on purpose. Splitting it into the usual
 //! `instruction.rs` / `processor.rs` / `state.rs` modules buys nothing
@@ -22,6 +26,8 @@ use openhl_state::{Market, MARKET_DISCRIMINATOR};
 use solana_program::{
     account_info::AccountInfo,
     entrypoint::ProgramResult,
+    hash::hash as sha256,
+    log::sol_log_compute_units,
     msg,
     program::invoke_signed,
     program_error::ProgramError,
@@ -57,6 +63,7 @@ pub fn process_instruction(
     match *tag {
         0 => process_initialize(program_id, accounts, payload),
         1 => process_create_market(program_id, accounts, payload),
+        2 => process_bench(payload),
         unknown => {
             msg!("unknown instruction tag: {}", unknown);
             Err(ProgramError::InvalidInstructionData)
@@ -319,5 +326,76 @@ fn process_create_market(
     market._reserved = [0u8; 128];
 
     msg!("market created at PDA (bump {})", bump);
+    Ok(())
+}
+
+// =============================================================================
+// Bench — instrumented workload for measuring compute units (Chapter 4).
+// =============================================================================
+
+/// Payload layout (8 bytes, little-endian):
+///   [0..4)  rounds      u32   — number of sha256 iterations
+///   [4..8)  heap_bytes  u32   — Vec<u8> allocation size, exercises the
+///                               default 32 KiB bump allocator
+const BENCH_PAYLOAD_LEN: usize = 8;
+
+/// Accounts: none. Bench is a pure-compute instruction that touches no state.
+///
+/// What this exists to demonstrate:
+///   1. CU is a real, observable, per-syscall cost. The `sol_log_compute_units`
+///      brackets around each phase let you read the cost of allocation vs.
+///      hashing vs. epilogue in the validator log.
+///   2. The default heap is 32 KiB and uses a *bump* allocator that never
+///      frees. Drop the Vec, and the bytes stay claimed until the program
+///      exits. Allocate beyond 32 KiB and the allocator returns null — Rust's
+///      global-alloc handler then aborts the program.
+///   3. Linear loops over non-trivial work blow the default 200 KCU budget
+///      fast. Raising it requires a ComputeBudgetInstruction in the same
+///      transaction.
+fn process_bench(payload: &[u8]) -> ProgramResult {
+    if payload.len() != BENCH_PAYLOAD_LEN {
+        msg!(
+            "bench: payload must be {} bytes, got {}",
+            BENCH_PAYLOAD_LEN,
+            payload.len()
+        );
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let rounds = u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes"));
+    let heap_bytes = u32::from_le_bytes(payload[4..8].try_into().expect("4 bytes"));
+
+    msg!("bench: start (rounds={}, heap_bytes={})", rounds, heap_bytes);
+    sol_log_compute_units();
+
+    // Phase A — heap allocation. The Vec lives until the end of the function,
+    // when it's dropped — but the bump allocator's `dealloc` is a no-op
+    // (see solana_program_entrypoint::BumpAllocator), so the bytes stay
+    // reserved until the program exits.
+    let mut buf = vec![0u8; heap_bytes as usize];
+    msg!("bench: after heap alloc ({} bytes)", buf.len());
+    sol_log_compute_units();
+
+    // Phase B — hash loop. Each iteration hashes the buffer and stuffs the
+    // 32-byte digest back into the front, ensuring no compiler can DCE the
+    // computation. sha256 is a syscall on BPF, so this CU cost is meaningful
+    // and stable across runs.
+    for i in 0..rounds {
+        let digest = sha256(&buf);
+        let bytes = digest.to_bytes();
+        // Re-feed the digest into the buffer head so the next hash sees
+        // different input. Use index arithmetic to also exercise bounds checks.
+        let copy_len = bytes.len().min(buf.len());
+        buf[..copy_len].copy_from_slice(&bytes[..copy_len]);
+        // Stir the loop counter in too, so equivalent-size buffers don't
+        // produce identical digests.
+        if !buf.is_empty() {
+            buf[0] ^= i as u8;
+        }
+    }
+
+    msg!("bench: after {} hash rounds", rounds);
+    sol_log_compute_units();
+
     Ok(())
 }

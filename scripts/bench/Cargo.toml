@@ -1,0 +1,20 @@
+[package]
+name = "bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Chapter 4 worked example: drives openhl-core::Bench with configurable rounds + heap_bytes, optionally raises the per-tx CU limit via ComputeBudgetInstruction, and prints the program logs so each phase's CU cost is visible."
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[dependencies]
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+solana-program = { workspace = true }
+solana-compute-budget-interface = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
