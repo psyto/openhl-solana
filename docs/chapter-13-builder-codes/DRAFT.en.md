@@ -20,9 +20,9 @@ This chapter ships three instructions:
 
 1. **`RegisterBuilder`** — each builder creates a per-builder `BuilderProfile` PDA that holds their accumulated fees and their self-declared max share. Registration is required because the program needs an account to credit; no account, no fees.
 2. **`PlaceOrderWithBuilder`** — the trading instruction variant that takes a builder profile as a fourth account. Computes the protocol fee, splits the builder's share into the profile's `accumulated_fees`, and runs the same place-order path as `PlaceOrderChecked`.
-3. **`ClaimBuilderFees`** — the builder's withdraw call. Zeroes their `accumulated_fees`; in production this is where the SPL Token Transfer CPI would move actual quote tokens from the protocol fee vault to the builder's wallet.
+3. **`ClaimBuilderFees`** — the builder's withdraw call. Zeroes the accumulator and logs the amount. Unlike Chapters 11 and 12 — which we extended with real SPL Token escrow — the chapter deliberately stops short of moving tokens for the fee split. §13.5 explains why builder-fee escrow is a different design problem than position or vault escrow, and lays out what a production implementation would look like.
 
-The chapter's intellectual content is the atomicity argument in §13.4 (why fee splits happen inside the trade instruction, not in a separate "claim per trade" call) and the cap-stacking pattern in §13.2 (how a self-declared cap interacts with the protocol-level cap to bound fee leakage even if a builder is compromised).
+The chapter's intellectual content is three-part: the atomicity argument in §13.4 (why fee splits happen inside the trade instruction, not in a separate "claim per trade" call), the cap-stacking pattern in §13.2 (how a self-declared cap interacts with the protocol-level cap to bound fee leakage even if a builder is compromised), and the production-escrow design discussion in §13.5 (what makes builder fees a structurally harder escrow problem than the two-party movements of Chapters 11 and 12).
 
 ---
 
@@ -185,11 +185,27 @@ msg!(
 );
 ```
 
-Authorization (only the builder can claim their own fees), zero the accumulator, log. In production this is also where the SPL Token Transfer CPI would move `claimed` quote tokens from the protocol's fee vault to the builder's token account. We omit that for the same reason we omitted it in Chapters 11 and 12 — the chapter is about the *mechanism*, and the SPL Token plumbing is a mechanical extension we'd add when productizing.
+Authorization (only the builder can claim their own fees), zero the accumulator, log. In production this is where an SPL Token Transfer CPI would PDA-sign a move of `claimed` quote tokens from a protocol fee-vault token account into the builder's token account.
 
 A real production claim also typically supports partial withdrawals (`claim --amount N` rather than always-everything), accumulator timeouts (fees idle for >N days are forfeited to the protocol), and per-token claims when the protocol supports multiple quote currencies. None of these change the fundamental shape; they're policy decisions on top.
 
 > **Exercise §13.5.** Modify `process_claim_builder_fees` to accept a `partial_amount: Option<u64>` in the payload. If `Some(n)`, claim `min(n, accumulated_fees)`; if `None`, claim all. Why is the partial-withdraw pattern useful for builders even though the total they can withdraw is the same?
+
+### Production-escrow design notes (why this one is left as homework)
+
+Chapters 11 and 12 added real SPL Token escrow to position collateral and vault deposits. This chapter does not. The reason is that builder-fee escrow is a *structurally different* escrow problem than the two-party token movements those chapters needed — and a single concrete implementation would mislead more than teach. Four design choices have to be made before any plumbing gets written.
+
+**1. Two parties vs three.** Position collateral and vault deposits are two-party movements: user ↔ vault, signed by one side, with the entire economic decision (how much, signed by whom) encoded in the instruction. Builder fees are a *three-party split*: the user pays a single protocol fee, of which one fraction goes to the protocol and another to the builder. Splitting one user payment across two recipients atomically — and crediting the right fraction to each — needs a different shape than `spl_token_transfer_user_signed` and `spl_token_transfer_vault_signed` provide. The natural implementation is a *fee-vault* token account (one per quote mint) owned by a PDA at e.g. `[b"fee_vault", quote_mint]`. Every `PlaceOrderWithBuilder` would (a) Transfer the *full* `protocol_fee` from the user's token account into the fee vault, then (b) credit `builder_share` to the builder's accumulator. The `(protocol_fee - builder_share)` remainder stays in the fee vault as the protocol's take.
+
+**2. The `PlaceOrderChecked` asymmetry.** Adding fee escrow only to `PlaceOrderWithBuilder` creates a perverse incentive: the no-builder path (`PlaceOrderChecked`) doesn't charge any token-denominated fee, so trades through a builder would cost the user more in real terms than identical trades without one. The natural fix is to make *all* place-order variants escrow the protocol fee — which is a bigger surgery on the trade path than the chapter can land without bloating §13.3 beyond utility. Production deployments resolve this by treating the protocol fee as universal across both variants from day one.
+
+**3. Multi-quote support.** With one quote currency (our case) the fee vault is a single account. With multiple quote currencies the design needs per-(quote_mint) fee vaults *and* per-(builder, quote_mint) accumulators — meaning `BuilderProfile` either grows a map field (not Pod-friendly) or splits into many one-per-quote profile PDAs. §13.1 mentioned the single-quote constraint as deliberate; the production escrow design is where it actually starts costing accounts.
+
+**4. Claim-side authority.** Once the fee vault exists, `ClaimBuilderFees` becomes a PDA-signed Transfer from `fee_vault` to `builder_token`, signed by the fee-vault authority PDA. Structurally identical to §12.4's `VaultWithdraw` — same `invoke_signed` pattern, same `InvalidSeeds` protection, different seeds. This is the only piece that's a "mechanical extension" of work the chapter already did.
+
+The mechanism the chapter actually teaches — accrual atomic with trade, claim as a separate batch operation, two-cap safety — survives all four design choices unchanged. Only the SPL Token plumbing differs across them.
+
+> **Exercise §13.5b (design).** Sketch the account layout for a production `ClaimBuilderFees`: which accounts must be passed (in order), which are signers, which are PDAs, and which seeds derive them. You don't need to write code — just the `accounts: vec![...]` declaration as it would appear in `scripts/builder/src/main.rs`. Compare with §12.4's `VaultWithdraw` declaration: what's structurally identical, what's structurally different, and which difference traces back to which of the four design choices above?
 
 ---
 

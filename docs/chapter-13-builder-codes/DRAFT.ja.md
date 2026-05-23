@@ -20,9 +20,9 @@ builder code は次のものでは**ない**:
 
 1. **`RegisterBuilder`** — 各 builder が、累積手数料と自己宣言した最大シェアを保持する builder ごとの `BuilderProfile` PDA を作る。プログラムが credit するアカウントが必要なので登録が必要。アカウントなし、手数料なし。
 2. **`PlaceOrderWithBuilder`** — 4 つ目のアカウントとして builder profile を取る取引命令バリアント。プロトコル手数料を計算し、builder のシェアを profile の `accumulated_fees` に分割し、`PlaceOrderChecked` と同じ place-order パスを走らせる。
-3. **`ClaimBuilderFees`** — builder の引き出し呼び出し。`accumulated_fees` をゼロ化する。本番ではここで SPL Token Transfer CPI がプロトコル手数料 vault から builder のウォレットへ実際の quote トークンを動かす。
+3. **`ClaimBuilderFees`** — builder の引き出し呼び出し。アキュムレータをゼロ化して額をログに残す。第 11 章・第 12 章 — 実際の SPL Token エスクローを追加した — とは異なり、本章は手数料分割についてはトークンを動かす手前で意図的に止める。§13.5 が、なぜ builder 手数料エスクローはポジションや vault のエスクローとは別種の設計問題なのか、本番実装がどのような形になるかを説明する。
 
-本章の知的内容は §13.4 のアトミシティ論（なぜ手数料分割は取引命令の中で起き、別の「取引ごとに claim」呼び出しではないか）と §13.2 のキャップ積み重ねパターン（自己宣言キャップとプロトコル レベル キャップがどう相互作用し、builder が侵害されても手数料漏れを境界付けるか）だ。
+本章の知的内容は 3 部構成だ。§13.4 のアトミシティ論（なぜ手数料分割は取引命令の中で起き、別の「取引ごとに claim」呼び出しではないか）、§13.2 のキャップ積み重ねパターン（自己宣言キャップとプロトコル レベル キャップがどう相互作用し、builder が侵害されても手数料漏れを境界付けるか）、そして §13.5 の本番エスクロー設計議論（なぜ builder 手数料は第 11 章・第 12 章の二者間移動より構造的に難しいエスクロー問題なのか）。
 
 ---
 
@@ -185,11 +185,27 @@ msg!(
 );
 ```
 
-認可（builder だけが自分の手数料を claim できる）、蓄積子をゼロ化、ログ。本番ではここも SPL Token Transfer CPI がプロトコル手数料 vault から builder のトークン アカウントへ `claimed` quote トークンを動かす場所だ。これを省略する理由は第 11 章と第 12 章で省略した理由と同じ — 章は**仕組み**についての章で、SPL Token 配線は本番化時に追加する機械的拡張だ。
+認可（builder だけが自分の手数料を claim できる）、アキュムレータをゼロ化、ログ。本番ではここで SPL Token Transfer CPI が、プロトコル手数料 vault トークン アカウントから builder のトークン アカウントへ、`claimed` quote トークンを PDA 署名で動かす。
 
-本物の本番 claim は通常、部分引き出し（`claim --amount N` でなく常に全部）、蓄積子タイムアウト（>N 日アイドルな手数料はプロトコルに没収）、プロトコルが複数 quote 通貨をサポートするときの per-token claim もサポートする。どれも根本的な形を変えない。上に乗るポリシー判断だ。
+本物の本番 claim は通常、部分引き出し（`claim --amount N`、常に全部ではなく）、蓄積子タイムアウト（>N 日アイドルな手数料はプロトコルに没収）、プロトコルが複数 quote 通貨をサポートするときの per-token claim もサポートする。どれも根本的な形を変えない。上に乗るポリシー判断だ。
 
 > **演習 §13.5.** `process_claim_builder_fees` を編集して、ペイロードに `partial_amount: Option<u64>` を受け入れるようにせよ。`Some(n)` なら `min(n, accumulated_fees)` を claim。`None` ならすべて claim。引き出せる総額が同じでも、部分引き出しパターンが builder に有用な理由は?
+
+### 本番エスクロー設計ノート — なぜこれは宿題として残すか
+
+第 11 章と第 12 章はポジション担保と vault deposit に実際の SPL Token エスクローを追加した。本章は追加しない。理由は、builder 手数料エスクローは、それらの章が必要とした二者間トークン移動とは**構造的に違う**エスクロー問題だからだ。具体的な単一実装を示すことは教えるより誤解させる方が大きい。配線を書き始める前に 4 つの設計判断が必要になる。
+
+**1. 二者 vs 三者。** ポジション担保と vault deposit は二者間移動だ: ユーザ ↔ vault、片方が署名し、経済判断（いくら、誰の署名で）はすべて命令にエンコードされている。Builder 手数料は**三者分割**だ: ユーザは単一のプロトコル手数料を払い、そのうち一部がプロトコルへ、別の一部が builder へ行く。1 つのユーザ支払いを 2 つの受取人にアトミックに分割し、各々に正しい比率を credit するには、`spl_token_transfer_user_signed` や `spl_token_transfer_vault_signed` が提供する形とは別の形が必要だ。自然な実装は、quote mint ごとに 1 つの**手数料 vault** トークン アカウント、`[b"fee_vault", quote_mint]` のような PDA 所有。各 `PlaceOrderWithBuilder` は (a) ユーザのトークン アカウントから手数料 vault へ**全額**の `protocol_fee` を Transfer し、(b) builder のアキュムレータに `builder_share` を credit する。`(protocol_fee - builder_share)` の残余は手数料 vault に残り、プロトコルの取り分になる。
+
+**2. `PlaceOrderChecked` 非対称性。** 手数料エスクローを `PlaceOrderWithBuilder` だけに追加すると、ねじれたインセンティブが生まれる: builder なしの経路（`PlaceOrderChecked`）はトークン建ての手数料をまったく取らないので、builder 経由の取引は同じ取引より実質コストが高くなる。自然な解は、*すべての* place-order バリアントにプロトコル手数料エスクローを入れること — だがそれは §13.3 を破綻させずに本章で着地できるより大きな取引パスへの外科手術だ。本番デプロイは初日からプロトコル手数料を両バリアント共通として扱うことでこれを解く。
+
+**3. 複数 quote 対応。** 単一 quote 通貨（本章のケース）なら手数料 vault は単一アカウント。複数 quote 通貨では、(quote_mint) ごとの手数料 vault *かつ* (builder, quote_mint) ごとのアキュムレータが必要 — `BuilderProfile` はマップ フィールドを持つ（Pod 適合しない）か、quote ごとに別 profile PDA に分かれる。§13.1 で単一 quote 制約を意図的だと述べた。本番エスクロー設計こそが、それが実際にアカウントを要求し始める場所だ。
+
+**4. Claim 側の authority。** 手数料 vault が存在すれば、`ClaimBuilderFees` は手数料 vault authority PDA で署名された `fee_vault` → `builder_token` の PDA 署名 Transfer になる。§12.4 の `VaultWithdraw` と構造的に同一 — 同じ `invoke_signed` パターン、同じ `InvalidSeeds` 保護、違う seeds。これだけが、本章がすでにやった作業の「機械的拡張」と呼べる部分だ。
+
+本章が実際に教える仕組み — 取引とアトミックな accrual、別バッチ操作としての claim、二段キャップ安全性 — は 4 つの設計判断すべてを通じて変わらない。差分は SPL Token 配線だけだ。
+
+> **演習 §13.5b（設計）.** 本番 `ClaimBuilderFees` のアカウント レイアウトをスケッチせよ: どのアカウントが（順に）渡され、どれが signer で、どれが PDA で、どの seeds で派生するか。コードを書く必要はない — `scripts/builder/src/main.rs` に現れる `accounts: vec![...]` 宣言だけでよい。§12.4 の `VaultWithdraw` 宣言と比較せよ: 構造的に同一なのは何か、構造的に違うのは何か、各々の違いは上の 4 つの設計判断のどれに起因するか?
 
 ---
 
