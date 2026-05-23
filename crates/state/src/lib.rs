@@ -277,6 +277,47 @@ impl FundingState {
     pub const DEFAULT_WINDOW_SECONDS: u64 = 3600;
 }
 
+/// Fixed 8-byte tag identifying a `Position` account.
+pub const POSITION_DISCRIMINATOR: [u8; 8] = *b"POSITION";
+
+/// Per-user-per-market position. The convergence type — every other Phase B
+/// primitive (oracle, funding, vault, matcher) eventually touches a Position
+/// to commit its effects. Chapter 11 introduces it and the three lifecycle
+/// instructions (Open / Close / Liquidate).
+///
+/// Layout (144 bytes):
+/// ```text
+///    0 | 0x00  discriminator              [u8; 8]   — POSITION
+///    8 | 0x08  bump                       u8        — PDA bump
+///    9 | 0x09  _pad0                      [u8; 7]
+///   16 | 0x10  user                       [u8; 32]
+///   48 | 0x30  market                     [u8; 32]
+///   80 | 0x50  size                       i64       — base units; signed (long > 0, short < 0)
+///   88 | 0x58  entry_price                u64       — quote per base at open
+///   96 | 0x60  collateral                 u64       — quote units posted as margin
+///  104 | 0x68  funding_snapshot_index     i64       — FundingState.cumulative at last touch
+///  112 | 0x70  _reserved                  [u8; 32]
+///  144                                                — total size
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct Position {
+    pub discriminator: [u8; 8],
+    pub bump: u8,
+    pub _pad0: [u8; 7],
+    pub user: [u8; 32],
+    pub market: [u8; 32],
+    pub size: i64,
+    pub entry_price: u64,
+    pub collateral: u64,
+    pub funding_snapshot_index: i64,
+    pub _reserved: [u8; 32],
+}
+
+impl Position {
+    pub const LEN: usize = core::mem::size_of::<Self>();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,5 +390,15 @@ mod tests {
     #[test]
     fn funding_discriminator_is_human_readable() {
         assert_eq!(&FUNDING_DISCRIMINATOR, b"FUNDING\0");
+    }
+
+    #[test]
+    fn position_size_is_144_bytes() {
+        assert_eq!(Position::LEN, 144);
+    }
+
+    #[test]
+    fn position_discriminator_is_human_readable() {
+        assert_eq!(&POSITION_DISCRIMINATOR, b"POSITION");
     }
 }

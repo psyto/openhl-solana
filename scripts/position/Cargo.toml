@@ -1,0 +1,23 @@
+[package]
+name = "position"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Chapter 11 worked example: drives openhl-core's position lifecycle. --open creates a position; --close settles and zeros; --liquidate force-closes if underwater. Default action dumps position + computed equity/health."
+
+[[bin]]
+name = "position"
+path = "src/main.rs"
+
+[dependencies]
+openhl-state = { path = "../../crates/state" }
+openhl-core = { path = "../../programs/openhl-core", features = ["no-entrypoint"] }
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+solana-program = { workspace = true }
+solana-system-interface = { workspace = true }
+bytemuck = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

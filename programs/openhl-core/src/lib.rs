@@ -78,6 +78,19 @@
 //!                          cumulative_funding_index += rate × elapsed_seconds.
 //!                          Time-windowed accumulator pattern; the
 //!                          Phase A parallelism lesson made operational.
+//!  16  OpenPosition      — written for Chapter 11 (liquidation engine)
+//!                          Creates per-(user, market) Position PDA, stamps
+//!                          entry price from oracle, snapshots funding
+//!                          index, validates initial margin.
+//!  17  ClosePosition     — also Chapter 11
+//!                          Settles funding, realizes price PnL into
+//!                          collateral, zeros size. Account stays around
+//!                          for re-open.
+//!  18  Liquidate         — also Chapter 11
+//!                          Permissionless. Reads oracle + funding,
+//!                          computes equity, compares to maintenance
+//!                          margin. If liquidatable: applies liquidation
+//!                          penalty, force-closes at mark.
 //!
 //! The entire program is one file on purpose. Splitting it into the usual
 //! `instruction.rs` / `processor.rs` / `state.rs` modules buys nothing
@@ -87,9 +100,9 @@
 #![allow(unexpected_cfgs)] // solana_program::entrypoint! gates on `target_os = "solana"`
 
 use openhl_state::{
-    side, FundingState, Market, Oracle, Order, OrderBook, Stats, FUNDING_DISCRIMINATOR,
+    side, FundingState, Market, Oracle, Order, OrderBook, Position, Stats, FUNDING_DISCRIMINATOR,
     MARKET_DISCRIMINATOR, ORACLE_DISCRIMINATOR, ORDER_BOOK_DISCRIMINATOR, ORDER_CAPACITY,
-    STATS_DISCRIMINATOR,
+    POSITION_DISCRIMINATOR, STATS_DISCRIMINATOR,
 };
 use solana_program::{
     account_info::AccountInfo,
@@ -178,6 +191,24 @@ pub const FUNDING_SEED: &[u8] = b"funding";
 /// without configuring per-market overrides.
 pub const MAX_FUNDING_RATE_PER_SEC_ABS: i64 = 1_000_000;
 
+/// PDA seed prefix for per-(user, market) Position accounts.
+///
+/// Full seed list: `[POSITION_SEED, user_pubkey.as_ref(), market_pubkey.as_ref(), &[bump]]`.
+pub const POSITION_SEED: &[u8] = b"position";
+
+/// Initial margin requirement, in basis points. `1000` = 10% of notional,
+/// so positions may be opened with up to 10× leverage. Production perps
+/// tune this per asset (more leverage for low-vol pairs, less for high-vol).
+pub const INITIAL_MARGIN_BPS: u64 = 1000;
+
+/// Maintenance margin requirement, in basis points. `500` = 5% of notional.
+/// A position is liquidatable when equity / notional < MAINT_MARGIN_BPS / 10000.
+pub const MAINT_MARGIN_BPS: u64 = 500;
+
+/// Penalty (% of notional) taken from the position's collateral on
+/// liquidation, paid to the liquidator. `100` = 1% of notional.
+pub const LIQUIDATION_PENALTY_BPS: u64 = 100;
+
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
 
@@ -212,6 +243,9 @@ pub fn process_instruction(
         13 => process_place_order_checked(program_id, accounts, payload),
         14 => process_create_funding_state(program_id, accounts, payload),
         15 => process_update_funding(program_id, accounts, payload),
+        16 => process_open_position(program_id, accounts, payload),
+        17 => process_close_position(program_id, accounts, payload),
+        18 => process_liquidate(program_id, accounts, payload),
         unknown => {
             msg!("unknown instruction tag: {}", unknown);
             Err(ProgramError::InvalidInstructionData)
@@ -1755,6 +1789,355 @@ fn process_update_funding(
     funding.current_rate_per_sec = new_rate;
     funding.last_update_ts = clock.unix_timestamp;
     funding.last_update_slot = clock.slot;
+
+    Ok(())
+}
+
+// =============================================================================
+// Position lifecycle — OpenPosition + ClosePosition + Liquidate (Chapter 11).
+// =============================================================================
+//
+// SCOPE NOTE: collateral here is *tracked*, not *escrowed*. In production
+// OpenPosition would CPI into SPL Token to debit the user's quote token
+// account into the market vault (Chapter 6's deposit pattern); ClosePosition
+// would CPI the other direction; Liquidate would split the closed collateral
+// between the liquidator and the insurance fund. Chapter 11 calls out the
+// missing CPI plumbing in the chapter framing — the math here is already
+// the math you'd run regardless of where the tokens live.
+
+const OPEN_POSITION_PAYLOAD_LEN: usize = 8 + 8; // size i64 + collateral u64
+const CLOSE_POSITION_PAYLOAD_LEN: usize = 0;
+const LIQUIDATE_PAYLOAD_LEN: usize = 0;
+
+/// Compute equity = collateral + price PnL + funding PnL.
+/// All returned in quote units, signed (negative means underwater).
+fn compute_equity(position: &Position, mark: u64, funding_index_now: i64) -> i128 {
+    let size = position.size as i128;
+    let entry = position.entry_price as i128;
+    let mark_i = mark as i128;
+    let collateral = position.collateral as i128;
+
+    let price_pnl = size * (mark_i - entry);
+
+    let funding_delta = (funding_index_now as i128) - (position.funding_snapshot_index as i128);
+    // funding pnl uses the 1e9 scaling from the FundingState index
+    let funding_pnl = funding_delta * size / 1_000_000_000_i128;
+
+    collateral + price_pnl + funding_pnl
+}
+
+/// Compute notional = abs(size) * mark.
+fn notional(size: i64, mark: u64) -> u128 {
+    let abs_size = (size.unsigned_abs()) as u128;
+    abs_size * (mark as u128)
+}
+
+/// Read a fresh oracle mark price from an oracle account. Same staleness
+/// gauntlet as Chapter 9's PlaceOrderChecked, factored out so the three
+/// position handlers don't duplicate the check.
+fn read_fresh_oracle(oracle_ai: &AccountInfo, program_id: &Pubkey) -> Result<u64, ProgramError> {
+    if oracle_ai.owner != program_id || oracle_ai.data_len() != Oracle::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let oracle_data = oracle_ai.try_borrow_data()?;
+    let oracle: &Oracle = bytemuck::from_bytes(&oracle_data[..Oracle::LEN]);
+    if oracle.discriminator != ORACLE_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+    if oracle.price <= 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let clock = Clock::get()?;
+    let age = clock.slot.saturating_sub(oracle.publish_slot);
+    if age > MAX_ORACLE_STALENESS_SLOTS {
+        msg!("oracle stale ({} slots, max {})", age, MAX_ORACLE_STALENESS_SLOTS);
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(oracle.price as u64)
+}
+
+/// Read the cumulative_funding_index from a funding account.
+fn read_funding_index(funding_ai: &AccountInfo, program_id: &Pubkey) -> Result<i64, ProgramError> {
+    if funding_ai.owner != program_id || funding_ai.data_len() != FundingState::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let funding_data = funding_ai.try_borrow_data()?;
+    let funding: &FundingState = bytemuck::from_bytes(&funding_data[..FundingState::LEN]);
+    if funding.discriminator != FUNDING_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+    Ok(funding.cumulative_funding_index)
+}
+
+/// Payload: [size i64 LE][collateral u64 LE]
+///
+/// Accounts:
+///   0. `[WRITE, SIGNER]` user
+///   1. `[]`              market
+///   2. `[WRITE]`         position        — PDA at [b"position", user, market]
+///   3. `[]`              oracle
+///   4. `[]`              funding
+///   5. `[]`              system_program
+fn process_open_position(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != OPEN_POSITION_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let size = i64::from_le_bytes(payload[0..8].try_into().expect("8 bytes"));
+    let collateral = u64::from_le_bytes(payload[8..16].try_into().expect("8 bytes"));
+
+    if size == 0 {
+        msg!("open_position: size must be non-zero");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if collateral == 0 {
+        msg!("open_position: collateral must be > 0");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let user_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let market_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let position_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let oracle_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let funding_ai = accounts.get(4).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let system_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !user_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if market_ai.owner != program_id {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if system_ai.key != &system_program::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    // PDA derivation.
+    let (expected, bump) = Pubkey::find_program_address(
+        &[POSITION_SEED, user_ai.key.as_ref(), market_ai.key.as_ref()],
+        program_id,
+    );
+    if position_ai.key != &expected {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // Pull oracle mark + funding snapshot.
+    let mark = read_fresh_oracle(oracle_ai, program_id)?;
+    let funding_snapshot = read_funding_index(funding_ai, program_id)?;
+
+    // Initial margin requirement check.
+    let notional_val = notional(size, mark);
+    let im_required = notional_val * (INITIAL_MARGIN_BPS as u128) / 10_000;
+    if (collateral as u128) < im_required {
+        msg!(
+            "open_position: collateral {} < initial margin {} (notional {} × {} bps)",
+            collateral,
+            im_required,
+            notional_val,
+            INITIAL_MARGIN_BPS
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // Allocate the position PDA.
+    let rent = Rent::get()?.minimum_balance(Position::LEN);
+    let create_ix = system_instruction::create_account(
+        user_ai.key,
+        position_ai.key,
+        rent,
+        Position::LEN as u64,
+        program_id,
+    );
+    invoke_signed(
+        &create_ix,
+        &[user_ai.clone(), position_ai.clone(), system_ai.clone()],
+        &[&[
+            POSITION_SEED,
+            user_ai.key.as_ref(),
+            market_ai.key.as_ref(),
+            &[bump],
+        ]],
+    )?;
+
+    let mut data = position_ai.try_borrow_mut_data()?;
+    let position: &mut Position = bytemuck::from_bytes_mut(&mut data[..Position::LEN]);
+    position.discriminator = POSITION_DISCRIMINATOR;
+    position.bump = bump;
+    position._pad0 = [0u8; 7];
+    position.user.copy_from_slice(user_ai.key.as_ref());
+    position.market.copy_from_slice(market_ai.key.as_ref());
+    position.size = size;
+    position.entry_price = mark;
+    position.collateral = collateral;
+    position.funding_snapshot_index = funding_snapshot;
+    position._reserved = [0u8; 32];
+
+    msg!(
+        "open_position: size={} entry={} collateral={} funding_snap={}",
+        size,
+        mark,
+        collateral,
+        funding_snapshot
+    );
+    Ok(())
+}
+
+/// Payload: empty.
+///
+/// Accounts:
+///   0. `[SIGNER]` user — must match the position's owner
+///   1. `[WRITE]`  position
+///   2. `[]`       oracle
+///   3. `[]`       funding
+fn process_close_position(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != CLOSE_POSITION_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let user_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let position_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let oracle_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let funding_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !user_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if position_ai.owner != program_id || position_ai.data_len() != Position::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let mark = read_fresh_oracle(oracle_ai, program_id)?;
+    let funding_now = read_funding_index(funding_ai, program_id)?;
+
+    let mut data = position_ai.try_borrow_mut_data()?;
+    let position: &mut Position = bytemuck::from_bytes_mut(&mut data[..Position::LEN]);
+
+    if position.discriminator != POSITION_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+    if position.user != *user_ai.key.as_ref() {
+        msg!("close_position: caller is not the position owner");
+        return Err(ProgramError::IllegalOwner);
+    }
+    if position.size == 0 {
+        msg!("close_position: position already closed");
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let equity = compute_equity(position, mark, funding_now);
+    msg!(
+        "close_position: size={} entry={} mark={} equity={}",
+        position.size,
+        position.entry_price,
+        mark,
+        equity
+    );
+
+    // Realize PnL into collateral. Underwater closes wipe the collateral
+    // to zero (the program does not socialize the loss here — see chapter
+    // hook into insurance fund).
+    let new_collateral = if equity < 0 { 0 } else { equity as u64 };
+    position.collateral = new_collateral;
+    position.size = 0;
+    position.entry_price = 0;
+    position.funding_snapshot_index = funding_now;
+
+    msg!("close_position: closed. realized collateral = {}", new_collateral);
+    Ok(())
+}
+
+/// Payload: empty.
+///
+/// Accounts:
+///   0. `[SIGNER]` liquidator — anyone; permissionless
+///   1. `[WRITE]`  position
+///   2. `[]`       oracle
+///   3. `[]`       funding
+fn process_liquidate(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != LIQUIDATE_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let liquidator_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let position_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let oracle_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let funding_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !liquidator_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if position_ai.owner != program_id || position_ai.data_len() != Position::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let mark = read_fresh_oracle(oracle_ai, program_id)?;
+    let funding_now = read_funding_index(funding_ai, program_id)?;
+
+    let mut data = position_ai.try_borrow_mut_data()?;
+    let position: &mut Position = bytemuck::from_bytes_mut(&mut data[..Position::LEN]);
+
+    if position.discriminator != POSITION_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+    if position.size == 0 {
+        msg!("liquidate: position already closed");
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let equity = compute_equity(position, mark, funding_now);
+    let notional_val = notional(position.size, mark);
+    let maint_required = (notional_val * (MAINT_MARGIN_BPS as u128) / 10_000) as i128;
+
+    msg!(
+        "liquidate: size={} mark={} equity={} maint_required={}",
+        position.size,
+        mark,
+        equity,
+        maint_required
+    );
+
+    if equity >= maint_required {
+        msg!(
+            "liquidate: position is healthy (equity {} >= maint {}), not liquidatable",
+            equity,
+            maint_required
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // Liquidatable. Apply penalty to whatever collateral survives the
+    // close, zero the position. In production the penalty would be
+    // transferred from the vault to the liquidator's token account via
+    // SPL Token CPI; here we only update the in-account number.
+    let liquidation_penalty = ((notional_val * (LIQUIDATION_PENALTY_BPS as u128) / 10_000)
+        .min(i64::MAX as u128)) as i128;
+
+    let mut realized = if equity < 0 { 0 } else { equity };
+    realized = (realized - liquidation_penalty).max(0);
+    let new_collateral = realized as u64;
+
+    msg!(
+        "liquidate: penalty={} new_collateral={} (paid to liquidator {})",
+        liquidation_penalty,
+        new_collateral,
+        liquidator_ai.key
+    );
+
+    position.collateral = new_collateral;
+    position.size = 0;
+    position.entry_price = 0;
+    position.funding_snapshot_index = funding_now;
 
     Ok(())
 }

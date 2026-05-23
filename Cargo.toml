@@ -13,6 +13,7 @@ members = [
     "scripts/init-market",
     "scripts/match",
     "scripts/oracle",
+    "scripts/position",
     "scripts/stats",
 ]
 
