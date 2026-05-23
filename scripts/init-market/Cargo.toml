@@ -1,0 +1,25 @@
+[package]
+name = "init-market"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Chapter 2 worked example: assign a previously-allocated Market to openhl-core, then call Initialize so MARKET\\0\\0 is written at offset 0."
+
+[[bin]]
+name = "init-market"
+path = "src/main.rs"
+
+[dependencies]
+openhl-state = { path = "../../crates/state" }
+# Pull `openhl-core` as a library (no entrypoint) so we can reuse types
+# without dragging the BPF entrypoint into the host binary.
+openhl-core = { path = "../../programs/openhl-core", features = ["no-entrypoint"] }
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+solana-program = { workspace = true }
+solana-system-interface = { workspace = true }
+bytemuck = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

@@ -1806,6 +1806,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "init-market"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "clap",
+ "openhl-core",
+ "openhl-state",
+ "solana-client",
+ "solana-program",
+ "solana-sdk",
+ "solana-system-interface",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2277,6 +2292,15 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+
+[[package]]
+name = "openhl-core"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "openhl-state",
+ "solana-program",
+]
 
 [[package]]
 name = "openhl-state"

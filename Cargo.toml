@@ -2,7 +2,9 @@
 resolver = "2"
 members = [
     "crates/state",
+    "programs/openhl-core",
     "scripts/allocate-market",
+    "scripts/init-market",
 ]
 
 [workspace.package]

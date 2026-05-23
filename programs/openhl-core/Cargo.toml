@@ -1,0 +1,22 @@
+[package]
+name = "openhl-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "openhl-solana on-chain program. Native (no Anchor) — built incrementally across the SolDojo internals track."
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+# `no-entrypoint` disables the BPF entrypoint so the crate can be linked
+# as a plain library (e.g. from clients that want to reuse instruction
+# definitions or types without pulling in the program entrypoint).
+no-entrypoint = []
+
+[dependencies]
+openhl-state = { path = "../../crates/state" }
+solana-program = { workspace = true }
+bytemuck = { workspace = true }
