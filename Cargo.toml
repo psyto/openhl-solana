@@ -5,6 +5,7 @@ members = [
     "programs/openhl-core",
     "scripts/allocate-market",
     "scripts/bench",
+    "scripts/book",
     "scripts/create-market",
     "scripts/create-vault",
     "scripts/deposit",

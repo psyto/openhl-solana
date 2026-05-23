@@ -456,6 +456,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "book"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "clap",
+ "openhl-core",
+ "openhl-state",
+ "solana-client",
+ "solana-program",
+ "solana-sdk",
+ "solana-system-interface",
+]
+
+[[package]]
 name = "borsh"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

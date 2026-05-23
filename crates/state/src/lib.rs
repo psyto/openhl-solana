@@ -96,6 +96,95 @@ impl Stats {
     pub const LEN: usize = core::mem::size_of::<Self>();
 }
 
+/// Side of an order — buy or sell. Encoded as a single byte so the layout
+/// stays Pod-friendly. `0 = bid`, `1 = ask`. Any other value is invalid
+/// and the program rejects orders carrying it.
+pub mod side {
+    pub const BID: u8 = 0;
+    pub const ASK: u8 = 1;
+}
+
+/// One resting order in the book. 64 bytes, Pod, repr(C).
+///
+/// `size == 0` is the sentinel for "this slot is unused." The program
+/// scans linearly for the first slot with size 0 when placing a new
+/// order; cancellation zeroes the slot in place. There is no compaction.
+///
+/// Layout:
+/// ```text
+///   0  | 0x00  order_id   u64       — assigned by OrderBook.next_order_id
+///   8  | 0x08  price      u64       — quote units per base unit
+///  16  | 0x10  size       u64       — base units remaining (0 = slot empty)
+///  24  | 0x18  owner      [u8; 32]  — user pubkey that placed the order
+///  56  | 0x38  side       u8        — 0 = bid, 1 = ask
+///  57  | 0x39  _pad       [u8; 7]
+///  64                                — total
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct Order {
+    pub order_id: u64,
+    pub price: u64,
+    pub size: u64,
+    pub owner: [u8; 32],
+    pub side: u8,
+    pub _pad: [u8; 7],
+}
+
+impl Order {
+    pub const LEN: usize = core::mem::size_of::<Self>();
+}
+
+/// Maximum resting orders the on-chain book can hold at once.
+///
+/// 32 is a deliberately small number chosen for pedagogy: it is large
+/// enough that the linear-scan CU cost is measurable in `place_order`
+/// and `cancel_order`, and small enough that the book account fits well
+/// under the per-instruction data-load budget. A real perp DEX would use
+/// 256–1024 slots and a more complex data structure (slab, critbit) —
+/// Chapter 7 discusses the trade-off.
+pub const ORDER_CAPACITY: usize = 32;
+
+/// Fixed 8-byte tag identifying an `OrderBook` account.
+pub const ORDER_BOOK_DISCRIMINATOR: [u8; 8] = *b"BOOK\0\0\0\0";
+
+/// On-chain order book. One per market, 2112 bytes.
+///
+/// The book is a flat array of `Order` slots. Bid and ask orders share
+/// the same array, distinguished by the `side` byte. This is the simplest
+/// possible CLOB layout — production designs use sorted price levels with
+/// FIFO queues per level (slab / critbit tree), but the flat array is
+/// pedagogically honest about what "linear scan" really costs.
+///
+/// Layout:
+/// ```text
+///    0 | 0x000  discriminator   [u8; 8]   — BOOK\0\0\0\0
+///    8 | 0x008  bump            u8        — PDA bump for [b"book", market]
+///    9 | 0x009  _pad0           [u8; 7]
+///   16 | 0x010  market          [u8; 32]  — the market this book belongs to
+///   48 | 0x030  next_order_id   u64       — monotonic counter
+///   56 | 0x038  active_count    u32       — slots with size != 0
+///   60 | 0x03c  _pad1           [u8; 4]
+///   64 | 0x040  slots           [Order; 32]
+/// 2112                                     — total
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct OrderBook {
+    pub discriminator: [u8; 8],
+    pub bump: u8,
+    pub _pad0: [u8; 7],
+    pub market: [u8; 32],
+    pub next_order_id: u64,
+    pub active_count: u32,
+    pub _pad1: [u8; 4],
+    pub slots: [Order; ORDER_CAPACITY],
+}
+
+impl OrderBook {
+    pub const LEN: usize = core::mem::size_of::<Self>();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +220,22 @@ mod tests {
     #[test]
     fn stats_discriminator_is_human_readable() {
         assert_eq!(&STATS_DISCRIMINATOR, b"STATS\0\0\0");
+    }
+
+    #[test]
+    fn order_size_is_64_bytes() {
+        assert_eq!(Order::LEN, 64);
+    }
+
+    #[test]
+    fn order_book_size_matches_layout() {
+        // 64 byte header + 32 * 64 byte slots = 2112
+        assert_eq!(OrderBook::LEN, 64 + ORDER_CAPACITY * Order::LEN);
+        assert_eq!(OrderBook::LEN, 2112);
+    }
+
+    #[test]
+    fn order_book_discriminator_is_human_readable() {
+        assert_eq!(&ORDER_BOOK_DISCRIMINATOR, b"BOOK\0\0\0\0");
     }
 }

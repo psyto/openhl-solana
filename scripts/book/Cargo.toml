@@ -1,0 +1,23 @@
+[package]
+name = "book"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Chapter 7 worked example: drives openhl-core's order-book instructions. --init creates the per-market OrderBook PDA; --place posts a bid or ask; --cancel removes one by order_id; default action dumps the current book."
+
+[[bin]]
+name = "book"
+path = "src/main.rs"
+
+[dependencies]
+openhl-state = { path = "../../crates/state" }
+openhl-core = { path = "../../programs/openhl-core", features = ["no-entrypoint"] }
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+solana-program = { workspace = true }
+solana-system-interface = { workspace = true }
+bytemuck = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

@@ -40,6 +40,14 @@
 //!                     Calls plain `invoke` because the user signs at the
 //!                     outer transaction level and signer privilege
 //!                     extends through to the SPL Token program.
+//!   7  CreateOrderBook — written for Chapter 7 (on-chain CLOB)
+//!                       Creates the per-market OrderBook PDA at
+//!                       [b"book", market], 2112 bytes.
+//!   8  PlaceOrder      — also Chapter 7
+//!                       Linear-scan for the first empty slot, write
+//!                       the Order. CU envelope grows with slot index.
+//!   9  CancelOrder     — also Chapter 7
+//!                       Linear-scan by order_id, zero the slot.
 //!
 //! The entire program is one file on purpose. Splitting it into the usual
 //! `instruction.rs` / `processor.rs` / `state.rs` modules buys nothing
@@ -48,7 +56,10 @@
 
 #![allow(unexpected_cfgs)] // solana_program::entrypoint! gates on `target_os = "solana"`
 
-use openhl_state::{Market, Stats, MARKET_DISCRIMINATOR, STATS_DISCRIMINATOR};
+use openhl_state::{
+    side, Market, Order, OrderBook, Stats, MARKET_DISCRIMINATOR, ORDER_BOOK_DISCRIMINATOR,
+    ORDER_CAPACITY, STATS_DISCRIMINATOR,
+};
 use solana_program::{
     account_info::AccountInfo,
     entrypoint::ProgramResult,
@@ -100,6 +111,11 @@ pub const SPL_TOKEN_PROGRAM_ID: Pubkey =
 /// Size of an SPL Token Account, per spl_token::state::Account::LEN.
 const TOKEN_ACCOUNT_LEN: usize = 165;
 
+/// PDA seed prefix for the per-market order book.
+///
+/// Full seed list: `[BOOK_SEED, market_pubkey.as_ref(), &[bump]]`.
+pub const BOOK_SEED: &[u8] = b"book";
+
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
 
@@ -125,6 +141,9 @@ pub fn process_instruction(
         4 => process_bump_stats(program_id, accounts, payload),
         5 => process_create_vault(program_id, accounts, payload),
         6 => process_deposit(accounts, payload),
+        7 => process_create_order_book(program_id, accounts, payload),
+        8 => process_place_order(program_id, accounts, payload),
+        9 => process_cancel_order(program_id, accounts, payload),
         unknown => {
             msg!("unknown instruction tag: {}", unknown);
             Err(ProgramError::InvalidInstructionData)
@@ -795,5 +814,256 @@ fn process_deposit(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
     )?;
 
     msg!("deposit: transferred {} units", amount);
+    Ok(())
+}
+
+// =============================================================================
+// CreateOrderBook + PlaceOrder + CancelOrder — on-chain CLOB (Chapter 7).
+// =============================================================================
+
+const CREATE_BOOK_PAYLOAD_LEN: usize = 0;
+const PLACE_ORDER_PAYLOAD_LEN: usize = 1 + 8 + 8; // side u8 + price u64 + size u64
+const CANCEL_ORDER_PAYLOAD_LEN: usize = 8; // order_id u64
+
+/// Accounts:
+///   0. `[WRITE, SIGNER]` payer
+///   1. `[]`              market
+///   2. `[WRITE]`         book           — PDA at [b"book", market]
+///   3. `[]`              system_program
+fn process_create_order_book(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != CREATE_BOOK_PAYLOAD_LEN {
+        msg!("create_order_book: payload must be empty");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let payer_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let market_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let book_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let system_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !payer_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if market_ai.owner != program_id {
+        msg!("create_order_book: market owner mismatch");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if system_ai.key != &system_program::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    let (expected_pda, bump) =
+        Pubkey::find_program_address(&[BOOK_SEED, market_ai.key.as_ref()], program_id);
+    if book_ai.key != &expected_pda {
+        msg!(
+            "create_order_book: passed book {} != derived PDA {}",
+            book_ai.key,
+            expected_pda
+        );
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let rent = Rent::get()?.minimum_balance(OrderBook::LEN);
+    let create_ix = system_instruction::create_account(
+        payer_ai.key,
+        book_ai.key,
+        rent,
+        OrderBook::LEN as u64,
+        program_id,
+    );
+    invoke_signed(
+        &create_ix,
+        &[payer_ai.clone(), book_ai.clone(), system_ai.clone()],
+        &[&[BOOK_SEED, market_ai.key.as_ref(), &[bump]]],
+    )?;
+
+    let mut data = book_ai.try_borrow_mut_data()?;
+    let book: &mut OrderBook = bytemuck::from_bytes_mut(&mut data[..OrderBook::LEN]);
+    book.discriminator = ORDER_BOOK_DISCRIMINATOR;
+    book.bump = bump;
+    book._pad0 = [0u8; 7];
+    book.market.copy_from_slice(market_ai.key.as_ref());
+    book.next_order_id = 1;
+    book.active_count = 0;
+    book._pad1 = [0u8; 4];
+    // slots remain zeroed (size == 0 ⇒ empty slot)
+
+    msg!("order book created (bump {})", bump);
+    Ok(())
+}
+
+/// Payload: [side u8][price u64 LE][size u64 LE]
+///
+/// Accounts:
+///   0. `[SIGNER]` user
+///   1. `[WRITE]`  book — must be owned by this program, must be initialized
+fn process_place_order(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != PLACE_ORDER_PAYLOAD_LEN {
+        msg!(
+            "place_order: payload must be {} bytes, got {}",
+            PLACE_ORDER_PAYLOAD_LEN,
+            payload.len()
+        );
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let order_side = payload[0];
+    let price = u64::from_le_bytes(payload[1..9].try_into().expect("8 bytes"));
+    let size = u64::from_le_bytes(payload[9..17].try_into().expect("8 bytes"));
+
+    if order_side != side::BID && order_side != side::ASK {
+        msg!("place_order: invalid side byte {}", order_side);
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if price == 0 || size == 0 {
+        msg!("place_order: price and size must be > 0");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let user_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let book_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !user_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if book_ai.owner != program_id {
+        msg!("place_order: book owner mismatch");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if book_ai.data_len() != OrderBook::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    msg!("place_order: side={} price={} size={}", order_side, price, size);
+    sol_log_compute_units();
+
+    let mut data = book_ai.try_borrow_mut_data()?;
+    let book: &mut OrderBook = bytemuck::from_bytes_mut(&mut data[..OrderBook::LEN]);
+
+    if book.discriminator != ORDER_BOOK_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    // Linear scan for the first empty slot. This is O(ORDER_CAPACITY) in the
+    // worst case (book full of asks placed before a bid lookup). Chapter 7's
+    // whole point is that this scan is *visible* in the CU log and *grows*
+    // as the book fills.
+    let mut chosen_slot: Option<usize> = None;
+    for (i, slot) in book.slots.iter().enumerate() {
+        if slot.size == 0 {
+            chosen_slot = Some(i);
+            break;
+        }
+    }
+    let slot_idx = chosen_slot.ok_or_else(|| {
+        msg!("place_order: book full ({} slots)", ORDER_CAPACITY);
+        ProgramError::AccountDataTooSmall
+    })?;
+
+    let order_id = book.next_order_id;
+    book.next_order_id = book.next_order_id.saturating_add(1);
+    book.active_count = book.active_count.saturating_add(1);
+
+    let mut owner = [0u8; 32];
+    owner.copy_from_slice(user_ai.key.as_ref());
+
+    book.slots[slot_idx] = Order {
+        order_id,
+        price,
+        size,
+        owner,
+        side: order_side,
+        _pad: [0u8; 7],
+    };
+
+    msg!(
+        "place_order: placed order_id={} into slot {} (active={})",
+        order_id,
+        slot_idx,
+        book.active_count
+    );
+    sol_log_compute_units();
+
+    Ok(())
+}
+
+/// Payload: [order_id u64 LE]
+///
+/// Accounts:
+///   0. `[SIGNER]` user — must match the slot's owner
+///   1. `[WRITE]`  book
+fn process_cancel_order(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != CANCEL_ORDER_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let order_id = u64::from_le_bytes(payload[0..8].try_into().expect("8 bytes"));
+
+    let user_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let book_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !user_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if book_ai.owner != program_id {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if book_ai.data_len() != OrderBook::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    msg!("cancel_order: order_id={}", order_id);
+    sol_log_compute_units();
+
+    let mut data = book_ai.try_borrow_mut_data()?;
+    let book: &mut OrderBook = bytemuck::from_bytes_mut(&mut data[..OrderBook::LEN]);
+
+    if book.discriminator != ORDER_BOOK_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    // Linear scan for the order_id. Worst case is "order is in the last
+    // slot" or "order not found at all" — both pay full O(ORDER_CAPACITY).
+    let mut found: Option<usize> = None;
+    for (i, slot) in book.slots.iter().enumerate() {
+        if slot.size != 0 && slot.order_id == order_id {
+            found = Some(i);
+            break;
+        }
+    }
+    let slot_idx = found.ok_or_else(|| {
+        msg!("cancel_order: order_id {} not found", order_id);
+        ProgramError::InvalidArgument
+    })?;
+
+    // Authorization: only the order's original owner may cancel it.
+    if book.slots[slot_idx].owner != *user_ai.key.as_ref() {
+        msg!("cancel_order: caller is not the order owner");
+        return Err(ProgramError::IllegalOwner);
+    }
+
+    // Zero the slot. The next place_order that lands in this index will
+    // overwrite it. No compaction.
+    book.slots[slot_idx] = <Order as bytemuck::Zeroable>::zeroed();
+    book.active_count = book.active_count.saturating_sub(1);
+
+    msg!(
+        "cancel_order: cancelled order_id={} (slot {}, active={})",
+        order_id,
+        slot_idx,
+        book.active_count
+    );
+    sol_log_compute_units();
+
     Ok(())
 }
