@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Solana
+test-ledger/
+*.so
+
+# Local keys
+*.json
+!Cargo.json

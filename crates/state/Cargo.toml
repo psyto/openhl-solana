@@ -1,0 +1,11 @@
+[package]
+name = "openhl-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Account layouts for openhl-solana — Pod structs shared between programs and clients."
+
+[dependencies]
+bytemuck = { workspace = true }
