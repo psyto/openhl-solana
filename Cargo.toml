@@ -7,6 +7,7 @@ members = [
     "scripts/bench",
     "scripts/create-market",
     "scripts/init-market",
+    "scripts/stats",
 ]
 
 [workspace.package]

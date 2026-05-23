@@ -1,0 +1,23 @@
+[package]
+name = "stats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Chapter 5 worked example: drives openhl-core's CreateStats (--init) and BumpStats (default) so the AccountMeta layouts can be inspected. Demonstrates the singleton write-shared account that Chapter 5 critiques."
+
+[[bin]]
+name = "stats"
+path = "src/main.rs"
+
+[dependencies]
+openhl-state = { path = "../../crates/state" }
+openhl-core = { path = "../../programs/openhl-core", features = ["no-entrypoint"] }
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+solana-program = { workspace = true }
+solana-system-interface = { workspace = true }
+bytemuck = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

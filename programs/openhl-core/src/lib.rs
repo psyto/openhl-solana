@@ -14,6 +14,17 @@
 //!                     Configurable workload that allocates a heap buffer
 //!                     and iterates sha256 hashes, with sol_log_compute_units
 //!                     bracketing each phase. Touches no accounts.
+//!   3  CreateStats   — written for Chapter 5 (Sealevel parallelism)
+//!                     One-shot creation of the program's singleton Stats
+//!                     PDA at seeds [b"stats"]. The chapter uses Stats as
+//!                     a worked example of write-shared state and why
+//!                     adding it to a hot-path instruction would serialize
+//!                     concurrent calls in the scheduler.
+//!   4  BumpStats     — also Chapter 5
+//!                     Increments market_count on the singleton Stats PDA.
+//!                     Trivial body; the interesting thing is the
+//!                     AccountMeta declaration (single WRITE on a singleton
+//!                     pubkey), which is what Sealevel sees.
 //!
 //! The entire program is one file on purpose. Splitting it into the usual
 //! `instruction.rs` / `processor.rs` / `state.rs` modules buys nothing
@@ -22,7 +33,7 @@
 
 #![allow(unexpected_cfgs)] // solana_program::entrypoint! gates on `target_os = "solana"`
 
-use openhl_state::{Market, MARKET_DISCRIMINATOR};
+use openhl_state::{Market, Stats, MARKET_DISCRIMINATOR, STATS_DISCRIMINATOR};
 use solana_program::{
     account_info::AccountInfo,
     entrypoint::ProgramResult,
@@ -42,6 +53,13 @@ use solana_system_interface::{instruction as system_instruction, program as syst
 /// The prefix is what makes the market address unambiguously a *market* and
 /// not, say, a position account that happened to derive from the same mints.
 pub const MARKET_SEED: &[u8] = b"market";
+
+/// PDA seed for the program's singleton Stats account.
+///
+/// Single byte string, no per-instance suffix — there is exactly one Stats
+/// PDA per program ID. This is the design choice Chapter 5 critiques: a
+/// singleton write-shared account becomes a Sealevel scheduling bottleneck.
+pub const STATS_SEED: &[u8] = b"stats";
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
@@ -64,6 +82,8 @@ pub fn process_instruction(
         0 => process_initialize(program_id, accounts, payload),
         1 => process_create_market(program_id, accounts, payload),
         2 => process_bench(payload),
+        3 => process_create_stats(program_id, accounts, payload),
+        4 => process_bump_stats(program_id, accounts, payload),
         unknown => {
             msg!("unknown instruction tag: {}", unknown);
             Err(ProgramError::InvalidInstructionData)
@@ -397,5 +417,123 @@ fn process_bench(payload: &[u8]) -> ProgramResult {
     msg!("bench: after {} hash rounds", rounds);
     sol_log_compute_units();
 
+    Ok(())
+}
+
+// =============================================================================
+// CreateStats + BumpStats — singleton write-shared state (Chapter 5).
+// =============================================================================
+//
+// The Stats PDA exists per program ID (single account, derived from
+// `[STATS_SEED]` + program_id). It deliberately serves as a worked
+// counter-example to parallelism: any instruction that writes to Stats
+// joins the same Sealevel lock queue, regardless of which market the
+// caller is otherwise touching. Chapter 5 walks the AccountMeta of these
+// instructions and explains why a singleton write-shared account is the
+// fastest path to single-threading a Solana program.
+
+const CREATE_STATS_PAYLOAD_LEN: usize = 0;
+const BUMP_STATS_PAYLOAD_LEN: usize = 0;
+
+/// Accounts:
+///   0. `[WRITE, SIGNER]` payer
+///   1. `[WRITE]`         stats           — singleton Stats PDA
+///   2. `[]`              system_program
+fn process_create_stats(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != CREATE_STATS_PAYLOAD_LEN {
+        msg!("create_stats: payload must be empty");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let payer_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let stats_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let system_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !payer_ai.is_signer {
+        msg!("create_stats: payer must sign");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if system_ai.key != &system_program::ID {
+        msg!("create_stats: account[2] is not the System program");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    let (expected_pda, bump) = Pubkey::find_program_address(&[STATS_SEED], program_id);
+    if stats_ai.key != &expected_pda {
+        msg!(
+            "create_stats: passed stats {} != derived PDA {}",
+            stats_ai.key,
+            expected_pda
+        );
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let rent = Rent::get()?.minimum_balance(Stats::LEN);
+    let create_ix = system_instruction::create_account(
+        payer_ai.key,
+        stats_ai.key,
+        rent,
+        Stats::LEN as u64,
+        program_id,
+    );
+    invoke_signed(
+        &create_ix,
+        &[payer_ai.clone(), stats_ai.clone(), system_ai.clone()],
+        &[&[STATS_SEED, &[bump]]],
+    )?;
+
+    let mut data = stats_ai.try_borrow_mut_data()?;
+    let stats: &mut Stats = bytemuck::from_bytes_mut(&mut data[..Stats::LEN]);
+    stats.discriminator = STATS_DISCRIMINATOR;
+    stats.bump = bump;
+    stats._pad0 = [0u8; 7];
+    stats.market_count = 0;
+    stats._reserved = [0u8; 32];
+
+    msg!("stats created at PDA (bump {})", bump);
+    Ok(())
+}
+
+/// Accounts:
+///   0. `[WRITE]` stats — the singleton Stats PDA
+fn process_bump_stats(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != BUMP_STATS_PAYLOAD_LEN {
+        msg!("bump_stats: payload must be empty");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let stats_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if stats_ai.owner != program_id {
+        msg!("bump_stats: stats owner mismatch");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if stats_ai.data_len() != Stats::LEN {
+        msg!(
+            "bump_stats: stats data_len {} != {}",
+            stats_ai.data_len(),
+            Stats::LEN
+        );
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let mut data = stats_ai.try_borrow_mut_data()?;
+    let stats: &mut Stats = bytemuck::from_bytes_mut(&mut data[..Stats::LEN]);
+
+    if stats.discriminator != STATS_DISCRIMINATOR {
+        msg!("bump_stats: stats account not initialized");
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    stats.market_count = stats.market_count.saturating_add(1);
+    msg!("stats.market_count: {}", stats.market_count);
     Ok(())
 }
