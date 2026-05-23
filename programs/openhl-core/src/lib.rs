@@ -102,6 +102,18 @@
 //!  22  VaultUpdateNAV     — also Chapter 12
 //!                           Manager-only. Sets total_assets to reflect
 //!                           realized PnL since last update.
+//!  23  RegisterBuilder    — written for Chapter 13 (builder codes)
+//!                           Creates per-builder BuilderProfile PDA at
+//!                           [b"builder", builder]. Builder declares
+//!                           their self-imposed max_fee_share_bps cap.
+//!  24  PlaceOrderWithBuilder — also Chapter 13
+//!                           Like PlaceOrderChecked but charges a
+//!                           protocol fee and atomically credits the
+//!                           builder's share to their BuilderProfile.
+//!  25  ClaimBuilderFees   — also Chapter 13
+//!                           Builder-only. Zeroes accumulated_fees;
+//!                           in production the amount would be CPI'd
+//!                           out via SPL Token Transfer.
 //!
 //! The entire program is one file on purpose. Splitting it into the usual
 //! `instruction.rs` / `processor.rs` / `state.rs` modules buys nothing
@@ -111,10 +123,11 @@
 #![allow(unexpected_cfgs)] // solana_program::entrypoint! gates on `target_os = "solana"`
 
 use openhl_state::{
-    side, FundingState, Market, Oracle, Order, OrderBook, Position, Stats, TradingVault,
-    VaultShare, FUNDING_DISCRIMINATOR, MARKET_DISCRIMINATOR, ORACLE_DISCRIMINATOR,
-    ORDER_BOOK_DISCRIMINATOR, ORDER_CAPACITY, POSITION_DISCRIMINATOR, STATS_DISCRIMINATOR,
-    TRADING_VAULT_DISCRIMINATOR, VAULT_SHARE_DISCRIMINATOR,
+    side, BuilderProfile, FundingState, Market, Oracle, Order, OrderBook, Position, Stats,
+    TradingVault, VaultShare, BUILDER_PROFILE_DISCRIMINATOR, FUNDING_DISCRIMINATOR,
+    MARKET_DISCRIMINATOR, ORACLE_DISCRIMINATOR, ORDER_BOOK_DISCRIMINATOR, ORDER_CAPACITY,
+    POSITION_DISCRIMINATOR, STATS_DISCRIMINATOR, TRADING_VAULT_DISCRIMINATOR,
+    VAULT_SHARE_DISCRIMINATOR,
 };
 use solana_program::{
     account_info::AccountInfo,
@@ -231,6 +244,23 @@ pub const TRADING_VAULT_SEED: &[u8] = b"trading_vault";
 /// Full seed list: `[VAULT_SHARE_SEED, vault.key, owner.key, &[bump]]`.
 pub const VAULT_SHARE_SEED: &[u8] = b"vault_share";
 
+/// PDA seed prefix for per-builder fee-accrual profile.
+///
+/// Full seed list: `[BUILDER_PROFILE_SEED, builder.key, &[bump]]`.
+pub const BUILDER_PROFILE_SEED: &[u8] = b"builder";
+
+/// Protocol fee in basis points of notional. `10` = 0.1%. Tight by perp-DEX
+/// standards (HL is ~3 bps for makers, ~5 for takers); we pick a round
+/// number so the math reads clean in the chapter examples.
+pub const PROTOCOL_FEE_BPS: u64 = 10;
+
+/// Hard cap on how much of the protocol fee a builder may claim,
+/// regardless of what their BuilderProfile declares. `5000` = 50%, i.e.
+/// builders may keep at most half of the protocol fee, with the rest
+/// retained by the protocol (in production: routed to an insurance
+/// fund or treasury account).
+pub const PROTOCOL_BUILDER_SHARE_CAP_BPS: u64 = 5000;
+
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
 
@@ -272,6 +302,9 @@ pub fn process_instruction(
         20 => process_vault_deposit(program_id, accounts, payload),
         21 => process_vault_withdraw(program_id, accounts, payload),
         22 => process_vault_update_nav(program_id, accounts, payload),
+        23 => process_register_builder(program_id, accounts, payload),
+        24 => process_place_order_with_builder(program_id, accounts, payload),
+        25 => process_claim_builder_fees(program_id, accounts, payload),
         unknown => {
             msg!("unknown instruction tag: {}", unknown);
             Err(ProgramError::InvalidInstructionData)
@@ -2537,6 +2570,289 @@ fn process_vault_update_nav(
         prev,
         new_total_assets,
         vault.total_shares
+    );
+    Ok(())
+}
+
+// =============================================================================
+// Builder codes — RegisterBuilder + PlaceOrderWithBuilder + ClaimBuilderFees
+// (Chapter 13).
+// =============================================================================
+//
+// A "builder" is a frontend / aggregator / market-maker that routes orders
+// to this program. In exchange, the program credits them a configurable
+// fraction of the protocol fee earned on those orders.
+//
+// SCOPE NOTE: as in ch.11/12, fee amounts here are *tracked* in u64 fields
+// rather than escrowed via SPL Token CPI. ClaimBuilderFees zeroes the
+// accumulator; a production deployment would CPI an SPL Token Transfer
+// from the protocol fee vault to the builder's token account in the same
+// instruction. The atomicity argument the chapter is about (fee split
+// happens inside place_order_with_builder, not in a separate claim call)
+// works identically whether or not real tokens are moving.
+
+const REGISTER_BUILDER_PAYLOAD_LEN: usize = 8; // max_fee_share_bps u64
+const PLACE_ORDER_WITH_BUILDER_PAYLOAD_LEN: usize = 1 + 8 + 8; // same as PlaceOrder
+const CLAIM_BUILDER_FEES_PAYLOAD_LEN: usize = 0;
+
+/// Payload: [max_fee_share_bps u64 LE]
+///
+/// Accounts:
+///   0. `[WRITE, SIGNER]` payer        — also implicitly the builder
+///   1. `[WRITE]`         builder_profile — PDA at [b"builder", payer]
+///   2. `[]`              system_program
+fn process_register_builder(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != REGISTER_BUILDER_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let mut max_share = u64::from_le_bytes(payload[0..8].try_into().expect("8 bytes"));
+    if max_share > PROTOCOL_BUILDER_SHARE_CAP_BPS {
+        msg!(
+            "register_builder: requested {} bps clamped to protocol cap {} bps",
+            max_share,
+            PROTOCOL_BUILDER_SHARE_CAP_BPS
+        );
+        max_share = PROTOCOL_BUILDER_SHARE_CAP_BPS;
+    }
+
+    let payer_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let profile_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let system_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !payer_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if system_ai.key != &system_program::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    let (expected, bump) =
+        Pubkey::find_program_address(&[BUILDER_PROFILE_SEED, payer_ai.key.as_ref()], program_id);
+    if profile_ai.key != &expected {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let rent = Rent::get()?.minimum_balance(BuilderProfile::LEN);
+    let create_ix = system_instruction::create_account(
+        payer_ai.key,
+        profile_ai.key,
+        rent,
+        BuilderProfile::LEN as u64,
+        program_id,
+    );
+    invoke_signed(
+        &create_ix,
+        &[payer_ai.clone(), profile_ai.clone(), system_ai.clone()],
+        &[&[BUILDER_PROFILE_SEED, payer_ai.key.as_ref(), &[bump]]],
+    )?;
+
+    let mut data = profile_ai.try_borrow_mut_data()?;
+    let profile: &mut BuilderProfile =
+        bytemuck::from_bytes_mut(&mut data[..BuilderProfile::LEN]);
+    profile.discriminator = BUILDER_PROFILE_DISCRIMINATOR;
+    profile.bump = bump;
+    profile._pad0 = [0u8; 7];
+    profile.builder.copy_from_slice(payer_ai.key.as_ref());
+    profile.max_fee_share_bps = max_share;
+    profile.accumulated_fees = 0;
+    profile.total_volume = 0;
+    profile._reserved = [0u8; 32];
+
+    msg!(
+        "register_builder: registered {} with max_fee_share_bps={}",
+        payer_ai.key,
+        max_share
+    );
+    Ok(())
+}
+
+/// Payload (same as PlaceOrderChecked): [side u8][price u64 LE][size u64 LE]
+///
+/// Accounts:
+///   0. `[SIGNER]` user
+///   1. `[WRITE]`  book
+///   2. `[]`       oracle
+///   3. `[WRITE]`  builder_profile — credited with builder fee share
+fn process_place_order_with_builder(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != PLACE_ORDER_WITH_BUILDER_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let order_side = payload[0];
+    let price = u64::from_le_bytes(payload[1..9].try_into().expect("8 bytes"));
+    let size = u64::from_le_bytes(payload[9..17].try_into().expect("8 bytes"));
+
+    if order_side != side::BID && order_side != side::ASK {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if price == 0 || size == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let user_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let book_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let oracle_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let builder_profile_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !user_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if book_ai.owner != program_id || book_ai.data_len() != OrderBook::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if builder_profile_ai.owner != program_id
+        || builder_profile_ai.data_len() != BuilderProfile::LEN
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // (1) Same oracle staleness + sanity-band gauntlet as PlaceOrderChecked.
+    let mark = read_fresh_oracle(oracle_ai, program_id)?;
+    let band = mark.saturating_mul(SANITY_BAND_BPS) / 10_000;
+    let low = mark.saturating_sub(band);
+    let high = mark.saturating_add(band);
+    if price < low || price > high {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // (2) Compute fees.
+    //
+    // Notional = price × size (in the smallest quote units our integer
+    // math can express). Protocol fee = notional × PROTOCOL_FEE_BPS / 10000.
+    // Builder share = protocol_fee × min(builder.max_fee_share_bps,
+    //                                    PROTOCOL_BUILDER_SHARE_CAP_BPS) / 10000.
+    let notional_val = (price as u128) * (size as u128);
+    let protocol_fee = (notional_val * (PROTOCOL_FEE_BPS as u128) / 10_000) as u64;
+
+    let mut share_bps;
+    let mut builder_pubkey = [0u8; 32];
+    let new_volume: u64;
+    {
+        let mut profile_data = builder_profile_ai.try_borrow_mut_data()?;
+        let profile: &mut BuilderProfile =
+            bytemuck::from_bytes_mut(&mut profile_data[..BuilderProfile::LEN]);
+        if profile.discriminator != BUILDER_PROFILE_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        share_bps = profile.max_fee_share_bps;
+        if share_bps > PROTOCOL_BUILDER_SHARE_CAP_BPS {
+            // Defensive: registered profile shouldn't exceed cap, but the
+            // cap could have been lowered since the builder registered.
+            share_bps = PROTOCOL_BUILDER_SHARE_CAP_BPS;
+        }
+        let builder_share =
+            ((protocol_fee as u128) * (share_bps as u128) / 10_000) as u64;
+        profile.accumulated_fees = profile
+            .accumulated_fees
+            .checked_add(builder_share)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        new_volume = profile
+            .total_volume
+            .checked_add(size)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        profile.total_volume = new_volume;
+        builder_pubkey.copy_from_slice(&profile.builder);
+
+        msg!(
+            "place_order_with_builder: notional={} protocol_fee={} builder_share={} ({} bps to {})",
+            notional_val,
+            protocol_fee,
+            builder_share,
+            share_bps,
+            Pubkey::new_from_array(builder_pubkey)
+        );
+    }
+
+    // (3) From here on, same place logic as ch.7 PlaceOrder.
+    let mut data = book_ai.try_borrow_mut_data()?;
+    let book: &mut OrderBook = bytemuck::from_bytes_mut(&mut data[..OrderBook::LEN]);
+    if book.discriminator != ORDER_BOOK_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    let mut chosen_slot: Option<usize> = None;
+    for (i, slot) in book.slots.iter().enumerate() {
+        if slot.size == 0 {
+            chosen_slot = Some(i);
+            break;
+        }
+    }
+    let slot_idx = chosen_slot.ok_or(ProgramError::AccountDataTooSmall)?;
+
+    let order_id = book.next_order_id;
+    book.next_order_id = book.next_order_id.saturating_add(1);
+    book.active_count = book.active_count.saturating_add(1);
+
+    let mut owner = [0u8; 32];
+    owner.copy_from_slice(user_ai.key.as_ref());
+
+    book.slots[slot_idx] = Order {
+        order_id,
+        price,
+        size,
+        owner,
+        side: order_side,
+        _pad: [0u8; 7],
+    };
+
+    msg!(
+        "place_order_with_builder: placed order_id={} into slot {}",
+        order_id,
+        slot_idx
+    );
+    let _ = (share_bps, builder_pubkey, new_volume); // log fields kept for the chapter walkthrough
+    Ok(())
+}
+
+/// Payload: empty.
+///
+/// Accounts:
+///   0. `[SIGNER]` builder
+///   1. `[WRITE]`  builder_profile
+fn process_claim_builder_fees(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != CLAIM_BUILDER_FEES_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let builder_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let profile_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !builder_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if profile_ai.owner != program_id || profile_ai.data_len() != BuilderProfile::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let mut data = profile_ai.try_borrow_mut_data()?;
+    let profile: &mut BuilderProfile =
+        bytemuck::from_bytes_mut(&mut data[..BuilderProfile::LEN]);
+    if profile.discriminator != BUILDER_PROFILE_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+    if profile.builder != *builder_ai.key.as_ref() {
+        msg!("claim_builder_fees: caller is not the registered builder");
+        return Err(ProgramError::IllegalOwner);
+    }
+
+    let claimed = profile.accumulated_fees;
+    profile.accumulated_fees = 0;
+
+    msg!(
+        "claim_builder_fees: builder {} claimed {} units (in production this would CPI SPL Token Transfer)",
+        builder_ai.key,
+        claimed
     );
     Ok(())
 }

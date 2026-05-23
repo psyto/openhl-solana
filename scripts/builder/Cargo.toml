@@ -1,0 +1,23 @@
+[package]
+name = "builder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Chapter 13 worked example: drives openhl-core's builder-code instructions. --register binds a builder; --place-with-builder routes an order through a builder's profile; --claim withdraws accumulated fees."
+
+[[bin]]
+name = "builder"
+path = "src/main.rs"
+
+[dependencies]
+openhl-state = { path = "../../crates/state" }
+openhl-core = { path = "../../programs/openhl-core", features = ["no-entrypoint"] }
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+solana-program = { workspace = true }
+solana-system-interface = { workspace = true }
+bytemuck = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

@@ -393,6 +393,42 @@ impl VaultShare {
     pub const LEN: usize = core::mem::size_of::<Self>();
 }
 
+/// Fixed 8-byte tag identifying a `BuilderProfile` account.
+pub const BUILDER_PROFILE_DISCRIMINATOR: [u8; 8] = *b"BUILDER\0";
+
+/// Per-builder fee-accrual profile. A "builder" is a frontend or
+/// aggregator that routes user orders to this program; in exchange the
+/// program accrues a configurable slice of protocol fees to them.
+///
+/// Layout (104 bytes):
+/// ```text
+///    0 | 0x00  discriminator         [u8; 8]   — BUILDER\0
+///    8 | 0x08  bump                  u8        — PDA bump
+///    9 | 0x09  _pad0                 [u8; 7]
+///   16 | 0x10  builder               [u8; 32]  — builder's pubkey
+///   48 | 0x30  max_fee_share_bps     u64       — self-cap on share-of-fee
+///   56 | 0x38  accumulated_fees      u64       — fees earned, awaiting claim
+///   64 | 0x40  total_volume          u64       — base volume routed through this builder
+///   72 | 0x48  _reserved             [u8; 32]
+///  104                                          — total size
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct BuilderProfile {
+    pub discriminator: [u8; 8],
+    pub bump: u8,
+    pub _pad0: [u8; 7],
+    pub builder: [u8; 32],
+    pub max_fee_share_bps: u64,
+    pub accumulated_fees: u64,
+    pub total_volume: u64,
+    pub _reserved: [u8; 32],
+}
+
+impl BuilderProfile {
+    pub const LEN: usize = core::mem::size_of::<Self>();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,5 +531,15 @@ mod tests {
     #[test]
     fn vault_share_discriminator_is_human_readable() {
         assert_eq!(&VAULT_SHARE_DISCRIMINATOR, b"VSHARE\0\0");
+    }
+
+    #[test]
+    fn builder_profile_size_is_104_bytes() {
+        assert_eq!(BuilderProfile::LEN, 104);
+    }
+
+    #[test]
+    fn builder_profile_discriminator_is_human_readable() {
+        assert_eq!(&BUILDER_PROFILE_DISCRIMINATOR, b"BUILDER\0");
     }
 }
