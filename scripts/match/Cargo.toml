@@ -1,0 +1,23 @@
+[package]
+name = "match-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Chapter 8 worked example: drives openhl-core::Match. Simulates first to capture program log + units_consumed; commits only when the simulation passes. Optional --cu-limit raises the per-tx ceiling via ComputeBudgetInstruction."
+
+[[bin]]
+name = "match-cli"
+path = "src/main.rs"
+
+[dependencies]
+openhl-state = { path = "../../crates/state" }
+openhl-core = { path = "../../programs/openhl-core", features = ["no-entrypoint"] }
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+solana-program = { workspace = true }
+solana-compute-budget-interface = { workspace = true }
+bytemuck = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

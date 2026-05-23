@@ -48,6 +48,14 @@
 //!                       the Order. CU envelope grows with slot index.
 //!   9  CancelOrder     — also Chapter 7
 //!                       Linear-scan by order_id, zero the slot.
+//!  10  Match           — written for Chapter 8 (matching under CU pressure)
+//!                       Takes a taker spec (side, limit_price, size,
+//!                       max_fills) and walks the opposite-side resting
+//!                       orders in the flat book, crossing wherever the
+//!                       prices agree until size or max_fills is
+//!                       exhausted. The max_fills cap is the
+//!                       "pagination" response to CU pressure that
+//!                       Chapter 8 walks through.
 //!
 //! The entire program is one file on purpose. Splitting it into the usual
 //! `instruction.rs` / `processor.rs` / `state.rs` modules buys nothing
@@ -144,6 +152,7 @@ pub fn process_instruction(
         7 => process_create_order_book(program_id, accounts, payload),
         8 => process_place_order(program_id, accounts, payload),
         9 => process_cancel_order(program_id, accounts, payload),
+        10 => process_match(program_id, accounts, payload),
         unknown => {
             msg!("unknown instruction tag: {}", unknown);
             Err(ProgramError::InvalidInstructionData)
@@ -1062,6 +1071,172 @@ fn process_cancel_order(
         order_id,
         slot_idx,
         book.active_count
+    );
+    sol_log_compute_units();
+
+    Ok(())
+}
+
+// =============================================================================
+// Match — taker crosses against the flat book (Chapter 8).
+// =============================================================================
+//
+// Match is the simplest possible CLOB matching engine. The taker supplies:
+//   - side: which side they're taking (0 = bid → matches against asks,
+//                                       1 = ask → matches against bids)
+//   - limit_price: the worst price the taker will accept
+//   - size: total base units to take
+//   - max_fills: maximum number of resting orders to cross in one
+//                instruction. This is the "pagination" lever — caps the
+//                worst-case CU cost so a single transaction stays under
+//                the budget.
+//
+// The algorithm per iteration:
+//   1. Linear-scan the book for the best price on the opposite side
+//      that is acceptable to the taker. O(N) on every iteration —
+//      this is the cost shape Chapter 8 is about.
+//   2. If no acceptable maker exists, stop.
+//   3. Cross: subtract the fill quantity from both sides, log the fill.
+//   4. If the maker is fully filled, zero their slot.
+//   5. Increment the fill counter. If we've hit max_fills, stop.
+//   6. If the taker is fully filled, stop.
+//
+// The implementation is intentionally simple — no per-price-level FIFO,
+// no maker-rebate accounting, no settlement movement. The point is to
+// expose the multiplicative cost shape (O(fills * N)) and watch how
+// it interacts with the per-tx CU ceiling.
+
+const MATCH_PAYLOAD_LEN: usize = 1 + 8 + 8 + 1; // side u8 + price u64 + size u64 + max_fills u8
+
+/// Payload: [side u8][limit_price u64 LE][size u64 LE][max_fills u8]
+///
+/// Accounts:
+///   0. `[SIGNER]` taker — informational; this matcher does no settlement
+///   1. `[WRITE]`  book  — owned by this program, must be initialized
+fn process_match(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != MATCH_PAYLOAD_LEN {
+        msg!(
+            "match: payload must be {} bytes, got {}",
+            MATCH_PAYLOAD_LEN,
+            payload.len()
+        );
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let taker_side = payload[0];
+    let limit_price = u64::from_le_bytes(payload[1..9].try_into().expect("8 bytes"));
+    let mut remaining = u64::from_le_bytes(payload[9..17].try_into().expect("8 bytes"));
+    let max_fills = payload[17];
+
+    if taker_side != side::BID && taker_side != side::ASK {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if limit_price == 0 || remaining == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if max_fills == 0 {
+        msg!("match: max_fills must be > 0");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let taker_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let book_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    if !taker_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if book_ai.owner != program_id {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if book_ai.data_len() != OrderBook::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    msg!(
+        "match: taker_side={} limit={} size={} max_fills={}",
+        taker_side,
+        limit_price,
+        remaining,
+        max_fills
+    );
+    sol_log_compute_units();
+
+    let mut data = book_ai.try_borrow_mut_data()?;
+    let book: &mut OrderBook = bytemuck::from_bytes_mut(&mut data[..OrderBook::LEN]);
+    if book.discriminator != ORDER_BOOK_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    let maker_side = if taker_side == side::BID { side::ASK } else { side::BID };
+
+    let mut fills_done: u8 = 0;
+    while remaining > 0 && fills_done < max_fills {
+        // (a) Find the best opposite-side resting order whose price the
+        // taker will accept. "Best" = lowest price for asks (taker = bid),
+        // highest price for bids (taker = ask). Linear O(N) scan per fill.
+        let mut best: Option<(usize, u64)> = None;
+        for (i, slot) in book.slots.iter().enumerate() {
+            if slot.size == 0 || slot.side != maker_side {
+                continue;
+            }
+            let price_acceptable = match taker_side {
+                side::BID => slot.price <= limit_price, // we'll buy at or below limit
+                side::ASK => slot.price >= limit_price, // we'll sell at or above limit
+                _ => unreachable!(),
+            };
+            if !price_acceptable {
+                continue;
+            }
+            let is_better = match best {
+                None => true,
+                Some((_, p)) => match taker_side {
+                    side::BID => slot.price < p, // lower ask is better
+                    side::ASK => slot.price > p, // higher bid is better
+                    _ => unreachable!(),
+                },
+            };
+            if is_better {
+                best = Some((i, slot.price));
+            }
+        }
+
+        let (maker_idx, fill_price) = match best {
+            Some(b) => b,
+            None => {
+                msg!("match: no acceptable maker found (book exhausted or out of price)");
+                break;
+            }
+        };
+
+        // (b) Cross. Take min(taker_remaining, maker_remaining).
+        let maker = &mut book.slots[maker_idx];
+        let fill_size = remaining.min(maker.size);
+
+        msg!(
+            "match: fill {} @ {} from maker_id={} (slot {})",
+            fill_size,
+            fill_price,
+            maker.order_id,
+            maker_idx
+        );
+
+        maker.size -= fill_size;
+        remaining -= fill_size;
+        fills_done += 1;
+
+        // (c) If maker is fully filled, vacate its slot.
+        if maker.size == 0 {
+            *maker = <Order as bytemuck::Zeroable>::zeroed();
+            book.active_count = book.active_count.saturating_sub(1);
+        }
+    }
+
+    msg!(
+        "match: done. fills={} taker_remaining={}",
+        fills_done,
+        remaining
     );
     sol_log_compute_units();
 
