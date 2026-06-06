@@ -107,13 +107,19 @@
 //!                           [b"builder", builder]. Builder declares
 //!                           their self-imposed max_fee_share_bps cap.
 //!  24  PlaceOrderWithBuilder — also Chapter 13
-//!                           Like PlaceOrderChecked but charges a
-//!                           protocol fee and atomically credits the
-//!                           builder's share to their BuilderProfile.
+//!                           Like PlaceOrderChecked but escrows the
+//!                           full protocol fee to the fee vault and
+//!                           atomically credits the builder's share
+//!                           to their BuilderProfile.
 //!  25  ClaimBuilderFees   — also Chapter 13
-//!                           Builder-only. Zeroes accumulated_fees;
-//!                           in production the amount would be CPI'd
-//!                           out via SPL Token Transfer.
+//!                           Builder-only. Zeroes accumulated_fees
+//!                           and CPI-signs an SPL Token Transfer of
+//!                           the accumulated amount from the fee
+//!                           vault to the builder's token account.
+//!  26  CreateFeeVault     — also Chapter 13
+//!                           One-shot bootstrap: allocates the per-
+//!                           (quote_mint) fee_vault token account
+//!                           owned by [b"fee_vault_auth", quote_mint].
 //!
 //! The entire program is one file on purpose. Splitting it into the usual
 //! `instruction.rs` / `processor.rs` / `state.rs` modules buys nothing
@@ -261,6 +267,22 @@ pub const PROTOCOL_FEE_BPS: u64 = 10;
 /// fund or treasury account).
 pub const PROTOCOL_BUILDER_SHARE_CAP_BPS: u64 = 5000;
 
+/// PDA seed prefix for the per-(quote_mint) protocol fee vault token
+/// account. Every place-order variant Transfers `protocol_fee` from the
+/// trader's quote token account into this PDA; ClaimBuilderFees moves
+/// the builder's accumulated share out. The remainder (protocol take)
+/// stays here.
+///
+/// Full seed list: `[FEE_VAULT_SEED, quote_mint.as_ref(), &[bump]]`.
+pub const FEE_VAULT_SEED: &[u8] = b"fee_vault";
+
+/// PDA seed prefix for the fee-vault authority. The fee_vault token
+/// account is owned (in SPL Token's sense) by this PDA; the program
+/// signs for it via `invoke_signed` on the claim path.
+///
+/// Full seed list: `[FEE_VAULT_AUTH_SEED, quote_mint.as_ref(), &[bump]]`.
+pub const FEE_VAULT_AUTH_SEED: &[u8] = b"fee_vault_auth";
+
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
 
@@ -305,6 +327,7 @@ pub fn process_instruction(
         23 => process_register_builder(program_id, accounts, payload),
         24 => process_place_order_with_builder(program_id, accounts, payload),
         25 => process_claim_builder_fees(program_id, accounts, payload),
+        26 => process_create_fee_vault(program_id, accounts, payload),
         unknown => {
             msg!("unknown instruction tag: {}", unknown);
             Err(ProgramError::InvalidInstructionData)
@@ -1538,9 +1561,15 @@ fn process_set_oracle_price(
 /// Payload (same as PlaceOrder): [side u8][price u64 LE][size u64 LE]
 ///
 /// Accounts:
-///   0. `[SIGNER]` user
-///   1. `[WRITE]`  book
-///   2. `[]`       oracle — must be initialized, must be fresh
+///   0. `[WRITE, SIGNER]` user             — signs both outer tx and the
+///                                           protocol-fee SPL Token Transfer
+///   1. `[WRITE]`         book
+///   2. `[]`              oracle           — must be initialized, must be fresh
+///   3. `[]`              market           — owns the (book, oracle, quote_mint) chain
+///   4. `[]`              mint             — quote_mint, must match market.quote_mint
+///   5. `[WRITE]`         user_token       — user's quote-token account (fee source)
+///   6. `[WRITE]`         fee_vault_token  — per-(quote_mint) fee vault PDA (fee sink)
+///   7. `[]`              token_program    — SPL Token
 fn process_place_order_checked(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -1563,6 +1592,11 @@ fn process_place_order_checked(
     let user_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
     let book_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let oracle_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let market_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let mint_ai = accounts.get(4).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let user_token_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let fee_vault_ai = accounts.get(6).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let token_ai = accounts.get(7).ok_or(ProgramError::NotEnoughAccountKeys)?;
 
     if !user_ai.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -1573,39 +1607,55 @@ fn process_place_order_checked(
     if oracle_ai.owner != program_id || oracle_ai.data_len() != Oracle::LEN {
         return Err(ProgramError::InvalidAccountData);
     }
-
-    // (1) Read the oracle. We hold the borrow only as long as we need
-    // its data, then drop it before mutating the book.
-    let mark: u64;
-    {
-        let oracle_data = oracle_ai.try_borrow_data()?;
-        let oracle: &Oracle = bytemuck::from_bytes(&oracle_data[..Oracle::LEN]);
-        if oracle.discriminator != ORACLE_DISCRIMINATOR {
-            return Err(ProgramError::UninitializedAccount);
-        }
-        if oracle.price <= 0 {
-            msg!("place_order_checked: oracle has non-positive price");
-            return Err(ProgramError::InvalidAccountData);
-        }
-
-        // (2) Staleness check via Clock sysvar. The check is the whole
-        // reason an oracle pattern works at all — a price you cannot
-        // freshness-check is a price you cannot trust.
-        let clock = Clock::get()?;
-        let age = clock.slot.saturating_sub(oracle.publish_slot);
-        if age > MAX_ORACLE_STALENESS_SLOTS {
-            msg!(
-                "place_order_checked: oracle stale ({} slots, max {})",
-                age,
-                MAX_ORACLE_STALENESS_SLOTS
-            );
-            return Err(ProgramError::InvalidAccountData);
-        }
-
-        mark = oracle.price as u64;
+    if market_ai.owner != program_id || market_ai.data_len() != Market::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if mint_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if user_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        msg!("place_order_checked: user_token not owned by SPL Token");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if token_ai.key != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
     }
 
-    // (3) Sanity band check. price must lie within ±SANITY_BAND_BPS bps of mark.
+    // book and oracle are both per-market PDAs; cross-check they descend
+    // from the market the caller passed. Prevents fee-vault confusion via
+    // book/oracle from market_A + market account from market_B.
+    let (expected_book, _) =
+        Pubkey::find_program_address(&[BOOK_SEED, market_ai.key.as_ref()], program_id);
+    if book_ai.key != &expected_book {
+        msg!("place_order_checked: book does not descend from passed market");
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let (expected_oracle, _) =
+        Pubkey::find_program_address(&[ORACLE_SEED, market_ai.key.as_ref()], program_id);
+    if oracle_ai.key != &expected_oracle {
+        msg!("place_order_checked: oracle does not descend from passed market");
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // Cross-check mint against market.quote_mint and derive the fee vault
+    // from mint. Fee escrow always flows into the quote currency's vault.
+    {
+        let market_data = market_ai.try_borrow_data()?;
+        let market: &Market = bytemuck::from_bytes(&market_data[..Market::LEN]);
+        if market.discriminator != MARKET_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        if market.quote_mint != *mint_ai.key.as_ref() {
+            msg!("place_order_checked: mint != market.quote_mint");
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
+    verify_fee_vault_token_account(fee_vault_ai, mint_ai.key, program_id)?;
+
+    // (1) Oracle staleness gauntlet, same as Chapter 9.
+    let mark = read_fresh_oracle(oracle_ai, program_id)?;
+
+    // (2) Sanity band: price must lie within ±SANITY_BAND_BPS bps of mark.
     let band = mark.saturating_mul(SANITY_BAND_BPS) / 10_000;
     let low = mark.saturating_sub(band);
     let high = mark.saturating_add(band);
@@ -1620,53 +1670,74 @@ fn process_place_order_checked(
         return Err(ProgramError::InvalidArgument);
     }
 
+    // (3) Compute the protocol fee. Symmetric with PlaceOrderWithBuilder
+    // (Chapter 13 §13.5): every place-order variant escrows the same fee.
+    // The asymmetric alternative — where only the builder path charges a
+    // token-denominated fee — would make trades through a builder cost
+    // the user more in real terms than identical trades without one.
+    let notional_val = (price as u128) * (size as u128);
+    let protocol_fee = (notional_val * (PROTOCOL_FEE_BPS as u128) / 10_000) as u64;
+
     msg!(
-        "place_order_checked: side={} price={} size={} mark={} (band ok)",
+        "place_order_checked: side={} price={} size={} mark={} protocol_fee={}",
         order_side,
         price,
         size,
-        mark
+        mark,
+        protocol_fee
     );
 
-    // (4) From here on, identical to PlaceOrder (Chapter 7): scan for an
-    // empty slot, write the order. Inlined rather than calling
-    // process_place_order so we don't double-pay on validation.
-    let mut data = book_ai.try_borrow_mut_data()?;
-    let book: &mut OrderBook = bytemuck::from_bytes_mut(&mut data[..OrderBook::LEN]);
-    if book.discriminator != ORDER_BOOK_DISCRIMINATOR {
-        return Err(ProgramError::UninitializedAccount);
-    }
-
-    let mut chosen_slot: Option<usize> = None;
-    for (i, slot) in book.slots.iter().enumerate() {
-        if slot.size == 0 {
-            chosen_slot = Some(i);
-            break;
+    // (4) Place the order, identical to PlaceOrder (Chapter 7) from here.
+    {
+        let mut data = book_ai.try_borrow_mut_data()?;
+        let book: &mut OrderBook = bytemuck::from_bytes_mut(&mut data[..OrderBook::LEN]);
+        if book.discriminator != ORDER_BOOK_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
         }
+
+        let mut chosen_slot: Option<usize> = None;
+        for (i, slot) in book.slots.iter().enumerate() {
+            if slot.size == 0 {
+                chosen_slot = Some(i);
+                break;
+            }
+        }
+        let slot_idx = chosen_slot.ok_or(ProgramError::AccountDataTooSmall)?;
+
+        let order_id = book.next_order_id;
+        book.next_order_id = book.next_order_id.saturating_add(1);
+        book.active_count = book.active_count.saturating_add(1);
+
+        let mut owner = [0u8; 32];
+        owner.copy_from_slice(user_ai.key.as_ref());
+
+        book.slots[slot_idx] = Order {
+            order_id,
+            price,
+            size,
+            owner,
+            side: order_side,
+            _pad: [0u8; 7],
+        };
+
+        msg!(
+            "place_order_checked: placed order_id={} into slot {}",
+            order_id,
+            slot_idx
+        );
     }
-    let slot_idx = chosen_slot.ok_or(ProgramError::AccountDataTooSmall)?;
 
-    let order_id = book.next_order_id;
-    book.next_order_id = book.next_order_id.saturating_add(1);
-    book.active_count = book.active_count.saturating_add(1);
+    // (5) Escrow the protocol fee via CPI to SPL Token Transfer. Placed
+    // last so a failed transfer (InsufficientFunds) reverts the whole tx
+    // — including the book write above — atomically.
+    spl_token_transfer_user_signed(
+        user_token_ai,
+        fee_vault_ai,
+        user_ai,
+        token_ai,
+        protocol_fee,
+    )?;
 
-    let mut owner = [0u8; 32];
-    owner.copy_from_slice(user_ai.key.as_ref());
-
-    book.slots[slot_idx] = Order {
-        order_id,
-        price,
-        size,
-        owner,
-        side: order_side,
-        _pad: [0u8; 7],
-    };
-
-    msg!(
-        "place_order_checked: placed order_id={} into slot {}",
-        order_id,
-        slot_idx
-    );
     Ok(())
 }
 
@@ -2012,6 +2083,44 @@ fn spl_token_transfer_user_signed<'a>(
     )
 }
 
+/// Verify the passed fee_vault token account matches the derived PDA at
+/// `[FEE_VAULT_SEED, quote_mint]` and is owned by SPL Token. Mirrors
+/// `verify_vault_token_account` but keyed on quote_mint, not (market, mint).
+fn verify_fee_vault_token_account(
+    fee_vault_ai: &AccountInfo,
+    quote_mint_key: &Pubkey,
+    program_id: &Pubkey,
+) -> ProgramResult {
+    let (expected, _bump) =
+        Pubkey::find_program_address(&[FEE_VAULT_SEED, quote_mint_key.as_ref()], program_id);
+    if fee_vault_ai.key != &expected {
+        msg!("fee_vault_token_account does not match derived PDA");
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if fee_vault_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        msg!("fee_vault_token_account not owned by SPL Token");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    Ok(())
+}
+
+/// Verify the passed fee_vault_authority matches the derived PDA at
+/// `[FEE_VAULT_AUTH_SEED, quote_mint]`. Returns the bump for use in
+/// invoke_signed on the claim path.
+fn verify_fee_vault_authority(
+    fee_vault_auth_ai: &AccountInfo,
+    quote_mint_key: &Pubkey,
+    program_id: &Pubkey,
+) -> Result<u8, ProgramError> {
+    let (expected, bump) =
+        Pubkey::find_program_address(&[FEE_VAULT_AUTH_SEED, quote_mint_key.as_ref()], program_id);
+    if fee_vault_auth_ai.key != &expected {
+        msg!("fee_vault_authority does not match derived PDA");
+        return Err(ProgramError::InvalidSeeds);
+    }
+    Ok(bump)
+}
+
 /// SPL Token Transfer where the source's authority is the per-market
 /// vault PDA at `[VAULT_AUTH_SEED, market]`. The program signs for the PDA
 /// via `invoke_signed` with the matching seeds + bump.
@@ -2048,6 +2157,50 @@ fn spl_token_transfer_vault_signed<'a>(
             token_program.clone(),
         ],
         &[&[VAULT_AUTH_SEED, market_key.as_ref(), &[vault_auth_bump]]],
+    )
+}
+
+/// SPL Token Transfer where the source's authority is the per-(quote_mint)
+/// fee-vault PDA at `[FEE_VAULT_AUTH_SEED, quote_mint]`. Structurally
+/// identical to `spl_token_transfer_vault_signed` — different seeds. Used by
+/// `ClaimBuilderFees` to move accumulated fees out of the fee vault.
+fn spl_token_transfer_fee_vault_signed<'a>(
+    source: &AccountInfo<'a>,
+    dest: &AccountInfo<'a>,
+    fee_vault_authority: &AccountInfo<'a>,
+    quote_mint_key: &Pubkey,
+    fee_vault_auth_bump: u8,
+    token_program: &AccountInfo<'a>,
+    amount: u64,
+) -> ProgramResult {
+    if amount == 0 {
+        return Ok(());
+    }
+    let mut data = Vec::with_capacity(1 + 8);
+    data.push(spl_token_ix::TRANSFER);
+    data.extend_from_slice(&amount.to_le_bytes());
+    let ix = Instruction {
+        program_id: SPL_TOKEN_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*source.key, false),
+            AccountMeta::new(*dest.key, false),
+            AccountMeta::new_readonly(*fee_vault_authority.key, true),
+        ],
+        data,
+    };
+    invoke_signed(
+        &ix,
+        &[
+            source.clone(),
+            dest.clone(),
+            fee_vault_authority.clone(),
+            token_program.clone(),
+        ],
+        &[&[
+            FEE_VAULT_AUTH_SEED,
+            quote_mint_key.as_ref(),
+            &[fee_vault_auth_bump],
+        ]],
     )
 }
 
@@ -3004,11 +3157,16 @@ fn process_register_builder(
 
 /// Payload (same as PlaceOrderChecked): [side u8][price u64 LE][size u64 LE]
 ///
-/// Accounts:
-///   0. `[SIGNER]` user
-///   1. `[WRITE]`  book
-///   2. `[]`       oracle
-///   3. `[WRITE]`  builder_profile — credited with builder fee share
+/// Accounts: same prefix as PlaceOrderChecked, plus the builder profile.
+///   0. `[WRITE, SIGNER]` user
+///   1. `[WRITE]`         book
+///   2. `[]`              oracle
+///   3. `[]`              market
+///   4. `[]`              mint            — quote_mint
+///   5. `[WRITE]`         user_token      — fee source
+///   6. `[WRITE]`         fee_vault_token — fee sink
+///   7. `[]`              token_program
+///   8. `[WRITE]`         builder_profile — credited with builder fee share
 fn process_place_order_with_builder(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -3031,7 +3189,12 @@ fn process_place_order_with_builder(
     let user_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
     let book_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let oracle_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
-    let builder_profile_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let market_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let mint_ai = accounts.get(4).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let user_token_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let fee_vault_ai = accounts.get(6).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let token_ai = accounts.get(7).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let builder_profile_ai = accounts.get(8).ok_or(ProgramError::NotEnoughAccountKeys)?;
 
     if !user_ai.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -3039,11 +3202,51 @@ fn process_place_order_with_builder(
     if book_ai.owner != program_id || book_ai.data_len() != OrderBook::LEN {
         return Err(ProgramError::InvalidAccountData);
     }
+    if market_ai.owner != program_id || market_ai.data_len() != Market::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if mint_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if user_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        msg!("place_order_with_builder: user_token not owned by SPL Token");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if token_ai.key != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
     if builder_profile_ai.owner != program_id
         || builder_profile_ai.data_len() != BuilderProfile::LEN
     {
         return Err(ProgramError::InvalidAccountData);
     }
+
+    // Cross-check the (book, oracle, mint) chain against the passed market,
+    // same gauntlet as PlaceOrderChecked.
+    let (expected_book, _) =
+        Pubkey::find_program_address(&[BOOK_SEED, market_ai.key.as_ref()], program_id);
+    if book_ai.key != &expected_book {
+        msg!("place_order_with_builder: book does not descend from passed market");
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let (expected_oracle, _) =
+        Pubkey::find_program_address(&[ORACLE_SEED, market_ai.key.as_ref()], program_id);
+    if oracle_ai.key != &expected_oracle {
+        msg!("place_order_with_builder: oracle does not descend from passed market");
+        return Err(ProgramError::InvalidSeeds);
+    }
+    {
+        let market_data = market_ai.try_borrow_data()?;
+        let market: &Market = bytemuck::from_bytes(&market_data[..Market::LEN]);
+        if market.discriminator != MARKET_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        if market.quote_mint != *mint_ai.key.as_ref() {
+            msg!("place_order_with_builder: mint != market.quote_mint");
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
+    verify_fee_vault_token_account(fee_vault_ai, mint_ai.key, program_id)?;
 
     // (1) Same oracle staleness + sanity-band gauntlet as PlaceOrderChecked.
     let mark = read_fresh_oracle(oracle_ai, program_id)?;
@@ -3102,43 +3305,59 @@ fn process_place_order_with_builder(
         );
     }
 
-    // (3) From here on, same place logic as ch.7 PlaceOrder.
-    let mut data = book_ai.try_borrow_mut_data()?;
-    let book: &mut OrderBook = bytemuck::from_bytes_mut(&mut data[..OrderBook::LEN]);
-    if book.discriminator != ORDER_BOOK_DISCRIMINATOR {
-        return Err(ProgramError::UninitializedAccount);
-    }
-
-    let mut chosen_slot: Option<usize> = None;
-    for (i, slot) in book.slots.iter().enumerate() {
-        if slot.size == 0 {
-            chosen_slot = Some(i);
-            break;
+    // (3) Place the order — same write logic as PlaceOrder / PlaceOrderChecked.
+    {
+        let mut data = book_ai.try_borrow_mut_data()?;
+        let book: &mut OrderBook = bytemuck::from_bytes_mut(&mut data[..OrderBook::LEN]);
+        if book.discriminator != ORDER_BOOK_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
         }
+
+        let mut chosen_slot: Option<usize> = None;
+        for (i, slot) in book.slots.iter().enumerate() {
+            if slot.size == 0 {
+                chosen_slot = Some(i);
+                break;
+            }
+        }
+        let slot_idx = chosen_slot.ok_or(ProgramError::AccountDataTooSmall)?;
+
+        let order_id = book.next_order_id;
+        book.next_order_id = book.next_order_id.saturating_add(1);
+        book.active_count = book.active_count.saturating_add(1);
+
+        let mut owner = [0u8; 32];
+        owner.copy_from_slice(user_ai.key.as_ref());
+
+        book.slots[slot_idx] = Order {
+            order_id,
+            price,
+            size,
+            owner,
+            side: order_side,
+            _pad: [0u8; 7],
+        };
+
+        msg!(
+            "place_order_with_builder: placed order_id={} into slot {}",
+            order_id,
+            slot_idx
+        );
     }
-    let slot_idx = chosen_slot.ok_or(ProgramError::AccountDataTooSmall)?;
 
-    let order_id = book.next_order_id;
-    book.next_order_id = book.next_order_id.saturating_add(1);
-    book.active_count = book.active_count.saturating_add(1);
+    // (4) Escrow the full protocol fee to the fee vault. The
+    // (protocol_fee - builder_share) remainder stays here as the protocol's
+    // take; the builder's share is later released to them via
+    // ClaimBuilderFees. Placed last so a transfer failure reverts both
+    // the builder credit and the order write atomically.
+    spl_token_transfer_user_signed(
+        user_token_ai,
+        fee_vault_ai,
+        user_ai,
+        token_ai,
+        protocol_fee,
+    )?;
 
-    let mut owner = [0u8; 32];
-    owner.copy_from_slice(user_ai.key.as_ref());
-
-    book.slots[slot_idx] = Order {
-        order_id,
-        price,
-        size,
-        owner,
-        side: order_side,
-        _pad: [0u8; 7],
-    };
-
-    msg!(
-        "place_order_with_builder: placed order_id={} into slot {}",
-        order_id,
-        slot_idx
-    );
     let _ = (share_bps, builder_pubkey, new_volume); // log fields kept for the chapter walkthrough
     Ok(())
 }
@@ -3148,6 +3367,11 @@ fn process_place_order_with_builder(
 /// Accounts:
 ///   0. `[SIGNER]` builder
 ///   1. `[WRITE]`  builder_profile
+///   2. `[]`       mint                — quote_mint (used to derive fee vault PDAs)
+///   3. `[WRITE]`  fee_vault_token     — source (per-(quote_mint) PDA)
+///   4. `[]`       fee_vault_authority — signer PDA via invoke_signed
+///   5. `[WRITE]`  builder_token       — builder's quote-token account (destination)
+///   6. `[]`       token_program
 fn process_claim_builder_fees(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -3159,6 +3383,11 @@ fn process_claim_builder_fees(
 
     let builder_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
     let profile_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let mint_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let fee_vault_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let fee_vault_auth_ai = accounts.get(4).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let builder_token_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let token_ai = accounts.get(6).ok_or(ProgramError::NotEnoughAccountKeys)?;
 
     if !builder_ai.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -3166,25 +3395,163 @@ fn process_claim_builder_fees(
     if profile_ai.owner != program_id || profile_ai.data_len() != BuilderProfile::LEN {
         return Err(ProgramError::InvalidAccountData);
     }
-
-    let mut data = profile_ai.try_borrow_mut_data()?;
-    let profile: &mut BuilderProfile =
-        bytemuck::from_bytes_mut(&mut data[..BuilderProfile::LEN]);
-    if profile.discriminator != BUILDER_PROFILE_DISCRIMINATOR {
-        return Err(ProgramError::UninitializedAccount);
+    if mint_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
     }
-    if profile.builder != *builder_ai.key.as_ref() {
-        msg!("claim_builder_fees: caller is not the registered builder");
-        return Err(ProgramError::IllegalOwner);
+    if builder_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        msg!("claim_builder_fees: builder_token not owned by SPL Token");
+        return Err(ProgramError::IncorrectProgramId);
     }
+    if token_ai.key != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    verify_fee_vault_token_account(fee_vault_ai, mint_ai.key, program_id)?;
+    let fee_vault_auth_bump = verify_fee_vault_authority(fee_vault_auth_ai, mint_ai.key, program_id)?;
 
-    let claimed = profile.accumulated_fees;
-    profile.accumulated_fees = 0;
+    let claimed: u64;
+    {
+        let mut data = profile_ai.try_borrow_mut_data()?;
+        let profile: &mut BuilderProfile =
+            bytemuck::from_bytes_mut(&mut data[..BuilderProfile::LEN]);
+        if profile.discriminator != BUILDER_PROFILE_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        if profile.builder != *builder_ai.key.as_ref() {
+            msg!("claim_builder_fees: caller is not the registered builder");
+            return Err(ProgramError::IllegalOwner);
+        }
+
+        claimed = profile.accumulated_fees;
+        profile.accumulated_fees = 0;
+    }
 
     msg!(
-        "claim_builder_fees: builder {} claimed {} units (in production this would CPI SPL Token Transfer)",
+        "claim_builder_fees: builder {} claiming {} units from fee vault",
         builder_ai.key,
         claimed
     );
+
+    // PDA-signed Transfer from fee_vault → builder_token. Structurally
+    // identical to §12.4's VaultWithdraw — same invoke_signed pattern,
+    // same InvalidSeeds protection, different seeds (per-quote_mint rather
+    // than per-market).
+    spl_token_transfer_fee_vault_signed(
+        fee_vault_ai,
+        builder_token_ai,
+        fee_vault_auth_ai,
+        mint_ai.key,
+        fee_vault_auth_bump,
+        token_ai,
+        claimed,
+    )?;
+
+    Ok(())
+}
+
+const CREATE_FEE_VAULT_PAYLOAD_LEN: usize = 0;
+
+/// Allocate the per-(quote_mint) fee_vault token account and initialize
+/// it under the fee_vault_authority PDA. Mirrors `process_create_vault`
+/// (Chapter 6) but keyed on quote_mint rather than (market, mint). One
+/// fee vault per quote currency; ours is single-quote so one call.
+///
+/// Payload: empty.
+///
+/// Accounts:
+///   0. `[WRITE, SIGNER]` payer
+///   1. `[]`              quote_mint            — owned by SPL Token
+///   2. `[WRITE]`         fee_vault             — PDA at [b"fee_vault", quote_mint]
+///   3. `[]`              fee_vault_authority   — PDA at [b"fee_vault_auth", quote_mint]
+///   4. `[]`              system_program
+///   5. `[]`              spl_token_program
+fn process_create_fee_vault(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != CREATE_FEE_VAULT_PAYLOAD_LEN {
+        msg!("create_fee_vault: payload must be empty");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let payer_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let mint_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let fee_vault_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let fee_vault_auth_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let system_ai = accounts.get(4).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let token_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !payer_ai.is_signer {
+        msg!("create_fee_vault: payer must sign");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if mint_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        msg!("create_fee_vault: mint not owned by SPL Token");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if system_ai.key != &system_program::ID {
+        msg!("create_fee_vault: account[4] is not the System program");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if token_ai.key != &SPL_TOKEN_PROGRAM_ID {
+        msg!("create_fee_vault: account[5] is not the SPL Token program");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    let (expected_vault, fee_vault_bump) =
+        Pubkey::find_program_address(&[FEE_VAULT_SEED, mint_ai.key.as_ref()], program_id);
+    if fee_vault_ai.key != &expected_vault {
+        msg!(
+            "create_fee_vault: passed fee_vault {} != derived PDA {}",
+            fee_vault_ai.key,
+            expected_vault
+        );
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let (expected_auth, _auth_bump) =
+        Pubkey::find_program_address(&[FEE_VAULT_AUTH_SEED, mint_ai.key.as_ref()], program_id);
+    if fee_vault_auth_ai.key != &expected_auth {
+        msg!(
+            "create_fee_vault: passed fee_vault_authority {} != derived PDA {}",
+            fee_vault_auth_ai.key,
+            expected_auth
+        );
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // (1) System CPI: allocate the token account, owned by SPL Token Program.
+    // The new account is the fee_vault PDA, so we sign with its seeds + bump.
+    let rent = Rent::get()?.minimum_balance(TOKEN_ACCOUNT_LEN);
+    let create_ix = system_instruction::create_account(
+        payer_ai.key,
+        fee_vault_ai.key,
+        rent,
+        TOKEN_ACCOUNT_LEN as u64,
+        &SPL_TOKEN_PROGRAM_ID,
+    );
+    invoke_signed(
+        &create_ix,
+        &[payer_ai.clone(), fee_vault_ai.clone(), system_ai.clone()],
+        &[&[FEE_VAULT_SEED, mint_ai.key.as_ref(), &[fee_vault_bump]]],
+    )?;
+
+    // (2) SPL Token CPI: InitializeAccount3 with fee_vault_authority as owner.
+    let mut init_data = Vec::with_capacity(1 + 32);
+    init_data.push(spl_token_ix::INITIALIZE_ACCOUNT_3);
+    init_data.extend_from_slice(fee_vault_auth_ai.key.as_ref());
+    let init_ix = Instruction {
+        program_id: SPL_TOKEN_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*fee_vault_ai.key, false),
+            AccountMeta::new_readonly(*mint_ai.key, false),
+        ],
+        data: init_data,
+    };
+    invoke(
+        &init_ix,
+        &[fee_vault_ai.clone(), mint_ai.clone(), token_ai.clone()],
+    )?;
+
+    msg!("fee vault created (fee_vault bump {})", fee_vault_bump);
     Ok(())
 }

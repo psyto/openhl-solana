@@ -1,7 +1,7 @@
 # 第13章 — プロトコル プリミティブとしての Builder Codes
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`BuilderProfile`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_register_builder` 2604–2670 行、`process_place_order_with_builder` 2680–2817 行、`process_claim_builder_fees` 2819–2860 行）、[`scripts/builder/src/main.rs`](../../scripts/builder/src/main.rs)。
+> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`BuilderProfile`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_register_builder`、`process_place_order_with_builder`、`process_claim_builder_fees`、`process_create_fee_vault`）、[`scripts/builder/src/main.rs`](../../scripts/builder/src/main.rs)。
 
 ---
 
@@ -16,13 +16,16 @@ builder code は次のものでは**ない**:
 - **紹介コード (Referral codes)。** 紹介コードは新規ユーザを紹介した人に報酬を与える。通常、サインアップごとに 1 回、あるいは紹介相手の手数料の長い尾を比率で永遠に支払う。Builder codes は**取引**ごとに支払い、誰が誰を紹介したかは追跡しない — ルーティングに報い、紹介に報いるのではない。
 - **メーカー/テイカー リベート。** メーカー リベートはユーザ（指値注文を出した人）に自分の手数料の一部を戻す。Builder codes はユーザの手数料の一部を**第三者**（フロントエンド）に支払う。ユーザはどちらにせよ同じ総手数料を払う。違うのは分配を誰が受け取るかだ。
 
-本章は 3 つの命令を出荷する。
+本章は 3 つの取引命令と 1 つのブートストラップを出荷する。
 
 1. **`RegisterBuilder`** — 各 builder が、累積手数料と自己宣言した最大シェアを保持する builder ごとの `BuilderProfile` PDA を作る。プログラムが credit するアカウントが必要なので登録が必要。アカウントなし、手数料なし。
-2. **`PlaceOrderWithBuilder`** — 4 つ目のアカウントとして builder profile を取る取引命令バリアント。プロトコル手数料を計算し、builder のシェアを profile の `accumulated_fees` に分割し、`PlaceOrderChecked` と同じ place-order パスを走らせる。
-3. **`ClaimBuilderFees`** — builder の引き出し呼び出し。アキュムレータをゼロ化して額をログに残す。第 11 章・第 12 章 — 実際の SPL Token エスクローを追加した — とは異なり、本章は手数料分割についてはトークンを動かす手前で意図的に止める。§13.5 が、なぜ builder 手数料エスクローはポジションや vault のエスクローとは別種の設計問題なのか、本番実装がどのような形になるかを説明する。
+2. **`PlaceOrderWithBuilder`** — 最後のアカウントとして builder profile を取る取引命令バリアント。プロトコル手数料を計算して per-(quote_mint) fee vault にエスクローし、builder のシェアを profile の `accumulated_fees` に分割し、`PlaceOrderChecked` と同じ place-order パスを走らせる。
+3. **`ClaimBuilderFees`** — builder の引き出し呼び出し。アキュムレータをゼロ化し、PDA 署名付きで fee vault から builder のトークン アカウントへ claim 額の SPL Token Transfer を行う。
+4. **`CreateFeeVault`** — quote mint ごとの 1 回限りのブートストラップ。place-order バリアント実行前にクラスタごと 1 回走らせる。per-(quote_mint) fee_vault トークン アカウントを `[b"fee_vault_auth", quote_mint]` PDA が所有する形で確保する。第 6 章の `CreateVault` のミラー。
 
-本章の知的内容は 3 部構成だ。§13.4 のアトミシティ論（なぜ手数料分割は取引命令の中で起き、別の「取引ごとに claim」呼び出しではないか）、§13.2 のキャップ積み重ねパターン（自己宣言キャップとプロトコル レベル キャップがどう相互作用し、builder が侵害されても手数料漏れを境界付けるか）、そして §13.5 の本番エスクロー設計議論（なぜ builder 手数料は第 11 章・第 12 章の二者間移動より構造的に難しいエスクロー問題なのか）。
+本章は `PlaceOrderChecked` も拡張して同じプロトコル手数料をエスクローする。理由は §13.5b の設計選択 #2 — 対称性だ。builder パスだけが手数料をエスクローすると、builder 経由の取引が経由なし取引より実質的に高くつく。本番デプロイは最初からこれを両方のバリアントで普遍的なプロトコル手数料として扱って解決する。
+
+本章の知的内容は 3 部構成だ。§13.4 のアトミシティ論（なぜ手数料分割は取引命令の中で起き、別の「取引ごとに claim」呼び出しではないか）、§13.2 のキャップ積み重ねパターン（自己宣言キャップとプロトコル レベル キャップがどう相互作用し、builder が侵害されても手数料漏れを境界付けるか）、そして §13.5b の本番エスクロー設計議論（なぜ builder 手数料は第 11 章・第 12 章の二者間移動と構造的に異なるか — fee-vault 実装の背後にある 4 つの設計選択）。
 
 ---
 
@@ -99,11 +102,11 @@ if share_bps > PROTOCOL_BUILDER_SHARE_CAP_BPS {
 
 ## §13.3  `PlaceOrderWithBuilder` を歩く
 
-`programs/openhl-core/src/lib.rs:2680–2817` の `process_place_order_with_builder`。ハンドラは `PlaceOrderChecked` の厳格な上位集合 — 同じチェック、同じ place ロジック — に手数料分割ブロックを検証と注文書き込みの間に挿入。
+`programs/openhl-core/src/lib.rs` の `process_place_order_with_builder`。ハンドラは `PlaceOrderChecked` の厳格な上位集合 — 同じ 8 つの先頭アカウント（`user`、`book`、`oracle`、`market`、`mint`、`user_token`、`fee_vault_token`、`token_program`）、末尾に追加の `builder_profile` アカウント 1 つ、同じ手数料計算、同じ place ロジックに、builder credit ステップを加える。
 
-**検証 + サニティ バンド**（2693–2724 行）: `PlaceOrderChecked` と同一、`accounts` に追加の `builder_profile_ai` スロットを除いて。オラクル staleness チェック、オラクル マークに対する価格サニティ バンド — すべてそのまま持ち越し。
+**検証 + サニティ バンド**: `PlaceOrderChecked` と同一。両ハンドラは渡された market に対して (book, oracle, mint) チェインをクロス検証し、オラクル staleness のガントレットを走らせ、価格サニティ バンドを適用する。
 
-**手数料計算 + builder credit**（2726–2775 行）:
+**手数料計算 + builder credit**:
 
 ```rust
 let notional_val = (price as u128) * (size as u128);
@@ -125,9 +128,11 @@ profile.total_volume = new_volume;
 
 `builder_share` は `checked_add` で `profile.accumulated_fees` に追加（オーバーフローは静かにキャップする代わりに取引を拒否 — builder は走行合計を u64::MAX 以下に保つため定期的に claim できる）。`total_volume` は観測性のため取引サイズ分進む。
 
-残りの `protocol_fee - builder_share` はプロトコルが留保する。スコープ繰り延べ版ではこれは暗黙のまま（どこにも追跡しない）。本番では SPL Token CPI でプロトコル手数料 vault アカウントに転送される。本章の教育的論点はどちらにせよ着地する: 分割は取引とアトミックに起きる。
+**注文配置**: §9.4 の `PlaceOrderChecked` と同一。空スロットを線形走査、注文を書く、カウンタをインクリメント。
 
-**注文配置**（2780–2811 行）: §9.4 の `PlaceOrderChecked` と同一。空スロットを線形走査、注文を書く、カウンタをインクリメント。`PlaceOrderWithBuilder` の CU コストは `PlaceOrderChecked + 約 600 CU`、手数料計算と builder profile 借用のため。
+**手数料エスクロー**: ハンドラは SPL Token Transfer の CPI（`spl_token_transfer_user_signed`）で終わり、ユーザの quote-token アカウントから per-(quote_mint) fee vault に**全額**の `protocol_fee` を移動する。`(protocol_fee - builder_share)` 残余は fee vault にプロトコルの取り分として残る。`ClaimBuilderFees` が後で各 builder への `accumulated_fees` を同じ vault から release する。最後に置くのは、Transfer 失敗（InsufficientFunds、凍結アカウント）が注文書き込みと builder credit の両方をアトミックに revert するようにするため — 第 11 章の担保エスクローと同じ順序重要性の論である。
+
+`PlaceOrderWithBuilder` の CU コストは `PlaceOrderChecked + 約 600 CU`、builder profile 借用のため。手数料計算と手数料エスクロー Transfer は既に `PlaceOrderChecked` にある。builder なしパスに対する限界コストは builder credit だけだ。
 
 > **演習 §13.3.** `price × size` が大きすぎて `notional × PROTOCOL_FEE_BPS` が `u128` をオーバーフローする `PlaceOrderWithBuilder` が呼ばれたら何が起きるか。失敗パスを辿れ。なぜこの計算に `u64` ではなく `u128` 精度が正しいか?
 
@@ -151,9 +156,9 @@ profile.total_volume = new_volume;
 
 ---
 
-## §13.5  `RegisterBuilder` と `ClaimBuilderFees`
+## §13.5  `RegisterBuilder`、`ClaimBuilderFees`、`CreateFeeVault`
 
-両方とも短い。`RegisterBuilder`（2604–2670 行）は第 3 章の標準 PDA 作成パターン、1 つのひねり付き: 要求された `max_fee_share_bps` は登録時にクランプされる:
+`RegisterBuilder` は第 3 章の標準 PDA 作成パターン、1 つのひねり付き: 要求された `max_fee_share_bps` は登録時にクランプされる:
 
 ```rust
 if max_share > PROTOCOL_BUILDER_SHARE_CAP_BPS {
@@ -168,44 +173,50 @@ if max_share > PROTOCOL_BUILDER_SHARE_CAP_BPS {
 
 クランプは静か — 登録は成功する、シェアが下げられただけだ。クランプをログすると、builder はプログラム ログから実効キャップを検証できる。
 
-`ClaimBuilderFees`（2819–2860 行）はさらに単純:
+`ClaimBuilderFees` は 2 ステップ — 借用スコープ内でアキュムレータをゼロ化、その後 fee vault からの PDA 署名 Transfer:
 
 ```rust
 if profile.builder != *builder_ai.key.as_ref() {
     return Err(ProgramError::IllegalOwner);
 }
-
 let claimed = profile.accumulated_fees;
 profile.accumulated_fees = 0;
+// ... 借用スコープ終了 ...
 
-msg!(
-    "claim_builder_fees: builder {} claimed {} units ...",
-    builder_ai.key,
-    claimed
-);
+spl_token_transfer_fee_vault_signed(
+    fee_vault_ai,
+    builder_token_ai,
+    fee_vault_auth_ai,
+    mint_ai.key,
+    fee_vault_auth_bump,
+    token_ai,
+    claimed,
+)?;
 ```
 
-認可（builder だけが自分の手数料を claim できる）、アキュムレータをゼロ化、ログ。本番ではここで SPL Token Transfer CPI が、プロトコル手数料 vault トークン アカウントから builder のトークン アカウントへ、`claimed` quote トークンを PDA 署名で動かす。
+認可（builder だけが自分の手数料を claim できる）、アキュムレータをゼロ化、借用を解放、PDA 署名 Transfer。Transfer ヘルパは §12.4 の `spl_token_transfer_vault_signed` と構造的に同一 — 同じ `invoke_signed` パターン、同じ `InvalidSeeds` 保護 — 違いは seeds が per-(market) `[VAULT_AUTH_SEED, market]` ではなく per-(quote_mint) `[FEE_VAULT_AUTH_SEED, quote_mint]` という点だけ。順序が重要: Transfer **の前に** アキュムレータをゼロ化することで、(a) Transfer 失敗時の tx revert がアキュムレータを復元（アトミック）、(b) Transfer 成功時はまだ funded なアキュムレータに対するリプレイ攻撃を防ぐ。
 
 本物の本番 claim は通常、部分引き出し（`claim --amount N`、常に全部ではなく）、蓄積子タイムアウト（>N 日アイドルな手数料はプロトコルに没収）、プロトコルが複数 quote 通貨をサポートするときの per-token claim もサポートする。どれも根本的な形を変えない。上に乗るポリシー判断だ。
 
+`CreateFeeVault` は 1 回限りのブートストラップ。第 6 章の `process_create_vault` をそのままミラーする、2 つの違い: seeds が `[b"vault", market, mint]` / `[b"vault_auth", market]` ではなく `[b"fee_vault", quote_mint]` / `[b"fee_vault_auth", quote_mint]`、そして market ごとではなく quote 通貨ごとに 1 つだけ必要。ハンドラは標準的な 2-CPI ダンス — PDA 署名付き System `create_account`、その後 authority PDA を所有者に設定する SPL Token `InitializeAccount3` — を行い、place-order バリアント実行前に一度走らせる。
+
 > **演習 §13.5.** `process_claim_builder_fees` を編集して、ペイロードに `partial_amount: Option<u64>` を受け入れるようにせよ。`Some(n)` なら `min(n, accumulated_fees)` を claim。`None` ならすべて claim。引き出せる総額が同じでも、部分引き出しパターンが builder に有用な理由は?
 
-### 本番エスクロー設計ノート — なぜこれは宿題として残すか
+### §13.5b  本番エスクロー設計ノート — 実装の背後にある 4 つの選択
 
-第 11 章と第 12 章はポジション担保と vault deposit に実際の SPL Token エスクローを追加した。本章は追加しない。理由は、builder 手数料エスクローは、それらの章が必要とした二者間トークン移動とは**構造的に違う**エスクロー問題だからだ。具体的な単一実装を示すことは教えるより誤解させる方が大きい。配線を書き始める前に 4 つの設計判断が必要になる。
+第 11 章と第 12 章はポジション担保と vault deposit に実際の SPL Token エスクローを 1 つずつのマッチング ヘルパで追加した。本章のエスクローは代わりに 4 つの設計選択を必要とした。なぜなら builder 手数料は、それらの章が必要とした二者間トークン移動とは**構造的に違う**エスクロー問題だからだ。`process_place_order_checked`、`process_place_order_with_builder`、`process_claim_builder_fees` の実装は 4 つすべてに形作られる。これらを理解することが、コードを恣意的な選択ではなく強制的な手筋の系列として読ませる鍵だ。
 
-**1. 二者 vs 三者。** ポジション担保と vault deposit は二者間移動だ: ユーザ ↔ vault、片方が署名し、経済判断（いくら、誰の署名で）はすべて命令にエンコードされている。Builder 手数料は**三者分割**だ: ユーザは単一のプロトコル手数料を払い、そのうち一部がプロトコルへ、別の一部が builder へ行く。1 つのユーザ支払いを 2 つの受取人にアトミックに分割し、各々に正しい比率を credit するには、`spl_token_transfer_user_signed` や `spl_token_transfer_vault_signed` が提供する形とは別の形が必要だ。自然な実装は、quote mint ごとに 1 つの**手数料 vault** トークン アカウント、`[b"fee_vault", quote_mint]` のような PDA 所有。各 `PlaceOrderWithBuilder` は (a) ユーザのトークン アカウントから手数料 vault へ**全額**の `protocol_fee` を Transfer し、(b) builder のアキュムレータに `builder_share` を credit する。`(protocol_fee - builder_share)` の残余は手数料 vault に残り、プロトコルの取り分になる。
+**1. 二者 vs 三者。** ポジション担保と vault deposit は二者間移動だ: ユーザ ↔ vault、片方が署名し、経済判断（いくら、誰の署名で）はすべて命令にエンコードされている。Builder 手数料は**三者分割**だ: ユーザは単一のプロトコル手数料を払い、そのうち一部がプロトコルへ、別の一部が builder へ行く。1 つのユーザ支払いを 2 つの受取人にアトミックに分割し、各々に正しい比率を credit するのは `spl_token_transfer_user_signed` と `spl_token_transfer_vault_signed` だけでは収まらない。実装は **fee-vault** トークン アカウント（quote mint ごとに 1 つ）を導入し、`[b"fee_vault_auth", quote_mint]` の PDA が所有する。すべての place-order バリアントが (a) ユーザのトークン アカウントから fee vault へ**全額**の `protocol_fee` を Transfer し、(b) （builder バリアントでは）builder のアキュムレータに `builder_share` を credit する。`(protocol_fee - builder_share)` 残余は fee vault にプロトコルの取り分として残る。
 
-**2. `PlaceOrderChecked` 非対称性。** 手数料エスクローを `PlaceOrderWithBuilder` だけに追加すると、ねじれたインセンティブが生まれる: builder なしの経路（`PlaceOrderChecked`）はトークン建ての手数料をまったく取らないので、builder 経由の取引は同じ取引より実質コストが高くなる。自然な解は、*すべての* place-order バリアントにプロトコル手数料エスクローを入れること — だがそれは §13.3 を破綻させずに本章で着地できるより大きな取引パスへの外科手術だ。本番デプロイは初日からプロトコル手数料を両バリアント共通として扱うことでこれを解く。
+**2. `PlaceOrderChecked` 非対称性。** 手数料エスクローを `PlaceOrderWithBuilder` だけに追加するとねじれたインセンティブが生まれる: builder なしパスはトークン建て手数料を取らないので、builder 経由の取引は同じ取引より実質コストが高くなる。本章は *すべての* place-order バリアントにプロトコル手数料エスクローを入れて解決する — だから `process_place_order_checked` も `PlaceOrderWithBuilder` と同じ `(market, mint, user_token, fee_vault_token, token_program)` プレフィックスに育った。両バリアントが同じ手数料をエスクローし、builder バリアントは追加で builder share を credit する。本番デプロイがこの選択を初日にやるのは、非対称設計が一方向の移行罠だからだ — ユーザが特定のアカウント形に依存するトランザクションに署名し始めた後で、静かにスロットを追加することはできない。
 
-**3. 複数 quote 対応。** 単一 quote 通貨（本章のケース）なら手数料 vault は単一アカウント。複数 quote 通貨では、(quote_mint) ごとの手数料 vault *かつ* (builder, quote_mint) ごとのアキュムレータが必要 — `BuilderProfile` はマップ フィールドを持つ（Pod 適合しない）か、quote ごとに別 profile PDA に分かれる。§13.1 で単一 quote 制約を意図的だと述べた。本番エスクロー設計こそが、それが実際にアカウントを要求し始める場所だ。
+**3. 複数 quote 対応。** 単一 quote 通貨（本章のケース）なら fee vault はクラスタごとに 1 アカウント、builder ごとのアキュムレータは単一 u64。複数 quote 通貨では、(quote_mint) ごとの fee vault *かつ* (builder, quote_mint) ごとのアキュムレータが必要 — `BuilderProfile` はマップ フィールドを持つ（Pod 適合しない）か、quote ごとに別 profile PDA に分かれる。§13.1 で単一 quote 制約を意図的だと述べた。ここがアーキテクチャ的に報酬を払う場所だ。注意: 選んだ PDA seeds（`[b"fee_vault"]` ではなく `[b"fee_vault", quote_mint]`）は既に per-mint vault をサポートしている。複数 quote 化で再構造化が必要なのは (builder, quote_mint) アキュムレータ側だけだ。
 
-**4. Claim 側の authority。** 手数料 vault が存在すれば、`ClaimBuilderFees` は手数料 vault authority PDA で署名された `fee_vault` → `builder_token` の PDA 署名 Transfer になる。§12.4 の `VaultWithdraw` と構造的に同一 — 同じ `invoke_signed` パターン、同じ `InvalidSeeds` 保護、違う seeds。これだけが、本章がすでにやった作業の「機械的拡張」と呼べる部分だ。
+**4. Claim 側の authority。** Fee vault が揃えば、`ClaimBuilderFees` は fee vault authority PDA で署名された `fee_vault` → `builder_token` の PDA 署名 Transfer になる — §12.4 の `VaultWithdraw` と構造的に同一、同じ `invoke_signed` パターン、同じ `InvalidSeeds` 保護、違う seeds。これは常に、先行章がすでにやった作業の「機械的拡張」と呼べる部分だった。新しい `spl_token_transfer_fee_vault_signed` ヘルパとして per-(market) のいとこと隣接して着地する。
 
-本章が実際に教える仕組み — 取引とアトミックな accrual、別バッチ操作としての claim、二段キャップ安全性 — は 4 つの設計判断すべてを通じて変わらない。差分は SPL Token 配線だけだ。
+本章が教える仕組み — 取引とアトミックな accrual、別バッチ操作としての claim、二段キャップ安全性 — は 4 つの設計判断すべてを通じて変わらない。選択 1 と 2 が Transfer がどこに落ちるかを決め、選択 4 が claim がどう署名するかを決める。選択 3 は seeds を mint-scoped に保ったことで無料で得られる。
 
-> **演習 §13.5b（設計）.** 本番 `ClaimBuilderFees` のアカウント レイアウトをスケッチせよ: どのアカウントが（順に）渡され、どれが signer で、どれが PDA で、どの seeds で派生するか。コードを書く必要はない — `scripts/builder/src/main.rs` に現れる `accounts: vec![...]` 宣言だけでよい。§12.4 の `VaultWithdraw` 宣言と比較せよ: 構造的に同一なのは何か、構造的に違うのは何か、各々の違いは上の 4 つの設計判断のどれに起因するか?
+> **演習 §13.5b（設計）.** `scripts/builder/src/main.rs` の `--place-with-builder`、`--claim`、および第 12 章の元の `--withdraw`（`scripts/vault/src/main.rs`）の `accounts: vec![...]` 宣言を比較せよ。3 つの構造的類似と 3 つの構造的相違を識別せよ。各相違を上の 4 つの設計判断のどれかに紐付けよ。ヒント: seed-derivation パターンは同一、authority 側は同一、非対称性はアカウント数、signer の役割、PDA-derivation seeds にある。
 
 ---
 
@@ -216,6 +227,12 @@ msg!(
 ```
 Builder ライフサイクル:
 
+  0) クラスタ ブートストラップ（quote mint ごとに 1 回）
+     CreateFeeVault(quote_mint)
+     ──► [b"fee_vault", quote_mint] の fee_vault トークン アカウント
+         [b"fee_vault_auth", quote_mint] PDA が所有
+
+
   1) Builder 登録
      RegisterBuilder(max_fee_share_bps=2000)
      ──► BuilderProfile{ builder, max_share=2000, fees=0, vol=0 }
@@ -223,7 +240,9 @@ Builder ライフサイクル:
 
   2) ユーザが builder 経由で取引
      PlaceOrderWithBuilder(side, price, size)
-     accounts: [user(S), book(W), oracle(R), builder_profile(W)]
+     accounts: [user(S,W), book(W), oracle(R), market(R), mint(R),
+                user_token(W), fee_vault(W), token_program(R),
+                builder_profile(W)]
 
        notional       = price × size
        protocol_fee   = notional × 10 / 10000    (PROTOCOL_FEE_BPS)
@@ -233,13 +252,19 @@ Builder ライフサイクル:
      アトミック:
        book に注文配置                            ─┐
        profile.accumulated_fees += builder_share   ├─ 同じ tx、同じ slot
-       profile.total_volume     += size            ─┘
+       profile.total_volume     += size            │
+       SPL Token Transfer:                         │
+         user_token → fee_vault   protocol_fee     ─┘
 
 
   3) Builder が定期的に claim
      ClaimBuilderFees(empty)
+     accounts: [builder(S), profile(W), mint(R), fee_vault(W),
+                fee_vault_auth(R), builder_token(W), token_program(R)]
      ──► profile.accumulated_fees = 0
-     ──► (本番: SPL Token CPI が claim された額を動かす)
+     ──► invoke_signed SPL Token Transfer:
+           fee_vault → builder_token  (claim 額)
+           signer seeds: [b"fee_vault_auth", quote_mint, &[bump]]
 
 
 2 キャップ安全性:
@@ -257,9 +282,11 @@ Builder ライフサイクル:
 
 ### 自分で検証する 3 項目
 
+前提: quote mint の fee vault をブートストラップ（`builder --create-fee-vault --mint <quote_mint>`）し、トレーダが funded な quote-token アカウントを持つことを確認すること。さもなくば手数料 Transfer が revert する。
+
 1. **キャップが正しく積み重なる。** `--max-share-bps 9999` で builder を登録する。ハンドラはクランプをログし、ダンプは `max_fee_share_bps = 5000`（本書の `PROTOCOL_BUILDER_SHARE_CAP_BPS`）を示すはずだ。次に取引をその builder 経由でルートする — builder のシェアはちょうどプロトコル手数料の 50% のはずだ。
-2. **失敗下でアトミシティが保たれる。** シミュレートされた失敗を使う: stale なオラクルで `PlaceOrderWithBuilder` を試す（注文配置が失敗する）。シミュレーションは `oracle stale` で失敗し、**かつ**失敗 sim 後 builder profile の `accumulated_fees` は不変のはずだ（トランザクション全体が revert するので）。取引が起きない限り分割は起きない。
-3. **取引ごとに volume が蓄積する。** 同じ builder 経由で 5 つの注文をサイズ 10、20、30、40、50 で配置する。`total_volume` はちょうど 150 （10+20+30+40+50）のはずだ。`accumulated_fees` が `(notional_total × PROTOCOL_FEE_BPS × share_bps / 10000 / 10000)` に加算されないなら、数学に off-by-one がある — それを追いかけよ。
+2. **失敗下でアトミシティが保たれる。** シミュレートされた失敗を使う: stale なオラクルで `PlaceOrderWithBuilder` を試す（注文配置が失敗する）。シミュレーションは `oracle stale` で失敗し、**かつ**失敗 sim 後、builder profile の `accumulated_fees` は不変、fee vault の残高は不変、トレーダの quote-token アカウントも不変のはずだ（トランザクション全体が revert するので）。取引が起きない限り分割は起きない。
+3. **取引ごとに volume が蓄積する。** 同じ builder 経由で 5 つの注文をサイズ 10、20、30、40、50 で配置する。`total_volume` はちょうど 150 （10+20+30+40+50）のはずだ。`accumulated_fees` が `(notional_total × PROTOCOL_FEE_BPS × share_bps / 10000 / 10000)` に加算されないなら、数学に off-by-one がある — それを追いかけよ。その後 `--claim --builder-token-account <pubkey>` を走らせる。Builder の quote-token アカウント残高は `accumulated_fees` ぶんちょうど増え、ダンプは `accumulated_fees = 0` を示すはずだ。
 
 ---
 

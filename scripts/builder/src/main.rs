@@ -1,25 +1,33 @@
 //! Chapter 13 worked example — drives openhl-core's builder-code
-//! instructions.
+//! instructions, now with real SPL Token fee escrow.
 //!
 //! Modes (mutually exclusive):
+//!   --create-fee-vault --mint <pubkey>        → CreateFeeVault (tag 26)
+//!                                               One-shot bootstrap per
+//!                                               quote_mint. Run once per
+//!                                               cluster before any
+//!                                               place-order variant.
 //!   --register --max-share-bps <u64>          → RegisterBuilder (tag 23)
 //!                                               (registers --payer as builder)
 //!   --place-with-builder --builder <pubkey>
 //!                        --market <pubkey>
+//!                        --mint <pubkey>
+//!                        --user-token-account <pubkey>
 //!                        --side bid|ask
 //!                        --price <u64>
 //!                        --size <u64>          → PlaceOrderWithBuilder (tag 24)
-//!   --claim                                   → ClaimBuilderFees (tag 25)
+//!   --claim --mint <pubkey>
+//!           --builder-token-account <pubkey>  → ClaimBuilderFees (tag 25)
 //!                                               (claims --payer's accumulated)
 //!   (no mode)                                 → dump BuilderProfile for --payer
 //!                                               (or --builder if provided)
-//!
-//! Note: --market is only required for --place-with-builder mode; other
-//! modes don't need it.
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use openhl_core::{BOOK_SEED, BUILDER_PROFILE_SEED, ORACLE_SEED};
+use openhl_core::{
+    BOOK_SEED, BUILDER_PROFILE_SEED, FEE_VAULT_AUTH_SEED, FEE_VAULT_SEED, ORACLE_SEED,
+    SPL_TOKEN_PROGRAM_ID,
+};
 use openhl_state::{side, BuilderProfile};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
@@ -51,23 +59,39 @@ struct Cli {
     builder: Option<String>,
 
     #[arg(long)]
+    create_fee_vault: bool,
+
+    #[arg(long)]
     register: bool,
     #[arg(long, requires = "register")]
     max_share_bps: Option<u64>,
 
     #[arg(long)]
     place_with_builder: bool,
-    #[arg(long, requires = "place_with_builder")]
+    #[arg(long)]
     market: Option<String>,
-    #[arg(long, requires = "place_with_builder")]
+    #[arg(long)]
     side: Option<String>,
-    #[arg(long, requires = "place_with_builder")]
+    #[arg(long)]
     price: Option<u64>,
-    #[arg(long, requires = "place_with_builder")]
+    #[arg(long)]
     size: Option<u64>,
 
     #[arg(long)]
     claim: bool,
+
+    /// Quote mint. Required for --create-fee-vault, --place-with-builder,
+    /// --claim.
+    #[arg(long)]
+    mint: Option<String>,
+
+    /// Trader's quote-token account. Required for --place-with-builder.
+    #[arg(long)]
+    user_token_account: Option<String>,
+
+    /// Builder's quote-token account (claim destination). Required for --claim.
+    #[arg(long)]
+    builder_token_account: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -96,15 +120,43 @@ fn main() -> Result<()> {
     println!("profile PDA: {profile_pda}");
     println!();
 
-    let modes = [cli.register, cli.place_with_builder, cli.claim]
-        .iter()
-        .filter(|b| **b)
-        .count();
+    let modes = [
+        cli.create_fee_vault,
+        cli.register,
+        cli.place_with_builder,
+        cli.claim,
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count();
     if modes > 1 {
-        bail!("--register, --place-with-builder, --claim are mutually exclusive");
+        bail!("--create-fee-vault, --register, --place-with-builder, --claim are mutually exclusive");
     }
 
-    if cli.register {
+    if cli.create_fee_vault {
+        let mint = require_mint(&cli)?;
+        let (fee_vault, _) =
+            Pubkey::find_program_address(&[FEE_VAULT_SEED, mint.as_ref()], &program_id);
+        let (fee_vault_auth, _) =
+            Pubkey::find_program_address(&[FEE_VAULT_AUTH_SEED, mint.as_ref()], &program_id);
+
+        println!("fee_vault PDA:        {fee_vault}");
+        println!("fee_vault_auth PDA:   {fee_vault_auth}");
+
+        let ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(mint, false),
+                AccountMeta::new(fee_vault, false),
+                AccountMeta::new_readonly(fee_vault_auth, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+            ],
+            data: vec![26u8],
+        };
+        send(&client, &payer, ix)?;
+    } else if cli.register {
         let max = cli.max_share_bps.unwrap();
         let mut data = Vec::with_capacity(1 + 8);
         data.push(23u8);
@@ -120,19 +172,33 @@ fn main() -> Result<()> {
         };
         send(&client, &payer, ix)?;
     } else if cli.place_with_builder {
-        let market: Pubkey = cli.market.as_deref().unwrap().parse().context("parse --market")?;
+        let market: Pubkey = cli
+            .market
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--market required for --place-with-builder"))?
+            .parse()
+            .context("parse --market")?;
+        let mint = require_mint(&cli)?;
+        let user_token: Pubkey = cli
+            .user_token_account
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--user-token-account required for --place-with-builder"))?
+            .parse()
+            .context("parse --user-token-account")?;
         let side_byte = match cli.side.as_deref() {
             Some("bid") => side::BID,
             Some("ask") => side::ASK,
             _ => bail!("--side bid|ask required"),
         };
-        let price = cli.price.unwrap();
-        let size = cli.size.unwrap();
+        let price = cli.price.ok_or_else(|| anyhow::anyhow!("--price required"))?;
+        let size = cli.size.ok_or_else(|| anyhow::anyhow!("--size required"))?;
 
         let (book_pda, _) =
             Pubkey::find_program_address(&[BOOK_SEED, market.as_ref()], &program_id);
         let (oracle_pda, _) =
             Pubkey::find_program_address(&[ORACLE_SEED, market.as_ref()], &program_id);
+        let (fee_vault, _) =
+            Pubkey::find_program_address(&[FEE_VAULT_SEED, mint.as_ref()], &program_id);
 
         let mut data = Vec::with_capacity(1 + 1 + 8 + 8);
         data.push(24u8);
@@ -143,20 +209,43 @@ fn main() -> Result<()> {
         let ix = Instruction {
             program_id,
             accounts: vec![
-                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new(payer.pubkey(), true),
                 AccountMeta::new(book_pda, false),
                 AccountMeta::new_readonly(oracle_pda, false),
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new_readonly(mint, false),
+                AccountMeta::new(user_token, false),
+                AccountMeta::new(fee_vault, false),
+                AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
                 AccountMeta::new(profile_pda, false),
             ],
             data,
         };
         send(&client, &payer, ix)?;
     } else if cli.claim {
+        let mint = require_mint(&cli)?;
+        let builder_token: Pubkey = cli
+            .builder_token_account
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--builder-token-account required for --claim"))?
+            .parse()
+            .context("parse --builder-token-account")?;
+
+        let (fee_vault, _) =
+            Pubkey::find_program_address(&[FEE_VAULT_SEED, mint.as_ref()], &program_id);
+        let (fee_vault_auth, _) =
+            Pubkey::find_program_address(&[FEE_VAULT_AUTH_SEED, mint.as_ref()], &program_id);
+
         let ix = Instruction {
             program_id,
             accounts: vec![
                 AccountMeta::new_readonly(payer.pubkey(), true),
                 AccountMeta::new(profile_pda, false),
+                AccountMeta::new_readonly(mint, false),
+                AccountMeta::new(fee_vault, false),
+                AccountMeta::new_readonly(fee_vault_auth, false),
+                AccountMeta::new(builder_token, false),
+                AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
             ],
             data: vec![25u8],
         };
@@ -179,6 +268,14 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn require_mint(cli: &Cli) -> Result<Pubkey> {
+    cli.mint
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--mint required for this mode"))?
+        .parse()
+        .context("parse --mint")
 }
 
 fn send(

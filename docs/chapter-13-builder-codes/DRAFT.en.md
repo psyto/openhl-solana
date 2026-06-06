@@ -1,7 +1,7 @@
 # Chapter 13 — Builder Codes as a Protocol Primitive
 
 > Status: draft (v0.1).
-> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`BuilderProfile`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_register_builder` 2604–2670, `process_place_order_with_builder` 2680–2817, `process_claim_builder_fees` 2819–2860), [`scripts/builder/src/main.rs`](../../scripts/builder/src/main.rs).
+> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`BuilderProfile`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_register_builder`, `process_place_order_with_builder`, `process_claim_builder_fees`, `process_create_fee_vault`), [`scripts/builder/src/main.rs`](../../scripts/builder/src/main.rs).
 
 ---
 
@@ -16,13 +16,16 @@ Two things builder codes are **not**:
 - **Referral codes.** Referral codes reward whoever introduced a new user; they typically pay once per signup or as a long-tail percentage of the referee's fees forever. Builder codes pay per *trade* and don't track who introduced whom — they reward routing, not introductions.
 - **Maker/taker rebates.** Maker rebates pay the user (the limit order placer) part of their own fee back. Builder codes pay a *third party* (the frontend) a fraction of the user's fee. The user pays the same gross fee either way; what differs is who receives the split.
 
-This chapter ships three instructions:
+This chapter ships three trading instructions and one bootstrap:
 
 1. **`RegisterBuilder`** — each builder creates a per-builder `BuilderProfile` PDA that holds their accumulated fees and their self-declared max share. Registration is required because the program needs an account to credit; no account, no fees.
-2. **`PlaceOrderWithBuilder`** — the trading instruction variant that takes a builder profile as a fourth account. Computes the protocol fee, splits the builder's share into the profile's `accumulated_fees`, and runs the same place-order path as `PlaceOrderChecked`.
-3. **`ClaimBuilderFees`** — the builder's withdraw call. Zeroes the accumulator and logs the amount. Unlike Chapters 11 and 12 — which we extended with real SPL Token escrow — the chapter deliberately stops short of moving tokens for the fee split. §13.5 explains why builder-fee escrow is a different design problem than position or vault escrow, and lays out what a production implementation would look like.
+2. **`PlaceOrderWithBuilder`** — the trading instruction variant that takes a builder profile as its last account. Computes the protocol fee, escrows it into the per-(quote_mint) fee vault, splits the builder's share into the profile's `accumulated_fees`, and runs the same place-order path as `PlaceOrderChecked`.
+3. **`ClaimBuilderFees`** — the builder's withdraw call. Zeroes the accumulator and PDA-signs an SPL Token Transfer of the claimed amount from the fee vault into the builder's token account.
+4. **`CreateFeeVault`** — one-shot bootstrap per quote mint, run once per cluster before any place-order variant. Allocates the per-(quote_mint) fee_vault token account owned by the `[b"fee_vault_auth", quote_mint]` PDA. Mirrors Chapter 6's `CreateVault`.
 
-The chapter's intellectual content is three-part: the atomicity argument in §13.4 (why fee splits happen inside the trade instruction, not in a separate "claim per trade" call), the cap-stacking pattern in §13.2 (how a self-declared cap interacts with the protocol-level cap to bound fee leakage even if a builder is compromised), and the production-escrow design discussion in §13.5 (what makes builder fees a structurally harder escrow problem than the two-party movements of Chapters 11 and 12).
+The chapter also extends `PlaceOrderChecked` to escrow the same protocol fee. The reason — design choice #2 in §13.5b — is symmetry: if only the builder path escrowed a fee, trades through a builder would cost the user more in real terms than identical trades without one. Production deployments resolve this by treating the protocol fee as universal across both variants from day one.
+
+The chapter's intellectual content is three-part: the atomicity argument in §13.4 (why fee splits happen inside the trade instruction, not in a separate "claim per trade" call), the cap-stacking pattern in §13.2 (how a self-declared cap interacts with the protocol-level cap to bound fee leakage even if a builder is compromised), and the production-escrow design discussion in §13.5b (what makes builder fees structurally different from the two-party movements of Chapters 11 and 12 — and the four design choices behind our fee-vault implementation).
 
 ---
 
@@ -99,11 +102,11 @@ Production builder programs often add a *third* cap — a per-market or per-asse
 
 ## §13.3  Walking `PlaceOrderWithBuilder`
 
-`process_place_order_with_builder` at `programs/openhl-core/src/lib.rs:2680–2817`. The handler is a strict superset of `PlaceOrderChecked` — same checks, same place logic — with one fee-split block inserted between the validation and the order write.
+`process_place_order_with_builder` in `programs/openhl-core/src/lib.rs`. The handler is a strict superset of `PlaceOrderChecked` — same eight prefix accounts (`user`, `book`, `oracle`, `market`, `mint`, `user_token`, `fee_vault_token`, `token_program`), one extra `builder_profile` account at the end, same fee math, same place logic, plus the builder credit step.
 
-**Validation + sanity band** (lines 2693–2724): identical to `PlaceOrderChecked` except for the additional `builder_profile_ai` slot in `accounts`. The oracle staleness check, the price sanity band against the oracle mark — all carried over verbatim.
+**Validation + sanity band**: identical to `PlaceOrderChecked`. Both handlers cross-check the (book, oracle, mint) chain against the passed market, run the oracle staleness gauntlet, and apply the price sanity band.
 
-**Fee computation + builder credit** (lines 2726–2775):
+**Fee computation + builder credit**:
 
 ```rust
 let notional_val = (price as u128) * (size as u128);
@@ -125,9 +128,11 @@ Three numbers fall out:
 
 `builder_share` is added to `profile.accumulated_fees` with `checked_add` (overflow refuses the trade rather than silently capping — the builder can claim periodically to keep the running total under u64::MAX). `total_volume` advances by the trade size for observability.
 
-The remaining `protocol_fee - builder_share` is retained by the protocol. In our scope-deferred version it stays implicit (we don't track it anywhere); in production it would be transferred to a protocol fee vault account via SPL Token CPI. The chapter's pedagogical point lands either way: the split happens atomically with the trade.
+**Order placement**: identical to `PlaceOrderChecked` from §9.4. Linear-scan for an empty slot, write the order, increment counters.
 
-**Order placement** (lines 2780–2811): identical to `PlaceOrderChecked` from §9.4. Linear-scan for an empty slot, write the order, increment counters. The CU cost of `PlaceOrderWithBuilder` is `PlaceOrderChecked + ~600 CU` for the fee math and the builder profile borrow.
+**Fee escrow**: the handler ends with a CPI to SPL Token Transfer (`spl_token_transfer_user_signed`) moving the *full* `protocol_fee` from the user's quote-token account into the per-(quote_mint) fee vault. The `(protocol_fee - builder_share)` remainder stays in the fee vault as the protocol's take; `ClaimBuilderFees` later releases `accumulated_fees` from the same vault to each builder. Placed last so a Transfer failure (InsufficientFunds, frozen account) reverts both the order write and the builder credit atomically — same order-matters argument as Chapter 11's collateral escrow.
+
+The CU cost of `PlaceOrderWithBuilder` is `PlaceOrderChecked + ~600 CU` for the builder profile borrow. The fee math and the fee-escrow Transfer are already in `PlaceOrderChecked`; the marginal cost over the no-builder path is just the builder credit.
 
 > **Exercise §13.3.** What happens if `PlaceOrderWithBuilder` is called with `price × size` so large that `notional × PROTOCOL_FEE_BPS` overflows `u128`? Trace the failure path. Why is `u128` the right precision for this calculation rather than `u64`?
 
@@ -151,9 +156,9 @@ This accrue-batch-claim pattern is identical to ERC-20 dividend distributions in
 
 ---
 
-## §13.5  `RegisterBuilder` and `ClaimBuilderFees`
+## §13.5  `RegisterBuilder`, `ClaimBuilderFees`, `CreateFeeVault`
 
-Both are short. `RegisterBuilder` (lines 2604–2670) is the standard PDA-creation pattern from Chapter 3, with one twist: the requested `max_fee_share_bps` is clamped at registration time:
+`RegisterBuilder` is the standard PDA-creation pattern from Chapter 3, with one twist: the requested `max_fee_share_bps` is clamped at registration time:
 
 ```rust
 if max_share > PROTOCOL_BUILDER_SHARE_CAP_BPS {
@@ -168,44 +173,50 @@ if max_share > PROTOCOL_BUILDER_SHARE_CAP_BPS {
 
 The clamp is silent — the registration succeeds, just with a reduced share. Logging the clamp lets builders verify their effective cap from program logs.
 
-`ClaimBuilderFees` (lines 2819–2860) is even simpler:
+`ClaimBuilderFees` is two steps — zero the accumulator inside a borrow scope, then PDA-sign a Transfer out of the fee vault:
 
 ```rust
 if profile.builder != *builder_ai.key.as_ref() {
     return Err(ProgramError::IllegalOwner);
 }
-
 let claimed = profile.accumulated_fees;
 profile.accumulated_fees = 0;
+// ... borrow scope ends ...
 
-msg!(
-    "claim_builder_fees: builder {} claimed {} units ...",
-    builder_ai.key,
-    claimed
-);
+spl_token_transfer_fee_vault_signed(
+    fee_vault_ai,
+    builder_token_ai,
+    fee_vault_auth_ai,
+    mint_ai.key,
+    fee_vault_auth_bump,
+    token_ai,
+    claimed,
+)?;
 ```
 
-Authorization (only the builder can claim their own fees), zero the accumulator, log. In production this is where an SPL Token Transfer CPI would PDA-sign a move of `claimed` quote tokens from a protocol fee-vault token account into the builder's token account.
+Authorization (only the builder can claim their own fees), zero the accumulator, release the borrow, PDA-sign the Transfer. The Transfer helper is structurally identical to §12.4's `spl_token_transfer_vault_signed` — same `invoke_signed` pattern, same `InvalidSeeds` protection — with the per-(quote_mint) `[FEE_VAULT_AUTH_SEED, quote_mint]` seeds instead of per-(market) `[VAULT_AUTH_SEED, market]`. Order matters: zero the accumulator *before* the Transfer so a transfer-failure tx revert restores the accumulator (atomic), and so a successful Transfer cannot be replayed against a still-funded accumulator.
 
 A real production claim also typically supports partial withdrawals (`claim --amount N` rather than always-everything), accumulator timeouts (fees idle for >N days are forfeited to the protocol), and per-token claims when the protocol supports multiple quote currencies. None of these change the fundamental shape; they're policy decisions on top.
 
+`CreateFeeVault` is the one-shot bootstrap. Mirrors `process_create_vault` from Chapter 6 verbatim, with two differences: the seeds are `[b"fee_vault", quote_mint]` / `[b"fee_vault_auth", quote_mint]` instead of `[b"vault", market, mint]` / `[b"vault_auth", market]`, and only one is needed per quote currency (not per market). The handler does the standard two-CPI dance — System `create_account` with PDA signing, then SPL Token `InitializeAccount3` setting the authority PDA as the owner — and is run once before any place-order variant.
+
 > **Exercise §13.5.** Modify `process_claim_builder_fees` to accept a `partial_amount: Option<u64>` in the payload. If `Some(n)`, claim `min(n, accumulated_fees)`; if `None`, claim all. Why is the partial-withdraw pattern useful for builders even though the total they can withdraw is the same?
 
-### Production-escrow design notes (why this one is left as homework)
+### §13.5b  Production-escrow design notes — the four choices behind the implementation
 
-Chapters 11 and 12 added real SPL Token escrow to position collateral and vault deposits. This chapter does not. The reason is that builder-fee escrow is a *structurally different* escrow problem than the two-party token movements those chapters needed — and a single concrete implementation would mislead more than teach. Four design choices have to be made before any plumbing gets written.
+Chapters 11 and 12 added real SPL Token escrow to position collateral and vault deposits with a single matching helper apiece. This chapter's escrow needed four design choices instead, because builder fees are a *structurally different* escrow problem than the two-party token movements those chapters needed. The implementation in `process_place_order_checked`, `process_place_order_with_builder`, and `process_claim_builder_fees` is shaped by all four; understanding them is what makes the code read as a sequence of forced moves rather than arbitrary choices.
 
-**1. Two parties vs three.** Position collateral and vault deposits are two-party movements: user ↔ vault, signed by one side, with the entire economic decision (how much, signed by whom) encoded in the instruction. Builder fees are a *three-party split*: the user pays a single protocol fee, of which one fraction goes to the protocol and another to the builder. Splitting one user payment across two recipients atomically — and crediting the right fraction to each — needs a different shape than `spl_token_transfer_user_signed` and `spl_token_transfer_vault_signed` provide. The natural implementation is a *fee-vault* token account (one per quote mint) owned by a PDA at e.g. `[b"fee_vault", quote_mint]`. Every `PlaceOrderWithBuilder` would (a) Transfer the *full* `protocol_fee` from the user's token account into the fee vault, then (b) credit `builder_share` to the builder's accumulator. The `(protocol_fee - builder_share)` remainder stays in the fee vault as the protocol's take.
+**1. Two parties vs three.** Position collateral and vault deposits are two-party movements: user ↔ vault, signed by one side, with the entire economic decision (how much, signed by whom) encoded in the instruction. Builder fees are a *three-party split*: the user pays a single protocol fee, of which one fraction goes to the protocol and another to the builder. Splitting one user payment across two recipients atomically — and crediting the right fraction to each — does not fit `spl_token_transfer_user_signed` and `spl_token_transfer_vault_signed` alone. The implementation introduces a *fee-vault* token account (one per quote mint) owned by a PDA at `[b"fee_vault_auth", quote_mint]`. Every place-order variant (a) Transfers the *full* `protocol_fee` from the user's token account into the fee vault, then (b) credits `builder_share` to the builder's accumulator (in the builder variant). The `(protocol_fee - builder_share)` remainder stays in the fee vault as the protocol's take.
 
-**2. The `PlaceOrderChecked` asymmetry.** Adding fee escrow only to `PlaceOrderWithBuilder` creates a perverse incentive: the no-builder path (`PlaceOrderChecked`) doesn't charge any token-denominated fee, so trades through a builder would cost the user more in real terms than identical trades without one. The natural fix is to make *all* place-order variants escrow the protocol fee — which is a bigger surgery on the trade path than the chapter can land without bloating §13.3 beyond utility. Production deployments resolve this by treating the protocol fee as universal across both variants from day one.
+**2. The `PlaceOrderChecked` asymmetry.** Adding fee escrow only to `PlaceOrderWithBuilder` would create a perverse incentive: the no-builder path would charge no token-denominated fee, so trades through a builder would cost the user more in real terms than identical trades without one. The chapter resolves this by making *all* place-order variants escrow the protocol fee — which is why `process_place_order_checked` grew the same `(market, mint, user_token, fee_vault_token, token_program)` prefix that `PlaceOrderWithBuilder` carries. Both variants now escrow the same fee; the builder variant additionally credits the builder share. Production deployments make this choice from day one rather than as a follow-up because the asymmetric design is a one-way migration trap — once users have signed transactions that assume an account shape, you can't quietly add slots later.
 
-**3. Multi-quote support.** With one quote currency (our case) the fee vault is a single account. With multiple quote currencies the design needs per-(quote_mint) fee vaults *and* per-(builder, quote_mint) accumulators — meaning `BuilderProfile` either grows a map field (not Pod-friendly) or splits into many one-per-quote profile PDAs. §13.1 mentioned the single-quote constraint as deliberate; the production escrow design is where it actually starts costing accounts.
+**3. Multi-quote support.** With one quote currency (our case) the fee vault is a single account per cluster, and the per-builder accumulator is a single u64. With multiple quote currencies the design needs per-(quote_mint) fee vaults *and* per-(builder, quote_mint) accumulators — meaning `BuilderProfile` either grows a map field (not Pod-friendly) or splits into many one-per-quote profile PDAs. §13.1 mentioned the single-quote constraint as deliberate; here is where it pays off architecturally. Note that the PDA seeds we picked (`[b"fee_vault", quote_mint]` rather than `[b"fee_vault"]`) already support per-mint vaults; only the per-(builder, quote_mint) accumulator side would need restructuring to go multi-quote.
 
-**4. Claim-side authority.** Once the fee vault exists, `ClaimBuilderFees` becomes a PDA-signed Transfer from `fee_vault` to `builder_token`, signed by the fee-vault authority PDA. Structurally identical to §12.4's `VaultWithdraw` — same `invoke_signed` pattern, same `InvalidSeeds` protection, different seeds. This is the only piece that's a "mechanical extension" of work the chapter already did.
+**4. Claim-side authority.** With the fee vault in place, `ClaimBuilderFees` is a PDA-signed Transfer from `fee_vault` to `builder_token`, signed by the fee-vault authority PDA — structurally identical to §12.4's `VaultWithdraw`, same `invoke_signed` pattern, same `InvalidSeeds` protection, different seeds. This is the piece that was always going to be a "mechanical extension" of work the prior chapters already did; it lands as the new `spl_token_transfer_fee_vault_signed` helper next to its per-(market) cousin.
 
-The mechanism the chapter actually teaches — accrual atomic with trade, claim as a separate batch operation, two-cap safety — survives all four design choices unchanged. Only the SPL Token plumbing differs across them.
+The mechanism the chapter teaches — accrual atomic with trade, claim as a separate batch operation, two-cap safety — survives all four design choices unchanged. Choices 1 and 2 dictate where Transfers land; choice 4 dictates how the claim signs; choice 3 is what we get for free by keeping the seeds mint-scoped.
 
-> **Exercise §13.5b (design).** Sketch the account layout for a production `ClaimBuilderFees`: which accounts must be passed (in order), which are signers, which are PDAs, and which seeds derive them. You don't need to write code — just the `accounts: vec![...]` declaration as it would appear in `scripts/builder/src/main.rs`. Compare with §12.4's `VaultWithdraw` declaration: what's structurally identical, what's structurally different, and which difference traces back to which of the four design choices above?
+> **Exercise §13.5b (design).** Compare the `accounts: vec![...]` declarations in `scripts/builder/src/main.rs` for `--place-with-builder`, `--claim`, and the original Chapter 12 `--withdraw` (in `scripts/vault/src/main.rs`). Identify three structural similarities and three structural differences. Trace each difference back to one of the four design choices above. Hint: the seed-derivation pattern is identical; the authority side is identical; the asymmetries are in account count, signer role, and PDA-derivation seeds.
 
 ---
 
@@ -216,6 +227,12 @@ The mechanism the chapter actually teaches — accrual atomic with trade, claim 
 ```
 Builder lifecycle:
 
+  0) Cluster bootstrap (once per quote mint)
+     CreateFeeVault(quote_mint)
+     ──► fee_vault token account at [b"fee_vault", quote_mint]
+         owned by [b"fee_vault_auth", quote_mint] PDA
+
+
   1) Builder registers
      RegisterBuilder(max_fee_share_bps=2000)
      ──► BuilderProfile{ builder, max_share=2000, fees=0, vol=0 }
@@ -223,7 +240,9 @@ Builder lifecycle:
 
   2) User trades through builder
      PlaceOrderWithBuilder(side, price, size)
-     accounts: [user(S), book(W), oracle(R), builder_profile(W)]
+     accounts: [user(S,W), book(W), oracle(R), market(R), mint(R),
+                user_token(W), fee_vault(W), token_program(R),
+                builder_profile(W)]
 
        notional       = price × size
        protocol_fee   = notional × 10 / 10000    (PROTOCOL_FEE_BPS)
@@ -233,13 +252,19 @@ Builder lifecycle:
      atomic:
        order placed in book                       ─┐
        profile.accumulated_fees += builder_share   ├─ same tx, same slot
-       profile.total_volume     += size            ─┘
+       profile.total_volume     += size            │
+       SPL Token Transfer:                         │
+         user_token → fee_vault   protocol_fee     ─┘
 
 
   3) Builder claims periodically
      ClaimBuilderFees(empty)
+     accounts: [builder(S), profile(W), mint(R), fee_vault(W),
+                fee_vault_auth(R), builder_token(W), token_program(R)]
      ──► profile.accumulated_fees = 0
-     ──► (production: SPL Token CPI moves the claimed amount)
+     ──► invoke_signed SPL Token Transfer:
+           fee_vault → builder_token  (claimed amount)
+           signer seeds: [b"fee_vault_auth", quote_mint, &[bump]]
 
 
 Two-cap safety:
@@ -257,9 +282,11 @@ Two-cap safety:
 
 ### Three things to verify yourself
 
+Prerequisites: bootstrap the fee vault for the quote mint (`builder --create-fee-vault --mint <quote_mint>`) and ensure your trader has a funded quote-token account before any place-order variant; otherwise the fee Transfer reverts.
+
 1. **The cap stacks correctly.** Register a builder with `--max-share-bps 9999`. The handler should log the clamp, and the dump should show `max_fee_share_bps = 5000` (our `PROTOCOL_BUILDER_SHARE_CAP_BPS`). Now route a trade through them — the builder's share should be exactly 50% of the protocol fee.
-2. **Atomicity holds under failure.** Use a simulated failure: try `PlaceOrderWithBuilder` with a stale oracle (so the order placement will fail). The simulation should fail with `oracle stale` *and* the builder profile's `accumulated_fees` should be unchanged after the failed sim (because the entire transaction reverts). The split doesn't happen unless the trade does.
-3. **Volume accrues per trade.** Place 5 orders through the same builder with sizes 10, 20, 30, 40, 50. The `total_volume` should be exactly 150 (10+20+30+40+50). If `accumulated_fees` doesn't add up to `(notional_total × PROTOCOL_FEE_BPS × share_bps / 10000 / 10000)`, there's an off-by-one in the math — chase it down.
+2. **Atomicity holds under failure.** Use a simulated failure: try `PlaceOrderWithBuilder` with a stale oracle (so the order placement will fail). The simulation should fail with `oracle stale` *and* the builder profile's `accumulated_fees` should be unchanged, the fee vault's balance should be unchanged, and the trader's quote-token account should be unchanged after the failed sim (the entire transaction reverts). The split doesn't happen unless the trade does.
+3. **Volume accrues per trade.** Place 5 orders through the same builder with sizes 10, 20, 30, 40, 50. The `total_volume` should be exactly 150 (10+20+30+40+50). If `accumulated_fees` doesn't add up to `(notional_total × PROTOCOL_FEE_BPS × share_bps / 10000 / 10000)`, there's an off-by-one in the math — chase it down. Then run `--claim --builder-token-account <pubkey>`; the builder's quote-token account balance should grow by exactly `accumulated_fees`, and the dump should show `accumulated_fees = 0`.
 
 ---
 
