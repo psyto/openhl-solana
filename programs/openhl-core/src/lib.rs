@@ -1926,14 +1926,6 @@ fn process_update_funding(
 // =============================================================================
 // Position lifecycle — OpenPosition + ClosePosition + Liquidate (Chapter 11).
 // =============================================================================
-//
-// SCOPE NOTE: collateral here is *tracked*, not *escrowed*. In production
-// OpenPosition would CPI into SPL Token to debit the user's quote token
-// account into the market vault (Chapter 6's deposit pattern); ClosePosition
-// would CPI the other direction; Liquidate would split the closed collateral
-// between the liquidator and the insurance fund. Chapter 11 calls out the
-// missing CPI plumbing in the chapter framing — the math here is already
-// the math you'd run regardless of where the tokens live.
 
 const OPEN_POSITION_PAYLOAD_LEN: usize = 8 + 8; // size i64 + collateral u64
 const CLOSE_POSITION_PAYLOAD_LEN: usize = 0;
@@ -2606,13 +2598,6 @@ fn process_liquidate(
 // Trading vault — CreateTradingVault + VaultDeposit + VaultWithdraw +
 //                 VaultUpdateNAV (Chapter 12).
 // =============================================================================
-//
-// SCOPE NOTE: like Chapter 11, asset balances here are tracked as numbers in
-// the vault account, not escrowed via SPL Token CPI. A production deployment
-// would CPI an SPL Token Transfer on every deposit/withdraw, into/out of the
-// vault's token-account PDA (Chapter 6 pattern). The share math is the
-// load-bearing part the chapter is about; the token plumbing is an
-// orthogonal extension.
 
 const CREATE_TRADING_VAULT_PAYLOAD_LEN: usize = 0;
 const VAULT_DEPOSIT_PAYLOAD_LEN: usize = 8; // assets u64
@@ -3067,14 +3052,6 @@ fn process_vault_update_nav(
 // A "builder" is a frontend / aggregator / market-maker that routes orders
 // to this program. In exchange, the program credits them a configurable
 // fraction of the protocol fee earned on those orders.
-//
-// SCOPE NOTE: as in ch.11/12, fee amounts here are *tracked* in u64 fields
-// rather than escrowed via SPL Token CPI. ClaimBuilderFees zeroes the
-// accumulator; a production deployment would CPI an SPL Token Transfer
-// from the protocol fee vault to the builder's token account in the same
-// instruction. The atomicity argument the chapter is about (fee split
-// happens inside place_order_with_builder, not in a separate claim call)
-// works identically whether or not real tokens are moving.
 
 const REGISTER_BUILDER_PAYLOAD_LEN: usize = 8; // max_fee_share_bps u64
 const PLACE_ORDER_WITH_BUILDER_PAYLOAD_LEN: usize = 1 + 8 + 8; // same as PlaceOrder
