@@ -1,7 +1,7 @@
 # Chapter 9 — Oracle Ingestion: Pyth Internals
 
 > Status: draft (v0.1).
-> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Oracle`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_oracle` 1302–1373, `process_set_oracle_price` 1375–1427, `process_place_order_checked` 1429–1535), [`scripts/oracle/src/main.rs`](../../scripts/oracle/src/main.rs).
+> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Oracle`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_oracle` 1440–1511, `process_set_oracle_price` 1513–1571, `process_place_order_checked` 1573–1748, `read_fresh_oracle` helper 1965–1987), [`scripts/oracle/src/main.rs`](../../scripts/oracle/src/main.rs).
 > Reference targets: Pyth Network mainnet program (`FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH`), Switchboard On-Demand.
 
 ---
@@ -75,7 +75,7 @@ Every column on the right has a direct counterpart in the column on the left. Ev
 
 ## §9.2  Writing the oracle — `SetOraclePrice`
 
-For the chapter to exercise staleness scenarios we need a way to write the oracle at a known moment. From `programs/openhl-core/src/lib.rs:1375–1427`:
+For the chapter to exercise staleness scenarios we need a way to write the oracle at a known moment. From `programs/openhl-core/src/lib.rs:1513–1571`:
 
 ```rust
 fn process_set_oracle_price(
@@ -117,11 +117,16 @@ The chapter codes (1) and (2) as exercises and walks (3) in prose. The deliberat
 
 ## §9.3  Reading the oracle — staleness as the foundational check
 
-The reader pattern is at `process_place_order_checked` (lines 1429–1535). The key block at lines 1473–1490:
+The reader pattern lives in a small helper `read_fresh_oracle` (lib.rs:1965–1987), called from `process_place_order_checked` and reused by the three position handlers Chapter 11 will add (so the gauntlet stays in one place rather than copied four times):
 
 ```rust
-let mark: u64;
-{
+fn read_fresh_oracle(
+    oracle_ai: &AccountInfo,
+    program_id: &Pubkey,
+) -> Result<u64, ProgramError> {
+    if oracle_ai.owner != program_id || oracle_ai.data_len() != Oracle::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
     let oracle_data = oracle_ai.try_borrow_data()?;
     let oracle: &Oracle = bytemuck::from_bytes(&oracle_data[..Oracle::LEN]);
     if oracle.discriminator != ORACLE_DISCRIMINATOR {
@@ -130,32 +135,28 @@ let mark: u64;
     if oracle.price <= 0 {
         return Err(ProgramError::InvalidAccountData);
     }
-
     let clock = Clock::get()?;
     let age = clock.slot.saturating_sub(oracle.publish_slot);
     if age > MAX_ORACLE_STALENESS_SLOTS {
-        msg!(
-            "place_order_checked: oracle stale ({} slots, max {})",
-            age,
-            MAX_ORACLE_STALENESS_SLOTS
-        );
+        msg!("oracle stale ({} slots, max {})", age, MAX_ORACLE_STALENESS_SLOTS);
         return Err(ProgramError::InvalidAccountData);
     }
-
-    mark = oracle.price as u64;
+    Ok(oracle.price as u64)
 }
 ```
+
+`process_place_order_checked` calls it as `let mark = read_fresh_oracle(oracle_ai, program_id)?;` and then runs the sanity band against `mark`.
 
 Four checks before the price is trusted:
 
 1. **Discriminator check** (`oracle.discriminator != ORACLE_DISCRIMINATOR`): refuses an oracle account that isn't initialized. In real Pyth this is the magic constant + version match.
 2. **Price-positivity check** (`oracle.price <= 0`): refuses oracle states with non-positive prices. Real Pyth occasionally publishes `0` to signal "no good price right now" — your reader must handle that.
 3. **Staleness check** (`age > MAX_ORACLE_STALENESS_SLOTS`): refuses prices older than 25 slots (~10 sec). This is the heart of the chapter. A price you cannot freshness-check is a price you cannot trust — because an attacker who can pause the publisher (or just exploit a network outage) can use a stale price to game any program that trusts it blindly.
-4. **Owner check** (line 1463, `oracle_ai.owner != program_id`): refuses an account from a different program. In real Pyth this is `oracle_ai.owner == &pyth_program::ID`.
+4. **Owner check** (line 1969, `oracle_ai.owner != program_id`): refuses an account from a different program. In real Pyth this is `oracle_ai.owner == &pyth_program::ID`.
 
-`MAX_ORACLE_STALENESS_SLOTS = 25` from `lib.rs:153`. The choice is workload-driven: 25 slots is ~10 seconds at the current target slot time. High-volatility pairs (BTC, ETH on a fast-moving day) need tighter — perhaps 10–15 slots. Stablecoin pairs can tolerate wider. The constant should ideally live on the per-market `Market` struct so each market tunes it; we keep it global for simplicity.
+`MAX_ORACLE_STALENESS_SLOTS = 25` from `lib.rs:205`. The choice is workload-driven: 25 slots is ~10 seconds at the current target slot time. High-volatility pairs (BTC, ETH on a fast-moving day) need tighter — perhaps 10–15 slots. Stablecoin pairs can tolerate wider. The constant should ideally live on the per-market `Market` struct so each market tunes it; we keep it global for simplicity.
 
-The borrow is scoped to a sub-block (`{ ... }`) so it drops before we mutate the book. This matters because both the oracle and the book are passed as `AccountInfo`, and the runtime requires that no two mutable borrows of the same underlying account memory coexist. Even though our oracle and book are different accounts, the pattern of scoping borrows tightly is good hygiene — it prevents subtle aliasing bugs when handlers grow.
+The borrow inside `read_fresh_oracle` is naturally scoped to the helper's body — it drops when the function returns, before the caller mutates the book. This matters because both the oracle and the book are passed as `AccountInfo`, and the runtime requires that no two mutable borrows of the same underlying account memory coexist. Even though our oracle and book are different accounts, the pattern of scoping borrows tightly is good hygiene — it prevents subtle aliasing bugs when handlers grow.
 
 **What the SDK hides:** `pyth-sdk-solana::load_price_feed_from_account_info` does the discriminator check, the owner check, and a deserialization into a typed `PriceFeed`. It does *not* do the staleness check — that is always your job. Programs that use Pyth without an explicit staleness gate ship with one of the largest classes of oracle bugs in DeFi.
 
@@ -167,7 +168,7 @@ The borrow is scoped to a sub-block (`{ ... }`) so it drops before we mutate the
 
 A staleness-checked price is now safe to read. The first risk control we use it for: refuse `place_order` calls whose limit price drifts too far from the oracle mark.
 
-From `process_place_order_checked` lines 1493–1506:
+From `process_place_order_checked` lines 1658–1671:
 
 ```rust
 let band = mark.saturating_mul(SANITY_BAND_BPS) / 10_000;
@@ -185,7 +186,7 @@ if price < low || price > high {
 }
 ```
 
-`SANITY_BAND_BPS = 2000` (lib.rs:159) means ±20%. With `mark = 100`, an order at price 50 is rejected (below `low = 80`), an order at 95 is accepted, an order at 121 is rejected. A wide band on purpose: tighter bands cause legitimate users to fail more often during normal volatility, and ch.9 is about the *pattern*, not the calibration.
+`SANITY_BAND_BPS = 2000` (lib.rs:211) means ±20%. With `mark = 100`, an order at price 50 is rejected (below `low = 80`), an order at 95 is accepted, an order at 121 is rejected. A wide band on purpose: tighter bands cause legitimate users to fail more often during normal volatility, and ch.9 is about the *pattern*, not the calibration.
 
 Production bands are tuned per market:
 
@@ -290,7 +291,7 @@ Required checks before trusting a price:
 
 ### Three things to verify yourself
 
-1. **The discriminator check matters.** Create a market PDA, then construct a transaction that calls `place_order_checked` passing the market PDA in the oracle slot. The discriminator check at [`lib.rs:1477`](../../programs/openhl-core/src/lib.rs#L1477) should fail with `UninitializedAccount`. Without this check, the code would `bytemuck::from_bytes` into garbage data and use a nonsensical `price`.
+1. **The discriminator check matters.** Create a market PDA, then construct a transaction that calls `place_order_checked` passing the market PDA in the oracle slot. The discriminator check in `read_fresh_oracle` at [`lib.rs:1974`](../../programs/openhl-core/src/lib.rs#L1974) should fail with `UninitializedAccount`. Without this check, the code would `bytemuck::from_bytes` into garbage data and use a nonsensical `price`.
 2. **Staleness is the security gate.** Set the oracle, wait 30+ slots, try to place an order at any price inside the band. It should fail with `oracle stale`. This is the most commonly forgotten check; it is also the one that has caused the most oracle exploits in the wild.
 3. **The band's edge is exact.** With `SANITY_BAND_BPS = 2000` and `mark = 100`, an order at exactly 80 should be *accepted* (the check is `< low`, not `<= low`). An order at exactly 79 should be rejected. Confirm by running both. The edge case for a `<=` vs `<` slip is a single bp; for tighter bands at higher prices, the dollar value of the difference can be significant.
 

@@ -1,7 +1,7 @@
 # 第9章 — オラクル取り込み: Pyth 内部
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Oracle`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_oracle` 1302–1373 行、`process_set_oracle_price` 1375–1427 行、`process_place_order_checked` 1429–1535 行）、[`scripts/oracle/src/main.rs`](../../scripts/oracle/src/main.rs)。
+> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Oracle`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_oracle` 1440–1511 行、`process_set_oracle_price` 1513–1571 行、`process_place_order_checked` 1573–1748 行、`read_fresh_oracle` ヘルパ 1965–1987 行）、[`scripts/oracle/src/main.rs`](../../scripts/oracle/src/main.rs)。
 > 参照対象: Pyth Network mainnet プログラム（`FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH`）、Switchboard On-Demand。
 
 ---
@@ -75,7 +75,7 @@ pub struct Oracle {
 
 ## §9.2  オラクルを書く — `SetOraclePrice`
 
-章で staleness シナリオを試すには、既知の瞬間にオラクルを書く手段が要る。`programs/openhl-core/src/lib.rs:1375–1427` から。
+章で staleness シナリオを試すには、既知の瞬間にオラクルを書く手段が要る。`programs/openhl-core/src/lib.rs:1513–1571` から。
 
 ```rust
 fn process_set_oracle_price(
@@ -117,11 +117,16 @@ fn process_set_oracle_price(
 
 ## §9.3  オラクルを読む — 基礎チェックとしての staleness
 
-読み手パターンは `process_place_order_checked`（1429–1535 行）にある。中核ブロックは 1473–1490 行。
+読み手パターンは小さなヘルパ `read_fresh_oracle`（lib.rs:1965–1987）に住み、`process_place_order_checked` から呼ばれる。第 11 章で追加する 3 つのポジションハンドラからも再利用するため、ガントレットは 4 度コピーされる代わりに 1 箇所に保たれる:
 
 ```rust
-let mark: u64;
-{
+fn read_fresh_oracle(
+    oracle_ai: &AccountInfo,
+    program_id: &Pubkey,
+) -> Result<u64, ProgramError> {
+    if oracle_ai.owner != program_id || oracle_ai.data_len() != Oracle::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
     let oracle_data = oracle_ai.try_borrow_data()?;
     let oracle: &Oracle = bytemuck::from_bytes(&oracle_data[..Oracle::LEN]);
     if oracle.discriminator != ORACLE_DISCRIMINATOR {
@@ -130,32 +135,28 @@ let mark: u64;
     if oracle.price <= 0 {
         return Err(ProgramError::InvalidAccountData);
     }
-
     let clock = Clock::get()?;
     let age = clock.slot.saturating_sub(oracle.publish_slot);
     if age > MAX_ORACLE_STALENESS_SLOTS {
-        msg!(
-            "place_order_checked: oracle stale ({} slots, max {})",
-            age,
-            MAX_ORACLE_STALENESS_SLOTS
-        );
+        msg!("oracle stale ({} slots, max {})", age, MAX_ORACLE_STALENESS_SLOTS);
         return Err(ProgramError::InvalidAccountData);
     }
-
-    mark = oracle.price as u64;
+    Ok(oracle.price as u64)
 }
 ```
+
+`process_place_order_checked` はこれを `let mark = read_fresh_oracle(oracle_ai, program_id)?;` として呼び、`mark` に対してサニティバンドを走らせる。
 
 価格を信用する前に 4 つのチェック。
 
 1. **Discriminator チェック**（`oracle.discriminator != ORACLE_DISCRIMINATOR`）: 初期化されていないオラクルアカウントを拒否する。本物の Pyth では magic 定数 + version 一致がこれにあたる。
 2. **価格正値チェック**（`oracle.price <= 0`）: 非正価格のオラクル状態を拒否する。本物の Pyth は時折 `0` を「今は良い価格がない」シグナルとして publish する — 読み手はそれを扱わねばならない。
 3. **Staleness チェック**（`age > MAX_ORACLE_STALENESS_SLOTS`）: 25 slot（約 10 秒）より古い価格を拒否する。これが本章の中心だ。鮮度をチェックできない価格は信用できない価格だ — publisher を止められる攻撃者（あるいは単にネットワーク障害を利用する者）が、それを盲信するプログラムを古い価格でゲームできるからだ。
-4. **所有者チェック**（1463 行、`oracle_ai.owner != program_id`）: 異なるプログラム由来のアカウントを拒否する。本物の Pyth では `oracle_ai.owner == &pyth_program::ID`。
+4. **所有者チェック**（1969 行、`oracle_ai.owner != program_id`）: 異なるプログラム由来のアカウントを拒否する。本物の Pyth では `oracle_ai.owner == &pyth_program::ID`。
 
-`lib.rs:153` の `MAX_ORACLE_STALENESS_SLOTS = 25`。選び方はワークロードによる: 25 slot は現行ターゲットスロット時間で約 10 秒。高ボラペア（BTC、ETH の荒れた日）なら、もっと tight に — おそらく 10〜15 slot。ステーブルコインペアならもっと wide で許せる。定数は理想的には market ごとに調整できるよう `Market` 構造体に持つべきだが、本書は簡潔さのためグローバルに置く。
+`lib.rs:205` の `MAX_ORACLE_STALENESS_SLOTS = 25`。選び方はワークロードによる: 25 slot は現行ターゲットスロット時間で約 10 秒。高ボラペア（BTC、ETH の荒れた日）なら、もっと tight に — おそらく 10〜15 slot。ステーブルコインペアならもっと wide で許せる。定数は理想的には market ごとに調整できるよう `Market` 構造体に持つべきだが、本書は簡潔さのためグローバルに置く。
 
-借用はサブブロック（`{ ... }`）でスコープし、book を変更する前にドロップする。これが重要なのは、オラクルと book の両方が `AccountInfo` として渡され、ランタイムは同じアカウントメモリの 2 つの可変借用が共存しないことを要求するからだ。本書のオラクルと book は別アカウントだとしても、借用をタイトにスコープするパターンは良い衛生だ — ハンドラが大きくなったときの微妙な aliasing バグを防ぐ。
+`read_fresh_oracle` 内の借用は自然にヘルパ本体にスコープされる — 関数が返ったときにドロップし、呼び出し側が book を変更する前に解放される。これが重要なのは、オラクルと book の両方が `AccountInfo` として渡され、ランタイムは同じアカウントメモリの 2 つの可変借用が共存しないことを要求するからだ。本書のオラクルと book は別アカウントだとしても、借用をタイトにスコープするパターンは良い衛生だ — ハンドラが大きくなったときの微妙な aliasing バグを防ぐ。
 
 **SDK が隠していること:** `pyth-sdk-solana::load_price_feed_from_account_info` は discriminator チェック、所有者チェック、型付き `PriceFeed` へのデシリアライズを行う。staleness チェックは**行わない** — それは常にあなたの仕事だ。明示的な staleness ゲートなしに Pyth を使うプログラムは、DeFi における最大のオラクルバグ群の 1 つに属して出荷される。
 
@@ -167,7 +168,7 @@ let mark: u64;
 
 staleness チェック済みの価格はもう安全に読める。最初のリスク制御として使うこと: オラクル mark から大きく外れる limit 価格の `place_order` 呼び出しを拒否する。
 
-`process_place_order_checked` 1493–1506 行。
+`process_place_order_checked` 1658–1671 行。
 
 ```rust
 let band = mark.saturating_mul(SANITY_BAND_BPS) / 10_000;
@@ -185,7 +186,7 @@ if price < low || price > high {
 }
 ```
 
-`SANITY_BAND_BPS = 2000`（lib.rs:159）で ±20%。`mark = 100` なら、価格 50 の注文は拒否される（`low = 80` 未満）、95 の注文は受け入れ、121 の注文は拒否。意図的に wide なバンド: tight なバンドは通常ボラの間に正当ユーザを失敗させる頻度を上げるし、章は**パターン**についての章であって calibration ではない。
+`SANITY_BAND_BPS = 2000`（lib.rs:211）で ±20%。`mark = 100` なら、価格 50 の注文は拒否される（`low = 80` 未満）、95 の注文は受け入れ、121 の注文は拒否。意図的に wide なバンド: tight なバンドは通常ボラの間に正当ユーザを失敗させる頻度を上げるし、章は**パターン**についての章であって calibration ではない。
 
 本番バンドは market ごとに調整される。
 
@@ -290,7 +291,7 @@ if price < low || price > high {
 
 ### 自分で検証する 3 項目
 
-1. **Discriminator チェックは重要。** market PDA を作り、`place_order_checked` のオラクルスロットに market PDA を渡すトランザクションを組み立てよ。[`lib.rs:1477`](../../programs/openhl-core/src/lib.rs#L1477) の discriminator チェックが `UninitializedAccount` で失敗するはずだ。このチェックがないと、コードは `bytemuck::from_bytes` でゴミデータに当てて意味のない `price` を使う。
+1. **Discriminator チェックは重要。** market PDA を作り、`place_order_checked` のオラクルスロットに market PDA を渡すトランザクションを組み立てよ。`read_fresh_oracle` の [`lib.rs:1974`](../../programs/openhl-core/src/lib.rs#L1974) の discriminator チェックが `UninitializedAccount` で失敗するはずだ。このチェックがないと、コードは `bytemuck::from_bytes` でゴミデータに当てて意味のない `price` を使う。
 2. **Staleness はセキュリティゲート。** オラクルを設定し、30+ slot 待ち、バンド内の任意の価格で注文を試みよ。`oracle stale` で失敗するはずだ。これが最も忘れられがちなチェックで、実戦で最多のオラクル exploit を生んできたチェックでもある。
 3. **バンドの境界は厳密。** `SANITY_BAND_BPS = 2000`、`mark = 100` で、ちょうど 80 の注文は**受け入れ**られるはずだ（チェックは `< low`、`<= low` ではない）。ちょうど 79 の注文は拒否されるはずだ。両方を実行して確認せよ。`<=` と `<` の slip エッジケースは 1 bp、tight なバンドや高価格では差のドル額が無視できなくなる。
 
