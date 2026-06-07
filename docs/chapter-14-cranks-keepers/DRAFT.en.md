@@ -290,7 +290,7 @@ Across fourteen chapters, we built:
 
 Things explicitly deferred (so they're easy to find later):
 
-- **Real Pyth integration.** Ch.9 uses a mock; the §9.5 migration table is the one-page diff to switch to real Pyth.
+- **Pyth v2 / pull-oracle integration.** Ch.9 §9.5 ships a working `PlaceOrderCheckedPyth` against Pyth v1's static `PriceAccount`. Migrating to Pyth v2's pull architecture (Wormhole VAA verification → price-cache PDA writes) is structurally different and is its own follow-on chapter.
 
 Things you'd add for a real production deployment:
 

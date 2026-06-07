@@ -629,6 +629,55 @@ impl Slab {
     pub const LEN: usize = core::mem::size_of::<Self>();
 }
 
+// =============================================================================
+// Pyth v1 PriceAccount — byte-layout constants (Chapter 9 §9.5).
+// =============================================================================
+//
+// We deliberately don't mirror the full ~3 KiB PriceAccount Pod here.
+// `read_fresh_pyth_v1_oracle` only ever reads six fields (magic, ver,
+// atype, expo, agg.{price, conf, status, pub_slot}), and the rest of the
+// account is publisher data + EMA bookkeeping we don't need. The constants
+// below are the field offsets from the published v1 layout, matching the
+// `pyth-sdk-solana::state::PriceAccount` struct byte-for-byte.
+
+/// Magic constant prefacing every Pyth v1 price account. Little-endian
+/// bytes [d4 c3 b2 a1] at the start of the account data.
+pub const PYTH_V1_MAGIC: u32 = 0xa1b2_c3d4;
+
+/// Version field value for Pyth v1 PriceAccount.
+pub const PYTH_V1_VERSION: u32 = 2;
+
+/// `atype` value identifying a Pyth account as a PriceAccount (vs. a
+/// MappingAccount or ProductAccount, which use the same magic).
+pub const PYTH_V1_ACCOUNT_TYPE_PRICE: u32 = 3;
+
+/// `agg.status` value indicating the aggregated price is fresh and
+/// tradable. Other values (Unknown=0, Halted=2, Auction=3) mean the
+/// publisher network couldn't agree on a price, the market is paused,
+/// or the venue is in pre-open — none of which we trust as a mark.
+pub const PYTH_V1_STATUS_TRADING: u32 = 1;
+
+/// Offset of the `expo: i32` field (base-10 exponent applied to the
+/// price mantissa — typically -8 for USD pairs).
+pub const PYTH_V1_OFFSET_EXPO: usize = 20;
+
+/// Offset of `agg.price: i64`.
+pub const PYTH_V1_OFFSET_AGG_PRICE: usize = 208;
+
+/// Offset of `agg.conf: u64`.
+pub const PYTH_V1_OFFSET_AGG_CONF: usize = 216;
+
+/// Offset of `agg.status: u32`.
+pub const PYTH_V1_OFFSET_AGG_STATUS: usize = 224;
+
+/// Offset of `agg.pub_slot: u64`.
+pub const PYTH_V1_OFFSET_AGG_PUB_SLOT: usize = 232;
+
+/// Minimum number of bytes we need to read to fully validate a price.
+/// (= end of agg.pub_slot). The actual account is much larger thanks
+/// to the per-publisher `comp[]` array; we just don't touch it.
+pub const PYTH_V1_MIN_LEN: usize = 240;
+
 #[cfg(test)]
 mod tests {
     use super::*;

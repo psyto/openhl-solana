@@ -1,7 +1,7 @@
 # 第9章 — オラクル取り込み: Pyth 内部
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Oracle`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_oracle` 1440–1511 行、`process_set_oracle_price` 1513–1571 行、`process_place_order_checked` 1573–1748 行、`read_fresh_oracle` ヘルパ 1965–1987 行）、[`scripts/oracle/src/main.rs`](../../scripts/oracle/src/main.rs)。
+> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Oracle`、加えて §9.5 のための Pyth v1 レイアウト定数）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_oracle`、`process_set_oracle_price`、`process_place_order_checked`、`process_place_order_checked_pyth`、ヘルパ `read_fresh_oracle` と `read_fresh_pyth_v1_oracle`）、[`scripts/oracle/src/main.rs`](../../scripts/oracle/src/main.rs)。
 > 参照対象: Pyth Network mainnet プログラム（`FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH`）、Switchboard On-Demand。
 
 ---
@@ -202,51 +202,105 @@ if price < low || price > high {
 
 ---
 
-## §9.5  本番 Pyth — 本物の形、1 ページで
+## §9.5  本番 Pyth v1 — bytes-up で実装
 
-本書の `Oracle` を本物の Pyth 価格アカウントに置き換えるなら、変更は局所的で小さい。
+モック `Oracle` は章が既知のスロットでパブリッシュを止められるように作られている。本番では、パブリッシャが独立に populate する Pyth アカウントから読む。マイグレーションは局所的 — 同じ staleness ガントレット、同じサニティバンド、違うパーサ — で、本章はそれを peer 命令 `PlaceOrderCheckedPyth`（タグ 32）として出荷し、2 つのパスを並べて比較できるようにする。Pyth v1 のレイアウトは bytes-up でパースできるほどよく定義されている — `pyth-sdk-solana` 依存なし。第 1 章の bytes-up 姿勢がそのまま通る。
 
-```rust
-// 1. 所有者チェックが変わる
-// 前:  if oracle_ai.owner != program_id { ... }
-// 後:  if oracle_ai.owner != &pyth_program::ID { ... }
+### Pyth v1 PriceAccount のレイアウト
 
-// 2. レイアウトが変わる
-// 前:  let oracle: &Oracle = bytemuck::from_bytes(&oracle_data[..Oracle::LEN]);
-// 後:  let price_feed = pyth_sdk_solana::load_price_feed_from_account_info(oracle_ai)?;
+すべての Pyth v1 price アカウントはマジック定数 + バージョン + アカウント型識別子で始まり、EMA 簿記のヘッダ、最後に本当に信用する集約 `agg` ブロックがある。本書が読む 6 フィールド:
 
-// 3. フィールドアクセスが変わる
-// 前:  oracle.price, oracle.conf, oracle.publish_slot
-// 後:  price_feed.get_price_no_older_than(&clock, MAX_ORACLE_STALENESS_SLOTS)?
-//         .price    (i64)
-//         .conf     (u64)
-//         .expo     (i32)
-// 注: pyth_sdk_solana::PriceFeed::get_price_no_older_than は本書が手で
-// やっている staleness チェックをすでに行う。SDK をインポートするなら
-// 使うこと。どちらにせよ何をしているかは理解すること。
-
-// 4. フォールバックパターン — Switchboard または副 Pyth フィード
-// 通常 2 つのオラクルアカウントを配線し、staleness + conf 境界を通る
-// 最初のものを優先する:
-//
-//   let primary = try_read(&primary_oracle_ai);
-//   let secondary = try_read(&secondary_oracle_ai);
-//   let mark = match (primary, secondary) {
-//       (Ok(p), _) => p,
-//       (Err(_), Ok(s)) => s,
-//       (Err(_), Err(_)) => return Err(NoFreshPrice),
-//   };
+```text
+offset | size | field                       | チェックする内容
+-------+------+-----------------------------+---------------------------------
+   0   |  4   | magic (u32)                 | == 0xa1b2c3d4
+   4   |  4   | ver   (u32)                 | == 2 (Pyth v1)
+   8   |  4   | atype (u32)                 | == 3 (PriceAccount)
+  20   |  4   | expo  (i32)                 | ログのみ; 適用しない（下記参照）
+ 208   |  8   | agg.price (i64)             | > 0
+ 216   |  8   | agg.conf  (u64)             | ログ
+ 224   |  4   | agg.status (u32)            | == 1 (Trading)
+ 232   |  8   | agg.pub_slot (u64)          | clock.slot - pub_slot <= MAX_ORACLE_STALENESS_SLOTS
 ```
 
-構造的パターンは本書のものと同一だ。パースするバイトが違う。auth モデル（オラクルを誰が書けるか）は完全に反転する: Pyth の場合、あなたは何も書かない — 読むだけだ。
+（`agg` はそのスロットでのパブリッシャネットワークの集約価格。Pyth は最大 32 パブリッシャを持ち、オンチェーン集約は毎スロット走る; `agg.status` がそれらが同意したかを反映する。）
 
-**Switchboard フォールバック**は章の最後のリスクエンジニアリングポイントが着地する場所だ。単一オラクルは単一障害点。Pyth は停止したことがある。Switchboard も停止したことがある。両方同時に（稀に）起きたこともある。下方を守るプログラムは**両方**を信頼し、どちらも fresh でなければ動作を拒否する。配線は機械的だ。
+オフセットは `crates/state/src/lib.rs` から `PYTH_V1_OFFSET_*` 定数としてエクスポートされる。完全な ~3 KiB の `PriceAccount` を Pod 構造体としてミラーするのは意図的に避ける — バイトの大半は本書が読まない publisher ごとの `comp[]` エントリだ。6 オフセットをハードコードするのはコードバイトが少なく、監査しやすく、本章の「バイトレイアウトが**契約**」のスタンスに一致する。
+
+### `read_fresh_pyth_v1_oracle`
+
+ヘルパ、骨格で:
+
+```rust
+fn read_fresh_pyth_v1_oracle(oracle_ai: &AccountInfo) -> Result<u64, ProgramError> {
+    let data = oracle_ai.try_borrow_data()?;
+    if data.len() < PYTH_V1_MIN_LEN { return Err(InvalidAccountData); }
+
+    // (1) ヘッダ ガントレット。
+    if u32::from_le_bytes(data[0..4]) != PYTH_V1_MAGIC      { return Err(...); }
+    if u32::from_le_bytes(data[4..8]) != PYTH_V1_VERSION    { return Err(...); }
+    if u32::from_le_bytes(data[8..12]) != PYTH_V1_ACCOUNT_TYPE_PRICE { return Err(...); }
+
+    // (2) 集約ステータス。
+    let status = u32::from_le_bytes(data[PYTH_V1_OFFSET_AGG_STATUS..]);
+    if status != PYTH_V1_STATUS_TRADING { return Err(InvalidAccountData); }
+
+    // (3) Staleness — agg.pub_slot vs Clock.slot。
+    let pub_slot = u64::from_le_bytes(data[PYTH_V1_OFFSET_AGG_PUB_SLOT..]);
+    let age = Clock::get()?.slot.saturating_sub(pub_slot);
+    if age > MAX_ORACLE_STALENESS_SLOTS { return Err(InvalidAccountData); }
+
+    // (4) 価格を読み、観測性のため expo/conf をログ。
+    let price_i = i64::from_le_bytes(data[PYTH_V1_OFFSET_AGG_PRICE..]);
+    if price_i <= 0 { return Err(InvalidAccountData); }
+    Ok(price_i as u64)
+}
+```
+
+チェック順序はモックパスをミラーする: 構造検証が先（magic / version / atype）、次にステータスチェック（本書モックの discriminator+initialization チェックの Pyth 類似）、次に staleness、最後に価格サニティ。どの失敗も `InvalidAccountData` を返すので、呼び出し側は stale なまたは非 Trading な Pyth フィードをモックの stale 処理と同じように扱える。
+
+フラグすべき設計判断 4 つ:
+
+**1. Pyth アカウントに所有者チェックなし。** モックパスは `oracle_ai.owner == program_id` を要求するが、ここでは意図的に `oracle_ai.owner == &pyth_program::ID` を**要求しない**。Pyth プログラム ID をハードコードすると mainnet 対 devnet の選択を最初から強いる（mainnet は `FsJ3...epH`、devnet は `gSbE...92s`）、加えて magic+version+atype ガントレットがすでにアカウントが Pyth v1 PriceAccount であることを構造的に保証する。本番デプロイでは (a) 期待される Pyth プログラム ID を `Market` 構造体に固定するか、(b) 期待される Pyth アカウントの**pubkey** を `Market` に固定する — 選択 (b) は呼び出し側が間違った資産の Pyth フィードを差し替えるのを防ぐので、より tight だ。
+
+**2. `expo` は読みログするが適用しない。** Pyth 価格は `(mantissa, expo)` ペアで来る — 本物の価格は `mantissa × 10^expo`。USD ペアでは `expo` は典型的に `-8`。モック側に expo はない（本書 `Oracle.price` は market が使うスケールでの u64）ので、本章で 2 パスを相互運用可能に保つため、mantissa を価格として扱い `expo` を観測性のためにログする。本番デプロイは正規化する: 単一サポート `expo` を固定し他を拒否するか、その場でプログラムの固定小数点規約に翻訳するか。これがマイグレーションで本物のバグを書く可能性が最も高い場所; 本章はそれを呼び出して TODO を自分で置けるようにする。
+
+**3. status == Trading でも `price <= 0` は拒否する。** Pyth は時々 0 を publish する — 集約が非負だが degenerate な publisher ネットワークのコーナーケース。モックパスも同じく拒否する; Pyth パスも合わせる。
+
+**4. `agg.status != Trading` はハード拒否、フォールバックではない。** Switchboard フォールバック付きの本物の本番リーダーは、ここでエラーを返さずに他のオラクルを試すだろう。本章はフォールバックを出荷しない、教材例が v1 単一オラクルマイグレーションだからだ; フォールバックパターン（try-A-then-B 不一致許容付き）は上に乗せるのは簡単 — §9.5 の closing ノートが配置する。
+
+### `PlaceOrderCheckedPyth`（タグ 32）
+
+ピア命令。`PlaceOrderChecked` と同じペイロード（`[side u8][price u64 LE][size u64 LE]`）、同じ 8 先頭アカウント、2 変更を除く:
+
+- スロット 2 は Pyth v1 PriceAccount、モック `Oracle` ではない（market から oracle PDA クロスチェックはドロップ; Pyth アカウントは PDA 導出対象ではない）。
+- オラクル側ガントレットは `read_fresh_oracle` ではなく `read_fresh_pyth_v1_oracle` を呼ぶ。
+
+下流すべて — サニティバンド、手数料エスクロー、book write — はモックパスと同一。両ハンドラは同じ `SANITY_BAND_BPS`、`PROTOCOL_FEE_BPS`、末尾の同じ `spl_token_transfer_user_signed` Transfer を共有する。マイグレーションの surface は §9.5 が約束したとおり: 局所的。
+
+### v1 / v2 注意
+
+`read_fresh_pyth_v1_oracle` の「v1」が重要。Pyth の v1 モデル — パブリッシャが毎スロット静的 PriceAccount に書き、リーダーがそれをパース — は廃止されつつあり、v2 のプルオラクル アーキテクチャに置き換わる。そこではパブリッシャがオフチェーンで update メッセージに署名し、誰でも検証（Wormhole VAA 検証経由）して price-cache アカウントに適用できる。v2 は構造的に違う: レイアウト変更ではなくモデル変更だ。2025 年に「本物の Pyth」を読むことはますます v2 を意味し、本章で出荷しない暗号検証が必要だ。
+
+v2 で実際にやること:
+
+1. `VerifyPythUpdate` 命令を加える。Pyth update メッセージ + Wormhole guardian set を取り、署名を検証し、検証済み価格を自分のプログラムが所有する market ごとの price-cache PDA に書く。
+2. 取引命令はその後そのキャッシュ PDA から読む（同じモック形状ガントレットを使う — キャッシュは update 時にあなたが populate する構造的にモック `Oracle` だ）。
+3. 取引のクリティカルパスは bytes-up のまま; update パスだけが SDK を伴う。
+
+それは別章だ — Wormhole 検証ステップは独自の機械装置で、第 9 章内に駐めると章のスコープが破綻する。ここの v1 リーダーは 2 つのパスのうち小さい方で、Phoenix とほとんどの既存 Solana CLOB がまだ依存しているもの; それを出荷し、必要なら後で v2 パスを出荷せよ。
+
+### Switchboard フォールバック
+
+単一オラクルは単一障害点。Pyth は停止したことがある。Switchboard も停止したことがある。両方同時に（稀に）起きたこともある。下方を守るプログラムは**両方**を信頼し、どちらも fresh でなければ動作を拒否する。配線は機械的だ:
 
 1. トランザクションの `AccountMeta` 配列に両オラクルアカウントを含める。
-2. ハンドラがそれぞれを読み、完全な検証パターン（discriminator + 所有者 + 価格正値 + staleness）を行う。
+2. ハンドラがそれぞれを読み、完全な検証パターン（discriminator/magic + status + 価格正値 + staleness）を行う。
 3. どちらかが通れば使う。両方失敗なら呼び出し拒否。
 
 これを行うプログラムは典型的に、両方が fresh のときは 2 つを**比較**もする — ある許容（例: 50 bp）を超えて不一致なら呼び出し拒否。Pyth と Switchboard の 50 bp 不一致は通常どちらかが誤っており、ユーザに安い方を選ぶだけのプログラムはゲームされてきた。
+
+> **演習 §9.5.** 本物の Pyth v1 mainnet PriceAccount を選べ（SOL/USD は執筆時点で `H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG` — Pyth の price-feed-ids ページで検証せよ）。ローカル validator の `clone` 機能を使ってそのアカウントをテストクラスタにミラーし、それに対して `PlaceOrderCheckedPyth` を invoke せよ。ログされた `expo` を SOL/USD product と比較せよ（`-8` のはず）。Staleness ガントレットをアカウントの古いスロットをアーカイブから再生して確認せよ。
 
 ---
 

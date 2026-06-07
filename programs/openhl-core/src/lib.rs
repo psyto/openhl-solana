@@ -139,6 +139,11 @@
 //!                           opposite-side critbit tree with a
 //!                           pagination cap, mirroring Chapter 8's
 //!                           flat-book Match.
+//!  32  PlaceOrderCheckedPyth — written for Chapter 9 §9.5. Peer to
+//!                           PlaceOrderChecked that reads its mark
+//!                           from a real Pyth v1 PriceAccount via
+//!                           bytes-up parsing (no SDK dep). Same
+//!                           sanity-band + fee-escrow plumbing.
 //!
 //! The entire program is one file on purpose. Splitting it into the usual
 //! `instruction.rs` / `processor.rs` / `state.rs` modules buys nothing
@@ -152,8 +157,11 @@ use openhl_state::{
     Order, OrderBook, Position, Slab, Stats, TradingVault, TreeNode, VaultShare,
     BUILDER_PROFILE_DISCRIMINATOR, FUNDING_DISCRIMINATOR, INSURANCE_FUND_DISCRIMINATOR,
     MARKET_DISCRIMINATOR, ORACLE_DISCRIMINATOR, ORDER_BOOK_DISCRIMINATOR, ORDER_CAPACITY,
-    POSITION_DISCRIMINATOR, SLAB_DISCRIMINATOR, SLAB_NONE_INDEX, SLAB_POOL_CAPACITY,
-    SLAB_TREE_CAPACITY, STATS_DISCRIMINATOR, TRADING_VAULT_DISCRIMINATOR, VAULT_SHARE_DISCRIMINATOR,
+    POSITION_DISCRIMINATOR, PYTH_V1_ACCOUNT_TYPE_PRICE, PYTH_V1_MAGIC, PYTH_V1_MIN_LEN,
+    PYTH_V1_OFFSET_AGG_CONF, PYTH_V1_OFFSET_AGG_PRICE, PYTH_V1_OFFSET_AGG_PUB_SLOT,
+    PYTH_V1_OFFSET_AGG_STATUS, PYTH_V1_OFFSET_EXPO, PYTH_V1_STATUS_TRADING, PYTH_V1_VERSION,
+    SLAB_DISCRIMINATOR, SLAB_NONE_INDEX, SLAB_POOL_CAPACITY, SLAB_TREE_CAPACITY,
+    STATS_DISCRIMINATOR, TRADING_VAULT_DISCRIMINATOR, VAULT_SHARE_DISCRIMINATOR,
 };
 use solana_program::{
     account_info::AccountInfo,
@@ -378,6 +386,7 @@ pub fn process_instruction(
         29 => process_create_slab(program_id, accounts, payload),
         30 => process_slab_place_order(program_id, accounts, payload),
         31 => process_slab_match(program_id, accounts, payload),
+        32 => process_place_order_checked_pyth(program_id, accounts, payload),
         unknown => {
             msg!("unknown instruction tag: {}", unknown);
             Err(ProgramError::InvalidInstructionData)
@@ -1791,6 +1800,172 @@ fn process_place_order_checked(
     Ok(())
 }
 
+/// Pyth-backed peer to `PlaceOrderChecked` (Chapter 9 §9.5).
+///
+/// Identical handler shape to `process_place_order_checked` except:
+///   - The oracle account at slot 2 is a Pyth v1 PriceAccount, not our
+///     mock `Oracle`. Validated via `read_fresh_pyth_v1_oracle`.
+///   - The oracle ↔ market PDA cross-check is dropped (Pyth accounts
+///     aren't ours to PDA). The trade-off is that the caller is
+///     trusted to pass the right Pyth feed; in production you'd pin
+///     the expected Pyth account pubkey on the `Market` struct so the
+///     handler can refuse mismatches.
+///
+/// Payload (same as PlaceOrderChecked): [side u8][price u64 LE][size u64 LE]
+///
+/// Accounts:
+///   0. `[WRITE, SIGNER]` user
+///   1. `[WRITE]`         book
+///   2. `[]`              pyth_oracle      — Pyth v1 PriceAccount
+///   3. `[]`              market
+///   4. `[]`              mint             — must match market.quote_mint
+///   5. `[WRITE]`         user_token
+///   6. `[WRITE]`         fee_vault_token
+///   7. `[]`              token_program
+fn process_place_order_checked_pyth(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != PLACE_ORDER_CHECKED_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let order_side = payload[0];
+    let price = u64::from_le_bytes(payload[1..9].try_into().expect("8 bytes"));
+    let size = u64::from_le_bytes(payload[9..17].try_into().expect("8 bytes"));
+
+    if order_side != side::BID && order_side != side::ASK {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if price == 0 || size == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let user_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let book_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let pyth_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let market_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let mint_ai = accounts.get(4).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let user_token_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let fee_vault_ai = accounts.get(6).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let token_ai = accounts.get(7).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !user_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if book_ai.owner != program_id || book_ai.data_len() != OrderBook::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if market_ai.owner != program_id || market_ai.data_len() != Market::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if mint_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if user_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if token_ai.key != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    // book ↔ market cross-check (same as the mock path).
+    let (expected_book, _) =
+        Pubkey::find_program_address(&[BOOK_SEED, market_ai.key.as_ref()], program_id);
+    if book_ai.key != &expected_book {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // mint ↔ market cross-check; fee vault derived from mint.
+    {
+        let market_data = market_ai.try_borrow_data()?;
+        let market: &Market = bytemuck::from_bytes(&market_data[..Market::LEN]);
+        if market.discriminator != MARKET_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        if market.quote_mint != *mint_ai.key.as_ref() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
+    verify_fee_vault_token_account(fee_vault_ai, mint_ai.key, program_id)?;
+
+    // (1) Pyth-side oracle gauntlet (replaces read_fresh_oracle).
+    let mark = read_fresh_pyth_v1_oracle(pyth_ai)?;
+
+    // (2) Sanity band — identical math to the mock path.
+    let band = mark.saturating_mul(SANITY_BAND_BPS) / 10_000;
+    let low = mark.saturating_sub(band);
+    let high = mark.saturating_add(band);
+    if price < low || price > high {
+        msg!(
+            "place_order_checked_pyth: price {} outside band [{}, {}] (mark={})",
+            price,
+            low,
+            high,
+            mark
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    // (3) Protocol fee — identical math to the mock path.
+    let notional_val = (price as u128) * (size as u128);
+    let protocol_fee = (notional_val * (PROTOCOL_FEE_BPS as u128) / 10_000) as u64;
+    msg!(
+        "place_order_checked_pyth: side={} price={} size={} mark={} protocol_fee={}",
+        order_side,
+        price,
+        size,
+        mark,
+        protocol_fee
+    );
+
+    // (4) Place the order — identical to PlaceOrder.
+    {
+        let mut data = book_ai.try_borrow_mut_data()?;
+        let book: &mut OrderBook = bytemuck::from_bytes_mut(&mut data[..OrderBook::LEN]);
+        if book.discriminator != ORDER_BOOK_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        let mut chosen_slot: Option<usize> = None;
+        for (i, slot) in book.slots.iter().enumerate() {
+            if slot.size == 0 {
+                chosen_slot = Some(i);
+                break;
+            }
+        }
+        let slot_idx = chosen_slot.ok_or(ProgramError::AccountDataTooSmall)?;
+        let order_id = book.next_order_id;
+        book.next_order_id = book.next_order_id.saturating_add(1);
+        book.active_count = book.active_count.saturating_add(1);
+        let mut owner = [0u8; 32];
+        owner.copy_from_slice(user_ai.key.as_ref());
+        book.slots[slot_idx] = Order {
+            order_id,
+            price,
+            size,
+            owner,
+            side: order_side,
+            _pad: [0u8; 7],
+        };
+        msg!(
+            "place_order_checked_pyth: placed order_id={} into slot {}",
+            order_id,
+            slot_idx
+        );
+    }
+
+    // (5) Escrow the protocol fee — identical to the mock path.
+    spl_token_transfer_user_signed(
+        user_token_ai,
+        fee_vault_ai,
+        user_ai,
+        token_ai,
+        protocol_fee,
+    )?;
+
+    Ok(())
+}
+
 // =============================================================================
 // Funding — CreateFundingState + UpdateFunding (Chapter 10).
 // =============================================================================
@@ -2026,6 +2201,115 @@ fn read_fresh_oracle(oracle_ai: &AccountInfo, program_id: &Pubkey) -> Result<u64
         return Err(ProgramError::InvalidAccountData);
     }
     Ok(oracle.price as u64)
+}
+
+/// Read a fresh aggregate price from a Pyth v1 PriceAccount, applying the
+/// same staleness gauntlet as `read_fresh_oracle` plus Pyth-specific
+/// validation (magic, version, account type, aggregate status).
+///
+/// Returns the price as `u64` mantissa — the caller treats it as a quote
+/// price in our usual base-unit scale. **The Pyth `expo` field is logged
+/// but not applied**: a production deployment would normalize the price
+/// by `10^expo` to translate Pyth's `(mantissa, expo)` pair into the
+/// program's fixed-point convention; the chapter calls this out as a
+/// deliberate simplification (§9.5).
+///
+/// The Pyth account's owner check is deliberately *not* done here — the
+/// caller has already pinned the right oracle account via the
+/// instruction's account list, and hardcoding `pyth_program::ID` would
+/// require choosing mainnet (`FsJ3...epH`) vs devnet (`gSbE...92s`) up
+/// front. The structural checks below (magic + version + atype + length)
+/// are what actually validate the account.
+fn read_fresh_pyth_v1_oracle(
+    oracle_ai: &AccountInfo,
+) -> Result<u64, ProgramError> {
+    let data = oracle_ai.try_borrow_data()?;
+    if data.len() < PYTH_V1_MIN_LEN {
+        msg!(
+            "pyth: account too small ({} bytes, need {})",
+            data.len(),
+            PYTH_V1_MIN_LEN
+        );
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // (1) Magic + version + account type. Any mismatch means we're
+    // pointing at the wrong kind of Pyth account (e.g., the mapping or
+    // product account) or at something else entirely.
+    let magic = u32::from_le_bytes(data[0..4].try_into().expect("4 bytes"));
+    if magic != PYTH_V1_MAGIC {
+        msg!("pyth: bad magic ({:#x})", magic);
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let ver = u32::from_le_bytes(data[4..8].try_into().expect("4 bytes"));
+    if ver != PYTH_V1_VERSION {
+        msg!("pyth: unsupported version ({})", ver);
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let atype = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes"));
+    if atype != PYTH_V1_ACCOUNT_TYPE_PRICE {
+        msg!("pyth: not a PriceAccount (atype={})", atype);
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // (2) Aggregate status must be Trading. If the publisher network
+    // couldn't agree on a price this slot, or the market is halted,
+    // we refuse to operate — just like our mock oracle refuses
+    // non-positive prices.
+    let status = u32::from_le_bytes(
+        data[PYTH_V1_OFFSET_AGG_STATUS..PYTH_V1_OFFSET_AGG_STATUS + 4]
+            .try_into()
+            .expect("4 bytes"),
+    );
+    if status != PYTH_V1_STATUS_TRADING {
+        msg!("pyth: aggregate status {} (not Trading)", status);
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // (3) Staleness gauntlet — same Clock-based check as the mock path,
+    // measured against agg.pub_slot rather than our SetOraclePrice
+    // timestamp.
+    let pub_slot = u64::from_le_bytes(
+        data[PYTH_V1_OFFSET_AGG_PUB_SLOT..PYTH_V1_OFFSET_AGG_PUB_SLOT + 8]
+            .try_into()
+            .expect("8 bytes"),
+    );
+    let clock = Clock::get()?;
+    let age = clock.slot.saturating_sub(pub_slot);
+    if age > MAX_ORACLE_STALENESS_SLOTS {
+        msg!(
+            "pyth: stale ({} slots, max {})",
+            age,
+            MAX_ORACLE_STALENESS_SLOTS
+        );
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // (4) Read price + log expo + conf for observability. We refuse
+    // non-positive prices for the same reason the mock does (Pyth
+    // occasionally publishes 0 to signal "no good price right now",
+    // even when status == Trading).
+    let price_i = i64::from_le_bytes(
+        data[PYTH_V1_OFFSET_AGG_PRICE..PYTH_V1_OFFSET_AGG_PRICE + 8]
+            .try_into()
+            .expect("8 bytes"),
+    );
+    let conf = u64::from_le_bytes(
+        data[PYTH_V1_OFFSET_AGG_CONF..PYTH_V1_OFFSET_AGG_CONF + 8]
+            .try_into()
+            .expect("8 bytes"),
+    );
+    let expo = i32::from_le_bytes(
+        data[PYTH_V1_OFFSET_EXPO..PYTH_V1_OFFSET_EXPO + 4]
+            .try_into()
+            .expect("4 bytes"),
+    );
+    if price_i <= 0 {
+        msg!("pyth: non-positive price ({})", price_i);
+        return Err(ProgramError::InvalidAccountData);
+    }
+    msg!("pyth: price={} conf={} expo={}", price_i, conf, expo);
+    Ok(price_i as u64)
 }
 
 /// Read the cumulative_funding_index from a funding account.

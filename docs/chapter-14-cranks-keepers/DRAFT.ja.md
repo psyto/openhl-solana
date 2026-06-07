@@ -290,7 +290,7 @@ Indexer はオフチェーン スタックの肝心なピースだ — 上記の
 
 明示的に繰り延べたもの（だから後で見つけやすい）:
 
-- **本物の Pyth 統合。** Ch.9 はモックを使う。§9.5 の移行表が本物の Pyth に切り替える 1 ページ diff。
+- **Pyth v2 / プルオラクル統合。** Ch.9 §9.5 は Pyth v1 の静的 `PriceAccount` に対して動作する `PlaceOrderCheckedPyth` を出荷する。Pyth v2 のプル アーキテクチャ（Wormhole VAA 検証 → price-cache PDA write）への移行は構造的に異なり、それ自体が後続章だ。
 
 本物の本番デプロイのために追加するもの:
 
