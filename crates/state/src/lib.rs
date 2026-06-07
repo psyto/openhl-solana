@@ -470,6 +470,165 @@ impl InsuranceFund {
     pub const LEN: usize = core::mem::size_of::<Self>();
 }
 
+/// Capacity of the OrderNode pool inside a `Slab`. 1024 nodes × 64 bytes
+/// each = 64 KiB. Matches the §8.4 pseudocode spec.
+pub const SLAB_POOL_CAPACITY: usize = 1024;
+
+/// Capacity of each per-side TreeNode pool inside a `CritbitTree`. With
+/// TREE_CAPACITY = 256 and worst-case fully-distinct prices, the tree can
+/// hold up to 128 leaves (each leaf needs one inner ancestor on average),
+/// so the effective price-level capacity per side is roughly 128.
+pub const SLAB_TREE_CAPACITY: usize = 256;
+
+/// Sentinel for "no index" in u16-indexed pools. Equal to `u16::MAX`.
+/// Free-list terminators, empty-tree roots, and dangling fifo pointers all
+/// use this value. There is deliberately no `Option<u16>` — that would
+/// push our slab structs out of `Pod`/`Zeroable` safety.
+pub const SLAB_NONE_INDEX: u16 = u16::MAX;
+
+/// TreeNode tag values. Stored in `TreeNode.tag`. `FREE` nodes live on
+/// the per-tree free list (linked through `next_free`). `INNER` nodes
+/// carry the critbit split-bit and two child indices. `LEAF` nodes carry
+/// the price + head/tail of the FIFO queue for that price level.
+pub mod tree_tag {
+    pub const FREE: u8 = 0;
+    pub const INNER: u8 = 1;
+    pub const LEAF: u8 = 2;
+}
+
+/// Fixed 8-byte tag identifying a `Slab` account.
+pub const SLAB_DISCRIMINATOR: [u8; 8] = *b"SLAB\0\0\0\0";
+
+/// One node in the OrderNode pool. Lives inside a per-price-level FIFO
+/// (chained via `next`/`prev` indices into `Slab.nodes`). When free, the
+/// node sits on the slab-level free list using `next` as the link
+/// (see `Slab.free_head`).
+///
+/// Layout (64 bytes):
+/// ```text
+///    0 | 0x00  order_id              u64       — monotonic from Slab.next_order_id
+///    8 | 0x08  owner                 [u8; 32]  — pubkey of the trader
+///   40 | 0x28  size                  u64       — remaining size on this order
+///   48 | 0x30  next                  u16       — next node in FIFO (or free list)
+///   50 | 0x32  prev                  u16       — prev node in FIFO
+///   52 | 0x34  _pad                  [u8; 12]
+///   64                                          — total size
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct OrderNode {
+    pub order_id: u64,
+    pub owner: [u8; 32],
+    pub size: u64,
+    pub next: u16,
+    pub prev: u16,
+    pub _pad: [u8; 12],
+}
+
+impl OrderNode {
+    pub const LEN: usize = core::mem::size_of::<Self>();
+}
+
+/// One node in a CritbitTree pool. Tagged union of FREE / INNER / LEAF —
+/// the field semantics depend on `tag`. The struct itself is always a
+/// flat 32-byte payload; unused fields are sentinel-valued or zero.
+///
+/// Layout (32 bytes):
+/// ```text
+///    0 | 0x00  tag                u8        — 0 free, 1 inner, 2 leaf
+///    1 | 0x01  split_bit          u8        — valid for INNER (bit 0..=63 of price)
+///    2 | 0x02  next_free          u16       — valid for FREE (link in free list)
+///    4 | 0x04  left_child         u16       — valid for INNER (0-side child index)
+///    6 | 0x06  right_child        u16       — valid for INNER (1-side child index)
+///    8 | 0x08  head_node          u16       — valid for LEAF (head of FIFO in pool)
+///   10 | 0x0A  tail_node          u16       — valid for LEAF
+///   12 | 0x0C  order_count        u32       — valid for LEAF (observability)
+///   16 | 0x10  price              u64       — valid for LEAF (this level's price)
+///   24 | 0x18  _pad               [u8; 8]
+///   32                                       — total size
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct TreeNode {
+    pub tag: u8,
+    pub split_bit: u8,
+    pub next_free: u16,
+    pub left_child: u16,
+    pub right_child: u16,
+    pub head_node: u16,
+    pub tail_node: u16,
+    pub order_count: u32,
+    pub price: u64,
+    pub _pad: [u8; 8],
+}
+
+impl TreeNode {
+    pub const LEN: usize = core::mem::size_of::<Self>();
+}
+
+/// A critbit tree of price levels for one side of the book. Owns a pool
+/// of `SLAB_TREE_CAPACITY` TreeNodes with its own free list.
+///
+/// Layout (8 + SLAB_TREE_CAPACITY × 32 = 8200 bytes):
+/// ```text
+///    0 | 0x00  root          u16     — tree root index (SLAB_NONE_INDEX if empty)
+///    2 | 0x02  free_head     u16     — head of free list
+///    4 | 0x04  _pad          [u8; 4]
+///    8 | 0x08  nodes         [TreeNode; SLAB_TREE_CAPACITY]
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct CritbitTree {
+    pub root: u16,
+    pub free_head: u16,
+    pub _pad: [u8; 4],
+    pub nodes: [TreeNode; SLAB_TREE_CAPACITY],
+}
+
+impl CritbitTree {
+    pub const LEN: usize = core::mem::size_of::<Self>();
+}
+
+/// Per-market slab order book. Two critbit trees (one per side) over price
+/// levels; each leaf holds a doubly-linked FIFO of OrderNodes drawn from a
+/// shared pool. See Chapter 15 for the implementation walk and Chapter 8
+/// §8.4 for the pseudocode this implements.
+///
+/// Layout (64 + 2 × 8200 + 1024 × 64 = 82_528 bytes):
+/// ```text
+///    0 | 0x00  discriminator         [u8; 8]   — SLAB\0\0\0\0
+///    8 | 0x08  bump                  u8
+///    9 | 0x09  _pad0                 [u8; 7]
+///   16 | 0x10  market                [u8; 32]
+///   48 | 0x30  next_order_id         u64
+///   56 | 0x38  active_count          u32       — total live orders, both sides
+///   60 | 0x3C  pool_free_head        u16       — OrderNode pool free list
+///   62 | 0x3E  _pad1                 [u8; 2]
+///   64 | 0x40  bid_tree              CritbitTree
+/// 8264 | 0x2048 ask_tree              CritbitTree
+/// 16464 | 0x4050 nodes                 [OrderNode; SLAB_POOL_CAPACITY]
+/// 82000 (sic — see actual LEN sanity test below)
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct Slab {
+    pub discriminator: [u8; 8],
+    pub bump: u8,
+    pub _pad0: [u8; 7],
+    pub market: [u8; 32],
+    pub next_order_id: u64,
+    pub active_count: u32,
+    pub pool_free_head: u16,
+    pub _pad1: [u8; 2],
+    pub bid_tree: CritbitTree,
+    pub ask_tree: CritbitTree,
+    pub nodes: [OrderNode; SLAB_POOL_CAPACITY],
+}
+
+impl Slab {
+    pub const LEN: usize = core::mem::size_of::<Self>();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,5 +751,39 @@ mod tests {
     #[test]
     fn insurance_fund_discriminator_is_human_readable() {
         assert_eq!(&INSURANCE_FUND_DISCRIMINATOR, b"INSFUND\0");
+    }
+
+    #[test]
+    fn order_node_size_is_64_bytes() {
+        assert_eq!(OrderNode::LEN, 64);
+    }
+
+    #[test]
+    fn tree_node_size_is_32_bytes() {
+        assert_eq!(TreeNode::LEN, 32);
+    }
+
+    #[test]
+    fn critbit_tree_size_matches_layout() {
+        assert_eq!(CritbitTree::LEN, 8 + SLAB_TREE_CAPACITY * TreeNode::LEN);
+        assert_eq!(CritbitTree::LEN, 8 + 256 * 32);
+    }
+
+    #[test]
+    fn slab_size_matches_layout() {
+        let expected = 64 + 2 * CritbitTree::LEN + SLAB_POOL_CAPACITY * OrderNode::LEN;
+        assert_eq!(Slab::LEN, expected);
+    }
+
+    #[test]
+    fn slab_discriminator_is_human_readable() {
+        assert_eq!(&SLAB_DISCRIMINATOR, b"SLAB\0\0\0\0");
+    }
+
+    #[test]
+    fn tree_tag_values() {
+        assert_eq!(tree_tag::FREE, 0);
+        assert_eq!(tree_tag::INNER, 1);
+        assert_eq!(tree_tag::LEAF, 2);
     }
 }

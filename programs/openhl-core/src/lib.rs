@@ -131,6 +131,14 @@
 //!                           Permissionless. Transfer quote tokens
 //!                           into the fund and credit the on-chain
 //!                           balance + total_deposits counter.
+//!  29  CreateSlab         — written for Chapter 15 (slab order book).
+//!                           Allocates the per-market Slab PDA and
+//!                           initializes free lists.
+//!  30  SlabPlaceOrder     — also Chapter 15. Critbit-tree insert.
+//!  31  SlabMatch          — also Chapter 15. Crosses against the
+//!                           opposite-side critbit tree with a
+//!                           pagination cap, mirroring Chapter 8's
+//!                           flat-book Match.
 //!
 //! The entire program is one file on purpose. Splitting it into the usual
 //! `instruction.rs` / `processor.rs` / `state.rs` modules buys nothing
@@ -140,11 +148,12 @@
 #![allow(unexpected_cfgs)] // solana_program::entrypoint! gates on `target_os = "solana"`
 
 use openhl_state::{
-    side, BuilderProfile, FundingState, InsuranceFund, Market, Oracle, Order, OrderBook, Position,
-    Stats, TradingVault, VaultShare, BUILDER_PROFILE_DISCRIMINATOR, FUNDING_DISCRIMINATOR,
-    INSURANCE_FUND_DISCRIMINATOR, MARKET_DISCRIMINATOR, ORACLE_DISCRIMINATOR,
-    ORDER_BOOK_DISCRIMINATOR, ORDER_CAPACITY, POSITION_DISCRIMINATOR, STATS_DISCRIMINATOR,
-    TRADING_VAULT_DISCRIMINATOR, VAULT_SHARE_DISCRIMINATOR,
+    side, tree_tag, BuilderProfile, CritbitTree, FundingState, InsuranceFund, Market, Oracle,
+    Order, OrderBook, Position, Slab, Stats, TradingVault, TreeNode, VaultShare,
+    BUILDER_PROFILE_DISCRIMINATOR, FUNDING_DISCRIMINATOR, INSURANCE_FUND_DISCRIMINATOR,
+    MARKET_DISCRIMINATOR, ORACLE_DISCRIMINATOR, ORDER_BOOK_DISCRIMINATOR, ORDER_CAPACITY,
+    POSITION_DISCRIMINATOR, SLAB_DISCRIMINATOR, SLAB_NONE_INDEX, SLAB_POOL_CAPACITY,
+    SLAB_TREE_CAPACITY, STATS_DISCRIMINATOR, TRADING_VAULT_DISCRIMINATOR, VAULT_SHARE_DISCRIMINATOR,
 };
 use solana_program::{
     account_info::AccountInfo,
@@ -278,6 +287,13 @@ pub const PROTOCOL_FEE_BPS: u64 = 10;
 /// fund or treasury account).
 pub const PROTOCOL_BUILDER_SHARE_CAP_BPS: u64 = 5000;
 
+/// PDA seed prefix for the per-market `Slab` order book account.
+/// Companion to `BOOK_SEED` (the flat-array Chapter 7 book); this is the
+/// Chapter 15 critbit implementation.
+///
+/// Full seed list: `[SLAB_SEED, market.as_ref(), &[bump]]`.
+pub const SLAB_SEED: &[u8] = b"slab";
+
 /// PDA seed prefix for the per-(quote_mint) protocol fee vault token
 /// account. Every place-order variant Transfers `protocol_fee` from the
 /// trader's quote token account into this PDA; ClaimBuilderFees moves
@@ -359,6 +375,9 @@ pub fn process_instruction(
         26 => process_create_fee_vault(program_id, accounts, payload),
         27 => process_create_insurance_fund(program_id, accounts, payload),
         28 => process_insurance_fund_deposit(program_id, accounts, payload),
+        29 => process_create_slab(program_id, accounts, payload),
+        30 => process_slab_place_order(program_id, accounts, payload),
+        31 => process_slab_match(program_id, accounts, payload),
         unknown => {
             msg!("unknown instruction tag: {}", unknown);
             Err(ProgramError::InvalidInstructionData)
@@ -4003,5 +4022,672 @@ fn process_insurance_fund_deposit(
     )?;
 
     msg!("insurance_fund_deposit: {} credited to fund", amount);
+    Ok(())
+}
+
+// =============================================================================
+// Slab order book — Chapter 15 (implementation of §8.4 pseudocode).
+// =============================================================================
+//
+// The slab is the production-grade order book: two critbit trees over price
+// levels (one for bids, one for asks), each leaf a FIFO of OrderNodes drawn
+// from a shared per-slab pool. Insert is O(log N) by price level. Best-price
+// is O(log N) — walk root toward the appropriate side. Cancel/match-and-pop
+// is O(log N) when a level drains and the leaf has to be removed; O(1)
+// otherwise (just FIFO bookkeeping). Chapter 8's flat-array book at
+// `OrderBook` is preserved for the pedagogical comparison and is unchanged.
+
+// ---- Pool helpers ----------------------------------------------------------
+
+/// Initialize the order-node free list inside a fresh `Slab`: all
+/// `SLAB_POOL_CAPACITY` nodes start free, linked via their `next` field.
+fn slab_init_pool(slab: &mut Slab) {
+    for i in 0..SLAB_POOL_CAPACITY {
+        slab.nodes[i].next = if i + 1 < SLAB_POOL_CAPACITY {
+            (i as u16) + 1
+        } else {
+            SLAB_NONE_INDEX
+        };
+        slab.nodes[i].prev = SLAB_NONE_INDEX;
+        slab.nodes[i].size = 0;
+        slab.nodes[i].order_id = 0;
+        slab.nodes[i].owner = [0u8; 32];
+    }
+    slab.pool_free_head = 0;
+}
+
+/// Initialize a critbit tree's tree-node free list.
+fn tree_init(tree: &mut CritbitTree) {
+    tree.root = SLAB_NONE_INDEX;
+    for i in 0..SLAB_TREE_CAPACITY {
+        tree.nodes[i].tag = tree_tag::FREE;
+        tree.nodes[i].next_free = if i + 1 < SLAB_TREE_CAPACITY {
+            (i as u16) + 1
+        } else {
+            SLAB_NONE_INDEX
+        };
+    }
+    tree.free_head = 0;
+}
+
+fn pool_alloc_node(slab: &mut Slab) -> Result<u16, ProgramError> {
+    let head = slab.pool_free_head;
+    if head == SLAB_NONE_INDEX {
+        msg!("slab: order-node pool exhausted");
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+    let next = slab.nodes[head as usize].next;
+    slab.pool_free_head = next;
+    Ok(head)
+}
+
+fn pool_free_node(slab: &mut Slab, idx: u16) {
+    let head = slab.pool_free_head;
+    let node = &mut slab.nodes[idx as usize];
+    node.next = head;
+    node.prev = SLAB_NONE_INDEX;
+    node.size = 0;
+    node.order_id = 0;
+    node.owner = [0u8; 32];
+    slab.pool_free_head = idx;
+}
+
+fn tree_alloc(tree: &mut CritbitTree) -> Result<u16, ProgramError> {
+    let head = tree.free_head;
+    if head == SLAB_NONE_INDEX {
+        msg!("slab: tree-node pool exhausted");
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+    let next = tree.nodes[head as usize].next_free;
+    tree.free_head = next;
+    Ok(head)
+}
+
+fn tree_free(tree: &mut CritbitTree, idx: u16) {
+    let head = tree.free_head;
+    let node = &mut tree.nodes[idx as usize];
+    *node = TreeNode {
+        tag: tree_tag::FREE,
+        split_bit: 0,
+        next_free: head,
+        left_child: SLAB_NONE_INDEX,
+        right_child: SLAB_NONE_INDEX,
+        head_node: SLAB_NONE_INDEX,
+        tail_node: SLAB_NONE_INDEX,
+        order_count: 0,
+        price: 0,
+        _pad: [0u8; 8],
+    };
+    tree.free_head = idx;
+}
+
+// ---- Critbit operations ---------------------------------------------------
+
+/// Walk the tree following `(price >> split_bit) & 1` at each inner node,
+/// stopping at the first leaf encountered. Returns the leaf index (which
+/// may or may not have `price` as its key — caller compares).
+fn critbit_walk_to_leaf(tree: &CritbitTree, price: u64) -> u16 {
+    let mut cur = tree.root;
+    loop {
+        let node = &tree.nodes[cur as usize];
+        if node.tag == tree_tag::LEAF {
+            return cur;
+        }
+        // INNER
+        let bit = (price >> node.split_bit) & 1;
+        cur = if bit == 1 { node.right_child } else { node.left_child };
+    }
+}
+
+/// Find an existing leaf with `price`, or create a new one (splicing as
+/// needed). Returns the leaf index. The leaf's FIFO bookkeeping
+/// (`head_node` / `tail_node` / `order_count`) is left to the caller.
+fn critbit_find_or_create_leaf(
+    tree: &mut CritbitTree,
+    price: u64,
+) -> Result<(u16, bool), ProgramError> {
+    // Empty tree → create root leaf.
+    if tree.root == SLAB_NONE_INDEX {
+        let leaf_idx = tree_alloc(tree)?;
+        tree.nodes[leaf_idx as usize] = TreeNode {
+            tag: tree_tag::LEAF,
+            split_bit: 0,
+            next_free: SLAB_NONE_INDEX,
+            left_child: SLAB_NONE_INDEX,
+            right_child: SLAB_NONE_INDEX,
+            head_node: SLAB_NONE_INDEX,
+            tail_node: SLAB_NONE_INDEX,
+            order_count: 0,
+            price,
+            _pad: [0u8; 8],
+        };
+        tree.root = leaf_idx;
+        return Ok((leaf_idx, true));
+    }
+
+    // Walk to any leaf to compare prices.
+    let found_leaf = critbit_walk_to_leaf(tree, price);
+    let found_price = tree.nodes[found_leaf as usize].price;
+    if found_price == price {
+        return Ok((found_leaf, false));
+    }
+
+    // New price — find the bit position to splice at, then splice.
+    let diff = price ^ found_price;
+    // 0-based highest set bit. diff != 0 because prices differ.
+    let shared_bit: u8 = 63u8 - (diff.leading_zeros() as u8);
+
+    // Walk again from root, looking for the spot to splice. We splice
+    // either above the first inner whose split_bit < shared_bit, or
+    // above any leaf we hit (whose split_bit is conceptually -1 < any).
+    let mut parent: u16 = SLAB_NONE_INDEX;
+    let mut parent_side: u8 = 0; // side of parent that cur lives at
+    let mut cur = tree.root;
+    loop {
+        let node = &tree.nodes[cur as usize];
+        if node.tag == tree_tag::LEAF || node.split_bit < shared_bit {
+            break;
+        }
+        let bit = ((price >> node.split_bit) & 1) as u8;
+        parent = cur;
+        parent_side = bit;
+        cur = if bit == 1 { node.right_child } else { node.left_child };
+    }
+
+    // Allocate the new leaf and the new inner.
+    let new_leaf_idx = tree_alloc(tree)?;
+    tree.nodes[new_leaf_idx as usize] = TreeNode {
+        tag: tree_tag::LEAF,
+        split_bit: 0,
+        next_free: SLAB_NONE_INDEX,
+        left_child: SLAB_NONE_INDEX,
+        right_child: SLAB_NONE_INDEX,
+        head_node: SLAB_NONE_INDEX,
+        tail_node: SLAB_NONE_INDEX,
+        order_count: 0,
+        price,
+        _pad: [0u8; 8],
+    };
+    let new_inner_idx = tree_alloc(tree)?;
+
+    // Which side does `price` go at shared_bit? That side gets new_leaf_idx;
+    // the other side keeps the existing subtree (cur).
+    let price_bit = ((price >> shared_bit) & 1) as u8;
+    let (left, right) = if price_bit == 1 {
+        (cur, new_leaf_idx)
+    } else {
+        (new_leaf_idx, cur)
+    };
+    tree.nodes[new_inner_idx as usize] = TreeNode {
+        tag: tree_tag::INNER,
+        split_bit: shared_bit,
+        next_free: SLAB_NONE_INDEX,
+        left_child: left,
+        right_child: right,
+        head_node: SLAB_NONE_INDEX,
+        tail_node: SLAB_NONE_INDEX,
+        order_count: 0,
+        price: 0,
+        _pad: [0u8; 8],
+    };
+
+    // Wire the new inner into parent (or as new root).
+    if parent == SLAB_NONE_INDEX {
+        tree.root = new_inner_idx;
+    } else if parent_side == 1 {
+        tree.nodes[parent as usize].right_child = new_inner_idx;
+    } else {
+        tree.nodes[parent as usize].left_child = new_inner_idx;
+    }
+
+    Ok((new_leaf_idx, true))
+}
+
+/// Find the best leaf on the side dictated by `want_max`:
+///   - `want_max = true`  (bids): walk right at every inner — highest price.
+///   - `want_max = false` (asks): walk left at every inner — lowest price.
+fn critbit_find_best(tree: &CritbitTree, want_max: bool) -> Option<u16> {
+    if tree.root == SLAB_NONE_INDEX {
+        return None;
+    }
+    let mut cur = tree.root;
+    loop {
+        let node = &tree.nodes[cur as usize];
+        if node.tag == tree_tag::LEAF {
+            return Some(cur);
+        }
+        cur = if want_max { node.right_child } else { node.left_child };
+    }
+}
+
+/// Remove `leaf_idx` from the tree. Frees both the leaf and the inner above
+/// it (the inner becomes redundant once a leaf is removed — its sibling
+/// promotes up). Handles the root-leaf and single-leaf edge cases.
+fn critbit_remove_leaf(tree: &mut CritbitTree, leaf_idx: u16) -> ProgramResult {
+    // Edge case: leaf is the root.
+    if tree.root == leaf_idx {
+        tree_free(tree, leaf_idx);
+        tree.root = SLAB_NONE_INDEX;
+        return Ok(());
+    }
+
+    // Walk from root by price, tracking parent + grandparent.
+    let target_price = tree.nodes[leaf_idx as usize].price;
+    let mut grandparent: u16 = SLAB_NONE_INDEX;
+    let mut parent: u16 = SLAB_NONE_INDEX;
+    let mut gp_to_p_side: u8 = 0;
+    let mut parent_side: u8 = 0; // which side of parent leads to cur
+    let mut cur = tree.root;
+    loop {
+        if cur == leaf_idx {
+            break;
+        }
+        let node = &tree.nodes[cur as usize];
+        if node.tag != tree_tag::INNER {
+            // Defensive: walking by price reached a non-target leaf — should
+            // not happen with a well-formed tree.
+            msg!("slab: critbit walk reached wrong leaf");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let bit = ((target_price >> node.split_bit) & 1) as u8;
+        grandparent = parent;
+        gp_to_p_side = parent_side;
+        parent = cur;
+        parent_side = bit;
+        cur = if bit == 1 { node.right_child } else { node.left_child };
+    }
+
+    // `parent` is the inner directly above the leaf. Its other child is the
+    // sibling that promotes up.
+    let parent_node = tree.nodes[parent as usize];
+    let sibling = if parent_side == 1 {
+        parent_node.left_child
+    } else {
+        parent_node.right_child
+    };
+
+    if grandparent == SLAB_NONE_INDEX {
+        tree.root = sibling;
+    } else if gp_to_p_side == 1 {
+        tree.nodes[grandparent as usize].right_child = sibling;
+    } else {
+        tree.nodes[grandparent as usize].left_child = sibling;
+    }
+    tree_free(tree, parent);
+    tree_free(tree, leaf_idx);
+    Ok(())
+}
+
+// ---- Higher-level slab operations ----------------------------------------
+
+/// Insert an order into the slab. Allocates an OrderNode, finds-or-creates
+/// the leaf for `price`, and appends the new node to that level's FIFO.
+/// Returns the assigned `order_id`.
+fn slab_insert_order(
+    slab: &mut Slab,
+    side: u8,
+    price: u64,
+    owner: [u8; 32],
+    size: u64,
+) -> Result<u64, ProgramError> {
+    if size == 0 || price == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    // Alloc + init the order node.
+    let order_idx = pool_alloc_node(slab)?;
+    let order_id = slab.next_order_id;
+    slab.next_order_id = slab
+        .next_order_id
+        .checked_add(1)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    {
+        let node = &mut slab.nodes[order_idx as usize];
+        node.order_id = order_id;
+        node.owner = owner;
+        node.size = size;
+        node.next = SLAB_NONE_INDEX;
+        node.prev = SLAB_NONE_INDEX;
+    }
+
+    // Find or create the leaf, then attach.
+    let tree = if side == side::BID {
+        &mut slab.bid_tree
+    } else {
+        &mut slab.ask_tree
+    };
+    let (leaf_idx, _was_new) = critbit_find_or_create_leaf(tree, price)?;
+    let old_tail_idx: u16;
+    {
+        let leaf = &mut tree.nodes[leaf_idx as usize];
+        if leaf.head_node == SLAB_NONE_INDEX {
+            leaf.head_node = order_idx;
+            leaf.tail_node = order_idx;
+            leaf.order_count = 1;
+            slab.active_count = slab
+                .active_count
+                .checked_add(1)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+            return Ok(order_id);
+        }
+        old_tail_idx = leaf.tail_node;
+        leaf.tail_node = order_idx;
+        leaf.order_count = leaf
+            .order_count
+            .checked_add(1)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+    }
+    // Borrow on tree ends here; now touch the OrderNode pool.
+    slab.nodes[old_tail_idx as usize].next = order_idx;
+    slab.nodes[order_idx as usize].prev = old_tail_idx;
+    slab.active_count = slab
+        .active_count
+        .checked_add(1)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    Ok(order_id)
+}
+
+/// Pop the head of the best leaf's FIFO. Returns the order node index +
+/// the price level, or `None` if the side is empty. Caller is responsible
+/// for actually freeing the order node (it may want to read fields first)
+/// and for re-linking the new head if the FIFO had more than one entry.
+fn slab_peek_best(slab: &Slab, want_max: bool) -> Option<(u16, u16, u64)> {
+    let tree = if want_max {
+        &slab.bid_tree
+    } else {
+        &slab.ask_tree
+    };
+    let leaf_idx = critbit_find_best(tree, want_max)?;
+    let leaf = &tree.nodes[leaf_idx as usize];
+    if leaf.head_node == SLAB_NONE_INDEX {
+        return None;
+    }
+    Some((leaf_idx, leaf.head_node, leaf.price))
+}
+
+/// Remove the head of the given leaf's FIFO. If the FIFO becomes empty,
+/// also remove the leaf from the tree (which may free the inner above).
+/// Returns the freed order node index.
+fn slab_pop_head_of_leaf(slab: &mut Slab, side: u8, leaf_idx: u16) -> Result<u16, ProgramError> {
+    let tree = if side == side::BID {
+        &mut slab.bid_tree
+    } else {
+        &mut slab.ask_tree
+    };
+
+    let head_idx: u16;
+    let new_head: u16;
+    let became_empty: bool;
+    {
+        let leaf = &mut tree.nodes[leaf_idx as usize];
+        head_idx = leaf.head_node;
+        if head_idx == SLAB_NONE_INDEX {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        leaf.order_count = leaf.order_count.saturating_sub(1);
+    }
+    new_head = slab.nodes[head_idx as usize].next;
+    {
+        let tree2 = if side == side::BID {
+            &mut slab.bid_tree
+        } else {
+            &mut slab.ask_tree
+        };
+        let leaf = &mut tree2.nodes[leaf_idx as usize];
+        leaf.head_node = new_head;
+        if new_head == SLAB_NONE_INDEX {
+            leaf.tail_node = SLAB_NONE_INDEX;
+            became_empty = true;
+        } else {
+            became_empty = false;
+        }
+    }
+    if new_head != SLAB_NONE_INDEX {
+        slab.nodes[new_head as usize].prev = SLAB_NONE_INDEX;
+    }
+    if became_empty {
+        let tree3 = if side == side::BID {
+            &mut slab.bid_tree
+        } else {
+            &mut slab.ask_tree
+        };
+        critbit_remove_leaf(tree3, leaf_idx)?;
+    }
+    pool_free_node(slab, head_idx);
+    slab.active_count = slab.active_count.saturating_sub(1);
+    Ok(head_idx)
+}
+
+// ---- Handlers --------------------------------------------------------------
+
+const CREATE_SLAB_PAYLOAD_LEN: usize = 0;
+const SLAB_PLACE_ORDER_PAYLOAD_LEN: usize = 1 + 8 + 8; // side u8 + price u64 + size u64
+const SLAB_MATCH_PAYLOAD_LEN: usize = 1 + 8 + 8 + 1; // side u8 + price u64 + size u64 + max_fills u8
+
+/// Payload: empty.
+///
+/// Accounts:
+///   0. `[WRITE, SIGNER]` payer
+///   1. `[]`              market
+///   2. `[WRITE]`         slab           — PDA at [b"slab", market]
+///   3. `[]`              system_program
+fn process_create_slab(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != CREATE_SLAB_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let payer_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let market_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let slab_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let system_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !payer_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if market_ai.owner != program_id || market_ai.data_len() != Market::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if system_ai.key != &system_program::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    let (expected, bump) =
+        Pubkey::find_program_address(&[SLAB_SEED, market_ai.key.as_ref()], program_id);
+    if slab_ai.key != &expected {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let rent = Rent::get()?.minimum_balance(Slab::LEN);
+    let create_ix = system_instruction::create_account(
+        payer_ai.key,
+        slab_ai.key,
+        rent,
+        Slab::LEN as u64,
+        program_id,
+    );
+    invoke_signed(
+        &create_ix,
+        &[payer_ai.clone(), slab_ai.clone(), system_ai.clone()],
+        &[&[SLAB_SEED, market_ai.key.as_ref(), &[bump]]],
+    )?;
+
+    let mut data = slab_ai.try_borrow_mut_data()?;
+    let slab: &mut Slab = bytemuck::from_bytes_mut(&mut data[..Slab::LEN]);
+    slab.discriminator = SLAB_DISCRIMINATOR;
+    slab.bump = bump;
+    slab._pad0 = [0u8; 7];
+    slab.market.copy_from_slice(market_ai.key.as_ref());
+    slab.next_order_id = 0;
+    slab.active_count = 0;
+    slab._pad1 = [0u8; 2];
+    tree_init(&mut slab.bid_tree);
+    tree_init(&mut slab.ask_tree);
+    slab_init_pool(slab);
+
+    msg!("slab created (bump {})", bump);
+    Ok(())
+}
+
+/// Payload: [side u8][price u64 LE][size u64 LE]
+///
+/// Accounts:
+///   0. `[SIGNER]` user
+///   1. `[WRITE]`  slab
+fn process_slab_place_order(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != SLAB_PLACE_ORDER_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let order_side = payload[0];
+    let price = u64::from_le_bytes(payload[1..9].try_into().expect("8 bytes"));
+    let size = u64::from_le_bytes(payload[9..17].try_into().expect("8 bytes"));
+    if order_side != side::BID && order_side != side::ASK {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if price == 0 || size == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let user_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let slab_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !user_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if slab_ai.owner != program_id || slab_ai.data_len() != Slab::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let mut data = slab_ai.try_borrow_mut_data()?;
+    let slab: &mut Slab = bytemuck::from_bytes_mut(&mut data[..Slab::LEN]);
+    if slab.discriminator != SLAB_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    let mut owner = [0u8; 32];
+    owner.copy_from_slice(user_ai.key.as_ref());
+    let order_id = slab_insert_order(slab, order_side, price, owner, size)?;
+
+    msg!(
+        "slab_place_order: side={} price={} size={} order_id={} active_count={}",
+        order_side,
+        price,
+        size,
+        order_id,
+        slab.active_count
+    );
+    Ok(())
+}
+
+/// Payload: [taker_side u8][price u64 LE][size u64 LE][max_fills u8]
+///
+/// Crosses against the opposite side: a BID taker crosses the asks (best
+/// price = min), an ASK taker crosses the bids (best price = max). Same
+/// pagination cap as Chapter 8's `Match` — bounded fills per CU budget.
+///
+/// Accounts:
+///   0. `[SIGNER]` caller
+///   1. `[WRITE]`  slab
+fn process_slab_match(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != SLAB_MATCH_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let taker_side = payload[0];
+    let limit_price = u64::from_le_bytes(payload[1..9].try_into().expect("8 bytes"));
+    let mut remaining = u64::from_le_bytes(payload[9..17].try_into().expect("8 bytes"));
+    let max_fills = payload[17] as usize;
+
+    if taker_side != side::BID && taker_side != side::ASK {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if remaining == 0 || max_fills == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let caller_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let slab_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    if !caller_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if slab_ai.owner != program_id || slab_ai.data_len() != Slab::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let mut data = slab_ai.try_borrow_mut_data()?;
+    let slab: &mut Slab = bytemuck::from_bytes_mut(&mut data[..Slab::LEN]);
+    if slab.discriminator != SLAB_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    // Maker side = the side we cross against. A BID taker (wants to buy)
+    // takes from asks (min price); an ASK taker (wants to sell) takes from
+    // bids (max price).
+    let maker_side = if taker_side == side::BID {
+        side::ASK
+    } else {
+        side::BID
+    };
+    let want_max = maker_side == side::BID; // crossing the bid tree → want highest
+
+    let mut fills: usize = 0;
+    while fills < max_fills && remaining > 0 {
+        let (leaf_idx, head_idx, level_price) = match slab_peek_best(slab, want_max) {
+            Some(v) => v,
+            None => break, // book empty on the maker side
+        };
+
+        // Limit-price gate. Taker is willing to:
+        //   BID taker: buy up to limit_price → cross asks where level_price <= limit_price.
+        //   ASK taker: sell down to limit_price → cross bids where level_price >= limit_price.
+        let crosses = if taker_side == side::BID {
+            level_price <= limit_price
+        } else {
+            level_price >= limit_price
+        };
+        if !crosses {
+            break;
+        }
+
+        // How much can we take from this maker?
+        let maker_size = slab.nodes[head_idx as usize].size;
+        let fill = remaining.min(maker_size);
+
+        if fill == maker_size {
+            // Maker fully consumed — pop it from the FIFO. May also drop
+            // the leaf if this was the last order at this level.
+            slab_pop_head_of_leaf(slab, maker_side, leaf_idx)?;
+        } else {
+            // Partial fill — maker stays, size shrinks.
+            slab.nodes[head_idx as usize].size = maker_size - fill;
+        }
+
+        remaining -= fill;
+        fills = fills.saturating_add(1);
+        msg!(
+            "slab_match: fill #{} price={} size={} remaining={}",
+            fills,
+            level_price,
+            fill,
+            remaining
+        );
+    }
+
+    msg!(
+        "slab_match: done. fills={} remaining_taker_size={} active_count={}",
+        fills,
+        remaining,
+        slab.active_count
+    );
     Ok(())
 }

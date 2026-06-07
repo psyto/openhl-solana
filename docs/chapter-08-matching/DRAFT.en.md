@@ -6,22 +6,16 @@
 
 ---
 
-## §8.0  Framing — and a scope honesty note
+## §8.0  Framing — what this chapter teaches
 
-Chapter 7's hook promised a working slab implementation in this chapter, measured against the flat-array baseline. Living with the implementation across a few weeks of writing, I've made a different scope call: this chapter walks the matcher on the flat book, measures its CU cost shape exactly, enumerates the three real responses to CU exhaustion (raise the budget, paginate via `max_fills`, refactor to a slab), and gives the slab as a thoroughly-pseudocoded design — but does not implement the slab. The reasons:
-
-1. **The pedagogical job of this chapter is the cost shape.** "Linear scans inside a fill loop are O(K × N), and that's the problem" is what the worked example needs to prove. Adding a working slab would dilute that focus into two parallel implementations that the reader has to hold in their head simultaneously.
-2. **A real slab implementation deserves its own chapter.** It involves a node pool with a free-list, a critbit tree over price levels, and a FIFO queue per level. None of those are throwaway — and squeezing them into 50% of one chapter would teach all three badly.
-3. **The flat matcher with `max_fills` pagination is genuinely useful** for low-throughput / educational deployments. Shipping it cleanly, with the pagination response built in, is honest engineering.
+Chapter 7 hooked a slab implementation here; that promise moved to its own chapter (15) because the slab grew big enough to deserve one. This chapter is about the **CU cost shape** of matching against the flat-array book Chapter 7 shipped — measured precisely, with the three responses to CU exhaustion (raise the budget, paginate via `max_fills`, refactor to a slab) named and costed. The slab pseudocode in §8.4 is the design spec that Chapter 15's code implements.
 
 So this chapter:
 
 1. Walks the `Match` algorithm on the flat book.
 2. Reads its CU cost shape from real logs and shows it is O(fills × N).
 3. Demonstrates the three CU-pressure responses (budget raise, pagination, slab refactor) and explains which costs what.
-4. Provides slab pseudocode + diagrams at a level of detail that lets you implement it yourself if you choose.
-
-The full slab implementation moves to a future chapter (or your own homework). The hook is being downsized; the engineering content is not.
+4. Provides slab pseudocode + diagrams as the design spec; Chapter 15 ships the implementation.
 
 ---
 
@@ -178,7 +172,7 @@ Per-fill cost is `O(log N)` instead of `O(N)`. For N = 1024, that's ~10 vs ~1000
 
 **When it's the right answer:** for production CLOBs with non-trivial liquidity. Phoenix and Serum both use this design for good reasons.
 
-The slab implementation is left to a future chapter (or your own implementation). The pseudo-code below is enough to write it.
+The slab implementation lives in Chapter 15, which walks the code produced from the design spec below.
 
 ---
 
@@ -247,9 +241,9 @@ The pedagogical points to absorb if you do implement this:
 4. **Critbit, not red-black.** Critbit trees have simpler rebalancing rules and don't need rotation logic. Serum uses critbit; Phoenix uses critbit. The pattern is well-trodden.
 5. **One tree per side.** Bids and asks have different "best" semantics (max vs min). Keep two trees and you avoid threading a comparator through the tree code.
 
-Implementing slab is a 3-4 day exercise if you've never done it before. The first day is the pool + free-list. The second is critbit insert/remove. The third is wiring it into a matcher. The fourth is testing edge cases (book full, level full, all-or-nothing fills).
+Implementing slab is a 3-4 day exercise if you've never done it before. The first day is the pool + free-list. The second is critbit insert/remove. The third is wiring it into a matcher. The fourth is testing edge cases (book full, level full, all-or-nothing fills). Chapter 15 walks the resulting implementation.
 
-> **Exercise §8.4.** Build the pool + free-list piece. Write a `Pool<OrderNode, 1024>` with `alloc() -> Option<u16>` and `free(idx: u16)` methods. Verify with 10,000 random alloc/free pairs that the pool always has the right `available_count`. This is the hardest single piece to get right — invariants on `free_head` are easy to break.
+> **Exercise §8.4.** Build the pool + free-list piece *from scratch* before reading Chapter 15. Write a `Pool<OrderNode, 1024>` with `alloc() -> Option<u16>` and `free(idx: u16)` methods. Verify with 10,000 random alloc/free pairs that the pool always has the right `available_count`. Then compare to Chapter 15's `pool_alloc_node` / `pool_free_node`. The invariants are easy to break; checking against a working implementation is part of the value.
 
 ---
 
@@ -267,7 +261,7 @@ It is not enough for:
 - A matcher that needs to atomically process large takers.
 - Any HFT-style use case where latency-per-fill matters.
 
-For those, you implement slab. The pseudo-code in §8.4 is the design spec.
+For those, ship the slab. The pseudo-code in §8.4 is the design spec and Chapter 15 is its implementation.
 
 ---
 
@@ -283,7 +277,7 @@ Match on flat book (this chapter):
   Failure mode:  CU exhaustion past ~30 fills
 
 
-Match on slab (future chapter, pseudocoded above):
+Match on slab (Chapter 15, pseudocoded above):
 
   Per fill:    O(log N) tree walk + O(1) FIFO advance  →  O(K × log N) total
   Per K=16 on ~1024-order book:           ~30 KCU

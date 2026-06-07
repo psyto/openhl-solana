@@ -21,7 +21,7 @@ Six keepers, one indexer:
 6. **Maintenance keeper** — odds and ends: closing dormant accounts, archiving filled orders, garbage collecting empty book slots.
 7. **Indexer** — not a keeper but an essential read-side service: subscribes to chain state and feeds frontends, analytics, alerting.
 
-The chapter closes Phase B and the track. After §14.7's retrospective there are no more chapters; there are no more on-chain features to add before the program is feature-complete in the sense the curriculum committed to in Chapter 0. Where you go after is your own choice — production deployment, audit prep, scaling experiments, your own perp DEX. The pieces are in your hands.
+The chapter closes Phase B's main arc. §14.7's retrospective summarizes what the fourteen chapters built. Chapter 15 follows as a separate appendix-style chapter that ships the slab order book §8.4 designed — the Phase B program is feature-complete with or without it, but the slab is the production-grade order book and lives next to the flat-array Chapter 7 book for direct comparison. Where you go after is your own choice — production deployment, audit prep, scaling experiments, your own perp DEX. The pieces are in your hands.
 
 ---
 
@@ -286,11 +286,10 @@ Across fourteen chapters, we built:
 
 **Phase A (foundations, ch.1–5):** Account model, native programs, PDAs, compute budget, Sealevel parallelism. A complete "Solana from scratch, no Anchor" curriculum that stands on its own — a learner who finishes Phase A can write a real Solana program and debug a real Solana program, without ever touching a framework.
 
-**Phase B (HL primitives, ch.6–14):** SPL Token vaults via CPI, on-chain order books, matching engines, oracle integration, funding rate accumulators, position lifecycle with liquidation, pooled trading vaults, builder codes, and the off-chain infrastructure that runs the result. A working — if scope-deferred — perp DEX, with every design choice annotated and every honesty note about what's deferred written into the chapter.
+**Phase B (HL primitives, ch.6–14, plus the ch.15 appendix):** SPL Token vaults via CPI, on-chain order books (flat-array in ch.7 + slab in ch.15), matching engines, oracle integration, funding rate accumulators, position lifecycle with liquidation, pooled trading vaults, builder codes, insurance fund, and the off-chain infrastructure that runs the result. A working — if scope-deferred — perp DEX, with every design choice annotated and every honesty note about what's deferred written into the chapter.
 
 Things explicitly deferred (so they're easy to find later):
 
-- **Slab-based order book.** Ch.8 ships the flat-array matcher with pagination and pseudocodes the slab in §8.4. Implementing it is well-scoped homework.
 - **Real Pyth integration.** Ch.9 uses a mock; the §9.5 migration table is the one-page diff to switch to real Pyth.
 
 Things you'd add for a real production deployment:

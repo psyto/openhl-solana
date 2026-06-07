@@ -1,0 +1,23 @@
+[package]
+name = "slab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Chapter 15 worked example: drives openhl-core's slab order-book instructions. --create allocates the per-market Slab PDA; --place inserts via critbit; --match crosses the opposite side with a pagination cap; default action dumps the slab summary (active count + best bid/ask)."
+
+[[bin]]
+name = "slab"
+path = "src/main.rs"
+
+[dependencies]
+openhl-state = { path = "../../crates/state" }
+openhl-core = { path = "../../programs/openhl-core", features = ["no-entrypoint"] }
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+solana-program = { workspace = true }
+solana-system-interface = { workspace = true }
+bytemuck = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

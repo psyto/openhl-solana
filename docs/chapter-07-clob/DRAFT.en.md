@@ -201,7 +201,7 @@ When Chapter 8 needs to actually move tokens (CPI to SPL Token, which is itself 
 - Raise the CU limit via `ComputeBudgetInstruction::set_compute_unit_limit` — the band-aid
 - Limit matching per-instruction to N crossings and require multiple matcher invocations — the workaround
 
-Chapter 8 explores all three and explains why slab is the only one that actually scales. For now, the flat array is correct, slow, and visibly so. That visibility is the prerequisite for understanding what the refactor buys us.
+Chapter 8 explores all three and explains why slab is the only one that actually scales; Chapter 15 ships the slab implementation. For now, the flat array is correct, slow, and visibly so. That visibility is the prerequisite for understanding what the refactor buys us.
 
 **What Anchor hides:** Anchor's `#[account(zero_copy)]` attribute makes `bytemuck`-cast accounts available with typed field access. It does nothing about choosing the right data structure — that decision is yours regardless of the framework. Anchor programs with naive `Vec<Order>` book layouts blow CU budgets just as fast as ours would in the matcher.
 

@@ -47,6 +47,10 @@ See [`docs/`](./docs/) for chapter drafts. Published lessons live on SolDojo.
 13. Builder Codes as Protocol Primitive
 14. Cranks, Keepers, and Off-Chain Glue
 
+### Appendix
+
+15. Slab Order Book (the §8.4 critbit design, implemented)
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).

@@ -1485,7 +1485,7 @@ dependencies = [
  "futures-task",
  "memchr",
  "pin-project-lite",
- "slab",
+ "slab 0.4.12",
 ]
 
 [[package]]
@@ -2692,7 +2692,7 @@ dependencies = [
  "rustls 0.23.40",
  "rustls-pki-types",
  "rustls-platform-verifier",
- "slab",
+ "slab 0.4.12",
  "thiserror 2.0.18",
  "tinyvec",
  "tracing",
@@ -3349,6 +3349,21 @@ name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
+
+[[package]]
+name = "slab"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "clap",
+ "openhl-core",
+ "openhl-state",
+ "solana-client",
+ "solana-program",
+ "solana-sdk",
+ "solana-system-interface",
+]
 
 [[package]]
 name = "slab"
