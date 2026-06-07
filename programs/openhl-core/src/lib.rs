@@ -120,6 +120,17 @@
 //!                           One-shot bootstrap: allocates the per-
 //!                           (quote_mint) fee_vault token account
 //!                           owned by [b"fee_vault_auth", quote_mint].
+//!  27  CreateInsuranceFund — written for Chapter 11 §11.6 insurance
+//!                           fund. One-shot per-market bootstrap:
+//!                           allocates the InsuranceFund state PDA
+//!                           and the per-(market, mint) insurance
+//!                           fund token account (authority = the
+//!                           vault_authority PDA shared with the
+//!                           position vault).
+//!  28  InsuranceFundDeposit — also Chapter 11 §11.6
+//!                           Permissionless. Transfer quote tokens
+//!                           into the fund and credit the on-chain
+//!                           balance + total_deposits counter.
 //!
 //! The entire program is one file on purpose. Splitting it into the usual
 //! `instruction.rs` / `processor.rs` / `state.rs` modules buys nothing
@@ -129,11 +140,11 @@
 #![allow(unexpected_cfgs)] // solana_program::entrypoint! gates on `target_os = "solana"`
 
 use openhl_state::{
-    side, BuilderProfile, FundingState, Market, Oracle, Order, OrderBook, Position, Stats,
-    TradingVault, VaultShare, BUILDER_PROFILE_DISCRIMINATOR, FUNDING_DISCRIMINATOR,
-    MARKET_DISCRIMINATOR, ORACLE_DISCRIMINATOR, ORDER_BOOK_DISCRIMINATOR, ORDER_CAPACITY,
-    POSITION_DISCRIMINATOR, STATS_DISCRIMINATOR, TRADING_VAULT_DISCRIMINATOR,
-    VAULT_SHARE_DISCRIMINATOR,
+    side, BuilderProfile, FundingState, InsuranceFund, Market, Oracle, Order, OrderBook, Position,
+    Stats, TradingVault, VaultShare, BUILDER_PROFILE_DISCRIMINATOR, FUNDING_DISCRIMINATOR,
+    INSURANCE_FUND_DISCRIMINATOR, MARKET_DISCRIMINATOR, ORACLE_DISCRIMINATOR,
+    ORDER_BOOK_DISCRIMINATOR, ORDER_CAPACITY, POSITION_DISCRIMINATOR, STATS_DISCRIMINATOR,
+    TRADING_VAULT_DISCRIMINATOR, VAULT_SHARE_DISCRIMINATOR,
 };
 use solana_program::{
     account_info::AccountInfo,
@@ -283,6 +294,24 @@ pub const FEE_VAULT_SEED: &[u8] = b"fee_vault";
 /// Full seed list: `[FEE_VAULT_AUTH_SEED, quote_mint.as_ref(), &[bump]]`.
 pub const FEE_VAULT_AUTH_SEED: &[u8] = b"fee_vault_auth";
 
+/// PDA seed prefix for the per-market insurance-fund state account.
+///
+/// Full seed list: `[INSURANCE_FUND_SEED, market.as_ref(), &[bump]]`.
+pub const INSURANCE_FUND_SEED: &[u8] = b"insurance_fund";
+
+/// PDA seed prefix for the per-(market, mint) insurance-fund token
+/// account. SPL Token owns the account; authority is the same
+/// `vault_authority` PDA at `[VAULT_AUTH_SEED, market]` that signs
+/// position-vault transfers, so no new authority PDA is needed.
+///
+/// Full seed list: `[INSURANCE_FUND_TOKEN_SEED, market.as_ref(), mint.as_ref(), &[bump]]`.
+pub const INSURANCE_FUND_TOKEN_SEED: &[u8] = b"insurance_fund_token";
+
+/// Fraction of every liquidation penalty (in bps) routed into the
+/// per-market insurance fund. The remainder goes to the liquidator as
+/// their bounty. `5000` = 50%.
+pub const INSURANCE_FUND_PENALTY_SHARE_BPS: u64 = 5000;
+
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
 
@@ -328,6 +357,8 @@ pub fn process_instruction(
         24 => process_place_order_with_builder(program_id, accounts, payload),
         25 => process_claim_builder_fees(program_id, accounts, payload),
         26 => process_create_fee_vault(program_id, accounts, payload),
+        27 => process_create_insurance_fund(program_id, accounts, payload),
+        28 => process_insurance_fund_deposit(program_id, accounts, payload),
         unknown => {
             msg!("unknown instruction tag: {}", unknown);
             Err(ProgramError::InvalidInstructionData)
@@ -2113,6 +2144,30 @@ fn verify_fee_vault_authority(
     Ok(bump)
 }
 
+/// Verify the passed insurance_fund_token account matches the derived
+/// PDA at `[INSURANCE_FUND_TOKEN_SEED, market, mint]` and is owned by
+/// SPL Token.
+fn verify_insurance_fund_token_account(
+    fund_token_ai: &AccountInfo,
+    market_key: &Pubkey,
+    mint_key: &Pubkey,
+    program_id: &Pubkey,
+) -> ProgramResult {
+    let (expected, _bump) = Pubkey::find_program_address(
+        &[INSURANCE_FUND_TOKEN_SEED, market_key.as_ref(), mint_key.as_ref()],
+        program_id,
+    );
+    if fund_token_ai.key != &expected {
+        msg!("insurance_fund_token_account does not match derived PDA");
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if fund_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        msg!("insurance_fund_token_account not owned by SPL Token");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    Ok(())
+}
+
 /// SPL Token Transfer where the source's authority is the per-market
 /// vault PDA at `[VAULT_AUTH_SEED, market]`. The program signs for the PDA
 /// via `invoke_signed` with the matching seeds + bump.
@@ -2344,16 +2399,19 @@ fn process_open_position(
 /// Payload: empty.
 ///
 /// Accounts:
-///   0. `[SIGNER]` user            — must match the position's owner
+///   0. `[SIGNER]` user                 — must match the position's owner
 ///   1. `[WRITE]`  position
 ///   2. `[]`       oracle
 ///   3. `[]`       funding
-///   4. `[]`       market          — needed for vault-PDA derivation
-///   5. `[]`       mint            — quote-asset SPL Mint
-///   6. `[WRITE]`  user_token      — destination of the payout
-///   7. `[WRITE]`  vault_token     — PDA at [b"vault", market, mint]
-///   8. `[]`       vault_authority — PDA at [b"vault_auth", market]
+///   4. `[]`       market               — needed for vault-PDA derivation
+///   5. `[]`       mint                 — quote-asset SPL Mint
+///   6. `[WRITE]`  user_token           — destination of the payout
+///   7. `[WRITE]`  vault_token          — PDA at [b"vault", market, mint]
+///   8. `[]`       vault_authority      — PDA at [b"vault_auth", market]
 ///   9. `[]`       token_program
+///  10. `[WRITE]`  insurance_fund       — InsuranceFund state PDA
+///  11. `[WRITE]`  insurance_fund_token — fund's token account; supplies the
+///                                        shortfall drain on underwater close
 fn process_close_position(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -2373,6 +2431,8 @@ fn process_close_position(
     let vault_token_ai = accounts.get(7).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let vault_authority_ai = accounts.get(8).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let token_ai = accounts.get(9).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let fund_ai = accounts.get(10).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let fund_token_ai = accounts.get(11).ok_or(ProgramError::NotEnoughAccountKeys)?;
 
     if !user_ai.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -2386,14 +2446,19 @@ fn process_close_position(
     if user_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
         return Err(ProgramError::IncorrectProgramId);
     }
+    if fund_ai.owner != program_id || fund_ai.data_len() != InsuranceFund::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
     verify_vault_token_account(vault_token_ai, market_ai.key, mint_ai.key, program_id)?;
     let vault_auth_bump = verify_vault_authority(vault_authority_ai, market_ai.key, program_id)?;
+    verify_insurance_fund_token_account(fund_token_ai, market_ai.key, mint_ai.key, program_id)?;
 
     let mark = read_fresh_oracle(oracle_ai, program_id)?;
     let funding_now = read_funding_index(funding_ai, program_id)?;
 
     // Compute realized payout inside a borrow-scope, then drop the borrow
     // before doing the CPI (the CPI may need to re-borrow vault state).
+    let equity: i128;
     let payout: u64;
     {
         let mut data = position_ai.try_borrow_mut_data()?;
@@ -2412,7 +2477,7 @@ fn process_close_position(
             return Err(ProgramError::InvalidArgument);
         }
 
-        let equity = compute_equity(position, mark, funding_now);
+        equity = compute_equity(position, mark, funding_now);
         msg!(
             "close_position: size={} entry={} mark={} equity={}",
             position.size,
@@ -2421,9 +2486,8 @@ fn process_close_position(
             equity
         );
 
-        // Underwater closes pay 0 to the user. The deposited collateral
-        // (in the vault) becomes a shortfall the protocol absorbs — the
-        // insurance-fund hook in §11.6 is the right place to socialize it.
+        // Underwater closes pay 0 to the user. The insurance-fund drain
+        // below covers the protocol's logical shortfall in the same tx.
         payout = if equity < 0 { 0 } else { equity as u64 };
 
         // Close the position record. collateral=0 because the value has
@@ -2434,8 +2498,45 @@ fn process_close_position(
         position.funding_snapshot_index = funding_now;
     }
 
-    // Vault → user transfer for the realized payout. Vault PDA signs via
-    // invoke_signed with [b"vault_auth", market] seeds.
+    // Shortfall drain — symmetric with Liquidate. equity < 0 draws
+    // min(-equity, fund.balance) from the fund into the vault to cover
+    // the protocol's logical loss; updates fund counters.
+    let shortfall_drain: u64;
+    {
+        let mut fund_data = fund_ai.try_borrow_mut_data()?;
+        let fund: &mut InsuranceFund =
+            bytemuck::from_bytes_mut(&mut fund_data[..InsuranceFund::LEN]);
+        if fund.discriminator != INSURANCE_FUND_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        if fund.market != *market_ai.key.as_ref() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if fund.mint != *mint_ai.key.as_ref() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        shortfall_drain = if equity < 0 {
+            let shortfall = (-equity).min(u64::MAX as i128) as u64;
+            shortfall.min(fund.balance)
+        } else {
+            0
+        };
+        fund.balance -= shortfall_drain;
+        fund.total_drawdowns = fund
+            .total_drawdowns
+            .checked_add(shortfall_drain)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+    }
+
+    if shortfall_drain > 0 {
+        msg!(
+            "close_position: equity < 0 — draining {} from fund to vault",
+            shortfall_drain
+        );
+    }
+
+    // Vault → user transfer for the realized payout.
     spl_token_transfer_vault_signed(
         vault_token_ai,
         user_token_ai,
@@ -2444,6 +2545,17 @@ fn process_close_position(
         vault_auth_bump,
         token_ai,
         payout,
+    )?;
+
+    // Fund → vault shortfall drain (if any).
+    spl_token_transfer_vault_signed(
+        fund_token_ai,
+        vault_token_ai,
+        vault_authority_ai,
+        market_ai.key,
+        vault_auth_bump,
+        token_ai,
+        shortfall_drain,
     )?;
 
     msg!("close_position: closed. paid out {} to user", payout);
@@ -2462,10 +2574,14 @@ fn process_close_position(
 ///   6. `[WRITE]`  owner_token       — position owner's token account
 ///                                     (gets the remainder after penalty)
 ///   7. `[WRITE]`  liquidator_token  — liquidator's token account
-///                                     (gets the penalty bounty)
+///                                     (gets the liquidator slice of the penalty)
 ///   8. `[WRITE]`  vault_token       — PDA at [b"vault", market, mint]
 ///   9. `[]`       vault_authority   — PDA at [b"vault_auth", market]
 ///  10. `[]`       token_program
+///  11. `[WRITE]`  insurance_fund    — InsuranceFund state PDA
+///  12. `[WRITE]`  insurance_fund_token — fund's token account; receives
+///                                       the fund slice of the penalty
+///                                       and supplies the shortfall drain
 fn process_liquidate(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -2486,6 +2602,8 @@ fn process_liquidate(
     let vault_token_ai = accounts.get(8).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let vault_authority_ai = accounts.get(9).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let token_ai = accounts.get(10).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let fund_ai = accounts.get(11).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let fund_token_ai = accounts.get(12).ok_or(ProgramError::NotEnoughAccountKeys)?;
 
     if !liquidator_ai.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -2501,14 +2619,20 @@ fn process_liquidate(
     {
         return Err(ProgramError::IncorrectProgramId);
     }
+    if fund_ai.owner != program_id || fund_ai.data_len() != InsuranceFund::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
     verify_vault_token_account(vault_token_ai, market_ai.key, mint_ai.key, program_id)?;
     let vault_auth_bump = verify_vault_authority(vault_authority_ai, market_ai.key, program_id)?;
+    verify_insurance_fund_token_account(fund_token_ai, market_ai.key, mint_ai.key, program_id)?;
 
     let mark = read_fresh_oracle(oracle_ai, program_id)?;
     let funding_now = read_funding_index(funding_ai, program_id)?;
 
-    let penalty_amount: u64;
+    let equity: i128;
+    let liquidator_amount: u64;
     let owner_amount: u64;
+    let fund_slice_amount: u64;
     {
         let mut data = position_ai.try_borrow_mut_data()?;
         let position: &mut Position =
@@ -2522,7 +2646,7 @@ fn process_liquidate(
             return Err(ProgramError::InvalidArgument);
         }
 
-        let equity = compute_equity(position, mark, funding_now);
+        equity = compute_equity(position, mark, funding_now);
         let notional_val = notional(position.size, mark);
         let maint_required =
             (notional_val * (MAINT_MARGIN_BPS as u128) / 10_000) as i128;
@@ -2544,23 +2668,32 @@ fn process_liquidate(
             return Err(ProgramError::InvalidArgument);
         }
 
-        // Liquidator's penalty bounty (cap to LIQUIDATION_PENALTY_BPS of
-        // notional, but never more than the equity that survives).
+        // Total penalty (cap to LIQUIDATION_PENALTY_BPS of notional, but
+        // never more than the equity that survives — at equity ≤ 0 the
+        // penalty is zero).
         let raw_penalty = (notional_val * (LIQUIDATION_PENALTY_BPS as u128) / 10_000)
             .min(i64::MAX as u128) as i128;
         let equity_positive = if equity < 0 { 0 } else { equity };
         let penalty = raw_penalty.min(equity_positive);
         let owner_remainder = (equity_positive - penalty).max(0);
 
-        penalty_amount = penalty as u64;
+        // Split the penalty: INSURANCE_FUND_PENALTY_SHARE_BPS to the fund,
+        // remainder to the liquidator. Floor-division keeps the liquidator
+        // slice ≥ floor(penalty / 2) at the 5000 bps split.
+        let fund_slice =
+            ((penalty as u128) * (INSURANCE_FUND_PENALTY_SHARE_BPS as u128) / 10_000) as i128;
+        let liquidator_slice = penalty - fund_slice;
+
+        liquidator_amount = liquidator_slice as u64;
         owner_amount = owner_remainder as u64;
+        fund_slice_amount = fund_slice as u64;
 
         msg!(
-            "liquidate: penalty={} (to {}), owner_remainder={} (to {})",
-            penalty_amount,
-            liquidator_ai.key,
-            owner_amount,
-            Pubkey::new_from_array(position.user)
+            "liquidate: penalty={} -> liquidator={} fund={}, owner_remainder={}",
+            penalty,
+            liquidator_amount,
+            fund_slice_amount,
+            owner_amount
         );
 
         position.collateral = 0;
@@ -2569,7 +2702,56 @@ fn process_liquidate(
         position.funding_snapshot_index = funding_now;
     }
 
-    // (a) Vault → liquidator transfer for the penalty.
+    // Update fund state: credit the penalty slice, then debit any shortfall
+    // drain. equity < 0 means the position lost more than it had — the fund
+    // covers up to min(-equity, fund.balance) by Transferring into the
+    // vault, which is the bookkeeping side of "the protocol is made whole."
+    let shortfall_drain: u64;
+    {
+        let mut fund_data = fund_ai.try_borrow_mut_data()?;
+        let fund: &mut InsuranceFund =
+            bytemuck::from_bytes_mut(&mut fund_data[..InsuranceFund::LEN]);
+        if fund.discriminator != INSURANCE_FUND_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        if fund.market != *market_ai.key.as_ref() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if fund.mint != *mint_ai.key.as_ref() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        fund.balance = fund
+            .balance
+            .checked_add(fund_slice_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        fund.total_deposits = fund
+            .total_deposits
+            .checked_add(fund_slice_amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+
+        shortfall_drain = if equity < 0 {
+            let shortfall = (-equity).min(u64::MAX as i128) as u64;
+            shortfall.min(fund.balance)
+        } else {
+            0
+        };
+
+        fund.balance -= shortfall_drain;
+        fund.total_drawdowns = fund
+            .total_drawdowns
+            .checked_add(shortfall_drain)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+    }
+
+    if shortfall_drain > 0 {
+        msg!(
+            "liquidate: equity < 0 — draining {} from fund to vault",
+            shortfall_drain
+        );
+    }
+
+    // (a) Vault → liquidator slice of penalty.
     spl_token_transfer_vault_signed(
         vault_token_ai,
         liquidator_token_ai,
@@ -2577,10 +2759,21 @@ fn process_liquidate(
         market_ai.key,
         vault_auth_bump,
         token_ai,
-        penalty_amount,
+        liquidator_amount,
     )?;
 
-    // (b) Vault → position-owner transfer for whatever's left.
+    // (b) Vault → insurance fund slice of penalty.
+    spl_token_transfer_vault_signed(
+        vault_token_ai,
+        fund_token_ai,
+        vault_authority_ai,
+        market_ai.key,
+        vault_auth_bump,
+        token_ai,
+        fund_slice_amount,
+    )?;
+
+    // (c) Vault → position owner remainder.
     spl_token_transfer_vault_signed(
         vault_token_ai,
         owner_token_ai,
@@ -2589,6 +2782,17 @@ fn process_liquidate(
         vault_auth_bump,
         token_ai,
         owner_amount,
+    )?;
+
+    // (d) Fund → vault shortfall drain (if equity was negative).
+    spl_token_transfer_vault_signed(
+        fund_token_ai,
+        vault_token_ai,
+        vault_authority_ai,
+        market_ai.key,
+        vault_auth_bump,
+        token_ai,
+        shortfall_drain,
     )?;
 
     Ok(())
@@ -3530,5 +3734,274 @@ fn process_create_fee_vault(
     )?;
 
     msg!("fee vault created (fee_vault bump {})", fee_vault_bump);
+    Ok(())
+}
+
+// =============================================================================
+// Insurance fund — CreateInsuranceFund + InsuranceFundDeposit (Chapter 11 §11.6).
+// =============================================================================
+//
+// Two account stack per market:
+//   • InsuranceFund state PDA at [b"insurance_fund", market] — program-owned,
+//     stores balance / total_deposits / total_drawdowns counters.
+//   • insurance_fund_token PDA at [b"insurance_fund_token", market, mint] —
+//     owned by SPL Token, authority is the per-market vault_authority PDA
+//     (the same one signing position-vault transfers). Reusing that authority
+//     keeps the on-chain authority surface small — one signer per market
+//     controls both the position vault and the insurance fund vault.
+//
+// The on-chain `balance` counter is redundant with the SPL Token account's
+// balance; it exists for cheap read-side access (scripts/indexers don't have
+// to parse SPL Token data) and to make the chapter's invariants debuggable.
+// Every handler that touches one touches the other in the same instruction.
+
+const CREATE_INSURANCE_FUND_PAYLOAD_LEN: usize = 0;
+const INSURANCE_FUND_DEPOSIT_PAYLOAD_LEN: usize = 8; // amount u64 LE
+
+/// Payload: empty.
+///
+/// Accounts:
+///   0. `[WRITE, SIGNER]` payer
+///   1. `[]`              market
+///   2. `[]`              mint              — quote_mint
+///   3. `[WRITE]`         fund              — InsuranceFund state PDA
+///   4. `[WRITE]`         fund_token        — token-account PDA
+///   5. `[]`              vault_authority   — reused from Chapter 6
+///   6. `[]`              system_program
+///   7. `[]`              spl_token_program
+fn process_create_insurance_fund(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != CREATE_INSURANCE_FUND_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let payer_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let market_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let mint_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let fund_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let fund_token_ai = accounts.get(4).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let vault_auth_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let system_ai = accounts.get(6).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let token_ai = accounts.get(7).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !payer_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if market_ai.owner != program_id || market_ai.data_len() != Market::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if mint_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if system_ai.key != &system_program::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if token_ai.key != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    // Cross-check mint matches market.quote_mint — the fund only holds the
+    // quote currency the market trades in.
+    {
+        let market_data = market_ai.try_borrow_data()?;
+        let market: &Market = bytemuck::from_bytes(&market_data[..Market::LEN]);
+        if market.discriminator != MARKET_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        if market.quote_mint != *mint_ai.key.as_ref() {
+            msg!("create_insurance_fund: mint != market.quote_mint");
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
+
+    // Derive + validate all three PDAs.
+    let (expected_fund, fund_bump) =
+        Pubkey::find_program_address(&[INSURANCE_FUND_SEED, market_ai.key.as_ref()], program_id);
+    if fund_ai.key != &expected_fund {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let (expected_token, token_bump) = Pubkey::find_program_address(
+        &[
+            INSURANCE_FUND_TOKEN_SEED,
+            market_ai.key.as_ref(),
+            mint_ai.key.as_ref(),
+        ],
+        program_id,
+    );
+    if fund_token_ai.key != &expected_token {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let (expected_auth, _auth_bump) =
+        Pubkey::find_program_address(&[VAULT_AUTH_SEED, market_ai.key.as_ref()], program_id);
+    if vault_auth_ai.key != &expected_auth {
+        msg!("create_insurance_fund: vault_authority does not match derived PDA");
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // (1) Allocate the InsuranceFund state PDA, owned by us.
+    let rent_fund = Rent::get()?.minimum_balance(InsuranceFund::LEN);
+    let create_fund_ix = system_instruction::create_account(
+        payer_ai.key,
+        fund_ai.key,
+        rent_fund,
+        InsuranceFund::LEN as u64,
+        program_id,
+    );
+    invoke_signed(
+        &create_fund_ix,
+        &[payer_ai.clone(), fund_ai.clone(), system_ai.clone()],
+        &[&[INSURANCE_FUND_SEED, market_ai.key.as_ref(), &[fund_bump]]],
+    )?;
+
+    // Initialize state.
+    {
+        let mut data = fund_ai.try_borrow_mut_data()?;
+        let fund: &mut InsuranceFund =
+            bytemuck::from_bytes_mut(&mut data[..InsuranceFund::LEN]);
+        fund.discriminator = INSURANCE_FUND_DISCRIMINATOR;
+        fund.bump = fund_bump;
+        fund._pad0 = [0u8; 7];
+        fund.market.copy_from_slice(market_ai.key.as_ref());
+        fund.mint.copy_from_slice(mint_ai.key.as_ref());
+        fund.balance = 0;
+        fund.total_deposits = 0;
+        fund.total_drawdowns = 0;
+        fund._reserved = [0u8; 32];
+    }
+
+    // (2) Allocate the insurance_fund_token account, owned by SPL Token.
+    let rent_token = Rent::get()?.minimum_balance(TOKEN_ACCOUNT_LEN);
+    let create_token_ix = system_instruction::create_account(
+        payer_ai.key,
+        fund_token_ai.key,
+        rent_token,
+        TOKEN_ACCOUNT_LEN as u64,
+        &SPL_TOKEN_PROGRAM_ID,
+    );
+    invoke_signed(
+        &create_token_ix,
+        &[payer_ai.clone(), fund_token_ai.clone(), system_ai.clone()],
+        &[&[
+            INSURANCE_FUND_TOKEN_SEED,
+            market_ai.key.as_ref(),
+            mint_ai.key.as_ref(),
+            &[token_bump],
+        ]],
+    )?;
+
+    // (3) InitializeAccount3 with the vault_authority PDA as owner. Reusing
+    // the position-vault authority keeps the signer surface to one PDA per
+    // market — Liquidate / ClosePosition already sign as this PDA, so the
+    // shortfall drain reuses the same invoke_signed call path.
+    let mut init_data = Vec::with_capacity(1 + 32);
+    init_data.push(spl_token_ix::INITIALIZE_ACCOUNT_3);
+    init_data.extend_from_slice(vault_auth_ai.key.as_ref());
+    let init_ix = Instruction {
+        program_id: SPL_TOKEN_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*fund_token_ai.key, false),
+            AccountMeta::new_readonly(*mint_ai.key, false),
+        ],
+        data: init_data,
+    };
+    invoke(
+        &init_ix,
+        &[fund_token_ai.clone(), mint_ai.clone(), token_ai.clone()],
+    )?;
+
+    msg!(
+        "insurance fund created (state bump {}, token bump {})",
+        fund_bump,
+        token_bump
+    );
+    Ok(())
+}
+
+/// Payload: [amount u64 LE]
+///
+/// Accounts:
+///   0. `[SIGNER]` depositor          — authority on depositor_token
+///   1. `[WRITE]`  fund               — InsuranceFund state PDA
+///   2. `[]`       market
+///   3. `[]`       mint
+///   4. `[WRITE]`  depositor_token    — source
+///   5. `[WRITE]`  fund_token         — destination
+///   6. `[]`       token_program
+///
+/// Permissionless. Anyone can seed the fund — most commonly the protocol
+/// itself, but in practice donations or admin top-ups are valid uses too.
+fn process_insurance_fund_deposit(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != INSURANCE_FUND_DEPOSIT_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let amount = u64::from_le_bytes(payload[0..8].try_into().expect("8 bytes"));
+    if amount == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let depositor_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let fund_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let market_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let mint_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let depositor_token_ai = accounts.get(4).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let fund_token_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let token_ai = accounts.get(6).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !depositor_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if fund_ai.owner != program_id || fund_ai.data_len() != InsuranceFund::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if token_ai.key != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if depositor_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    verify_insurance_fund_token_account(fund_token_ai, market_ai.key, mint_ai.key, program_id)?;
+
+    // Update counters inside borrow scope; release before Transfer CPI.
+    {
+        let mut data = fund_ai.try_borrow_mut_data()?;
+        let fund: &mut InsuranceFund =
+            bytemuck::from_bytes_mut(&mut data[..InsuranceFund::LEN]);
+        if fund.discriminator != INSURANCE_FUND_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        if fund.market != *market_ai.key.as_ref() {
+            msg!("insurance_fund_deposit: market does not match fund.market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if fund.mint != *mint_ai.key.as_ref() {
+            msg!("insurance_fund_deposit: mint does not match fund.mint");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        fund.balance = fund
+            .balance
+            .checked_add(amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        fund.total_deposits = fund
+            .total_deposits
+            .checked_add(amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+    }
+
+    spl_token_transfer_user_signed(
+        depositor_token_ai,
+        fund_token_ai,
+        depositor_ai,
+        token_ai,
+        amount,
+    )?;
+
+    msg!("insurance_fund_deposit: {} credited to fund", amount);
     Ok(())
 }

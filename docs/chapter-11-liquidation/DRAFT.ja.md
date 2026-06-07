@@ -1,7 +1,7 @@
 # 第11章 — ポジション ライフサイクルと清算エンジン
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Position`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（ヘルパ + `process_open_position` 1881–1993 行、`process_close_position` 1995–2061 行、`process_liquidate` 2063–2152 行）、[`scripts/position/src/main.rs`](../../scripts/position/src/main.rs)。
+> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Position`、`InsuranceFund`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（ヘルパ + `process_open_position`、`process_close_position`、`process_liquidate`、`process_create_insurance_fund`、`process_insurance_fund_deposit`）、[`scripts/position/src/main.rs`](../../scripts/position/src/main.rs)。
 
 ---
 
@@ -13,11 +13,11 @@
 
 1. **`OpenPosition`** — (user, market) ごとの Position PDA を作成し、entry 価格をオラクルから読み、後の決済のために累積ファンディング指数をスナップショットし、初期証拠金要件を検証し、**担保をエスクロー**する。ユーザの quote トークンアカウントから market vault（第 6 章で組み立てた (market, mint) ごとの vault）へ SPL Token Transfer を CPI する。
 2. **`ClosePosition`** — 所有者の退出。第 10 章のスナップショット パターンでファンディングを決済し、実現 PnL = `size × (mark - entry)` を計算し、**実現額を vault からユーザに戻す** — vault authority PDA が署名する SPL Token CPI（`invoke_signed` を `[b"vault_auth", market]` シードで）— その上で position をゼロ化する。
-3. **`Liquidate`** — 誰でも他者の水没ポジションに対して行える退出。equity を計算し、維持証拠金と比較し、ポジションが下回っていれば現行マークで強制クローズする。**ハンドラ内で 2 つの SPL Token CPI を走らせる**: vault → 清算者にペナルティ bounty、vault → ポジション所有者に残額。両方とも vault authority PDA が署名する。
+3. **`Liquidate`** — 誰でも他者の水没ポジションに対して行える退出。equity を計算し、維持証拠金と比較し、ポジションが下回っていれば現行マークで強制クローズする。**ハンドラ内で 4 つの SPL Token CPI を走らせる**: vault → 清算者（ペナルティの清算者側スライス）、vault → 保険基金（基金側スライス）、vault → ポジション所有者（残額）、そして水没時の fund → vault（不足分の drain）。すべて vault authority PDA が署名する。
 
 担保は本物の perp DEX が置く場所 — プログラムの vault トークンアカウント、SPL Token 所有、`invoke_signed` 経由でしか動かせない PDA が制御 — に住む。ポジション レコードは**簿記**（size、entry 価格、snapshot index）を持つ。vault は**お金**を持つ。両者は同期を保つ、すべての状態遷移が簿記と CPI を同じハンドラ内でアトミックに更新するからだ。
 
-本章に残るスコープ正直性ノートは 1 つ: **保険基金**。ポジションが水没でクローズしたとき（`equity < 0`）、預けられた担保はすでに vault に座っている — そして本プログラムは現状その残余を損失吸収に任せる。本番では各清算ペナルティの一部を `InsuranceFund` アカウントに回し、水没クローズで不足分が発生したら基金から引き出し、基金が空になって初めて LP プールに社会化する。§11.6 で論じるが実装はしない。それ自体が後続章のテーマだ。
+本章は §11.6 の **保険基金** も出荷する: market ごとの `InsuranceFund` PDA + 専用トークン アカウント。各清算ペナルティの設定可能な一部（`INSURANCE_FUND_PENALTY_SHARE_BPS = 5000`、すなわち半分）を受け取り、水没クローズの不足分をカバーするために drain する。基金のトークン アカウントはポジション vault と authority 共有（`[b"vault_auth", market]`）なので、新たな signer PDA は導入されない。`CreateInsuranceFund` で market ごとに 1 回ブートストラップし、`InsuranceFundDeposit` で誰でも上乗せできる。
 
 ---
 
@@ -48,7 +48,7 @@ load-bearing なフィールド 6 つ、加えて discriminator + bump + padding
 
 **`entry_price: u64`** は `OpenPosition` 時にオラクルから刻印したマーク価格。価格 PnL の参照点: `(mark - entry) × size`。部分クローズのための走行 entry 価格は維持しない。本章の `ClosePosition` は all-or-nothing。部分クローズには各部分での `entry_price` をサイズ加重平均にリセットする必要がある — 有用な拡張だがスコープ外。
 
-**`collateral: u64`** は quote 通貨の証拠金額。ポジション オープン中は厳密に正、水没クローズや清算でゼロまで減少しうる。負にはなれない — 担保を超える損失は保険基金（あるいはスコープ繰り延べ版では単に失われる）に社会化される。
+**`collateral: u64`** は quote 通貨の証拠金額。ポジション オープン中は厳密に正、水没クローズや清算でゼロまで減少しうる。負にはなれない — 担保を超える損失は market ごとの保険基金が（残高の範囲で）吸収する（§11.6）。基金が空になった後の残りの不足分は取引の相手方が被る — autodeleverage はこの章では実装しない（それ自体がアーキテクチャ問題で、§11.6 が今も延期する唯一の保険基金パートだ）。
 
 **`funding_snapshot_index: i64`** は最終タッチ（open、close、liquidate）時の累積ファンディング指数。第 10 章のポジションごとの決済パターンが、これをファンディング会計に必要な唯一のフィールドにする — `funding_now` と `funding_snapshot_index` の差にサイズを掛けたものが、スナップショット以降に蓄積したファンディング PnL だ。
 
@@ -179,7 +179,7 @@ position.funding_snapshot_index = funding_snapshot;
 
 ## §11.4  `ClosePosition` を歩く
 
-`process_close_position`。オープンより単純な部分（PDA 作成なし）と複雑な部分が両方ある: vault authority PDA が `invoke_signed` で署名する outbound SPL Token CPI が加わる。
+`process_close_position`。オープンより単純な部分（PDA 作成なし）と複雑な部分が両方ある: vault authority PDA が `invoke_signed` で署名する outbound SPL Token CPI が 2 つ — ユーザへのペイアウトと（水没クローズ時の）保険基金からの不足分 drain — 加わる。ハンドラは 12 アカウントを取り、最後の 2 つは保険基金の state とトークン アカウント（§11.6）。
 
 **検証 + 所有者チェック**（2007–2024 行）:
 
@@ -239,7 +239,7 @@ spl_token_transfer_vault_signed(
 
 vault authority は `[VAULT_AUTH_SEED, market]` の PDA なので、プログラムが署名する: `invoke_signed` を `[VAULT_AUTH_SEED, market_key, &[bump]]` で。vault トークン アカウントが `payout` 単位を失い、ユーザのトークン アカウントが受け取る。`payout == 0`（水没クローズ）ならヘルパは CPI をスキップ — ゼロ転送に CU を燃やす意味がない。
 
-**水没クローズは担保を失うが、損失を相手方に渡さない。** equity = -50（損失が担保を超える）でクローズするポジションは `payout = 0` をユーザに送る。しかし元々預けた 100 単位はまだ vault に座っており、もはやポジション レコードと結びついていない。その残余が、取引の相手方への暗黙のサブシディだ。本番では InsuranceFund がこれらの残余 + 各清算ペナルティの一部から不足分を適切にカバーする。§11.6 を見よ。
+**水没クローズは保険基金を drain する。** equity = -50 でクローズするポジションは `payout = 0` をユーザに送り、加えてハンドラは `min(50, fund.balance)` を保険基金のトークン アカウントから vault へ drain する。drain は「残余が暗黙のうちに相手方にサブシディする代わりに、プロトコルが不足分をカバーした」の簿記側だ — 基金が枯渇したときの cap 動作も含めた完全な設計は §11.6 を見よ。
 
 > **演習 §11.4.** entry = 100、サイズ = 5、担保 = 100 でポジションをオープンする。オラクルをマーク = 80 に動かす。クローズ。期待される equity は `100 + 5 × (80 - 100) = 0`。クローズ後のユーザの quote トークン残高は、オープン前と変わらないことを確認せよ（payout = 0 — 預けた 100 は vault に入ってそこに留まる）。
 
@@ -247,7 +247,7 @@ vault authority は `[VAULT_AUTH_SEED, market]` の PDA なので、プログラ
 
 ## §11.5  `Liquidate` を歩く
 
-`process_liquidate`。クローズとの重要な違い: **誰でも呼べる**。ハンドラは**2 つの**outbound SPL Token CPI を走らせる — vault → 清算者にペナルティ bounty、vault → ポジション所有者に残額 — 両方とも vault authority PDA が署名する。
+`process_liquidate`。クローズとの重要な違い: **誰でも呼べる**。ハンドラは**4 つの** outbound SPL Token CPI を走らせる — vault → 清算者（ペナルティの清算者側スライス）、vault → 保険基金（基金側スライス）、vault → ポジション所有者（残額）、そして equity < 0 のときの fund → vault（不足分の drain） — すべて同じ vault authority PDA が署名する。ハンドラは 13 アカウントを取り、最後の 2 つは保険基金の state とトークン アカウント（§11.6）。
 
 **検証**: **清算者**は signer でなければならないが、プログラムは清算者がポジションの user と一致するかをチェック**しない**。誰でも誰のポジションに対しても liquidate を呼べる。escrow 側の追加チェック: token_program は SPL Token、`owner_token` と `liquidator_token` は両方とも SPL Token 所有、vault_token は派生 PDA と一致、vault_authority は派生 PDA と一致（bump は下の 2 つの invoke_signed 呼び出しのために捕捉）。
 
@@ -277,7 +277,7 @@ if equity >= maint_required {
 
 `equity >= maintenance_margin` ならポジションは健全で呼び出しは拒否される。清算者は無意味に tx 手数料を払った — 健全ポジションに対する liquidate のスパム呼び出しを小さく抑制する。（本番プロトコルは時にこういうとき tx 手数料を返金するか、清算者が提出前にオフチェーン ヘルス チェックをやることを期待する。）
 
-**ペナルティ適用 + 強制クローズ + 2 つの CPI**:
+**ペナルティ適用（清算者と基金で分割）+ 強制クローズ + 4 つの CPI**:
 
 ```rust
 // 借用スコープ内（ポジション データ参照が CPI 前にドロップするように）:
@@ -287,22 +287,31 @@ let equity_positive = if equity < 0 { 0 } else { equity };
 let penalty = raw_penalty.min(equity_positive);           // 利用可能 equity で上限
 let owner_remainder = (equity_positive - penalty).max(0);
 
-penalty_amount = penalty as u64;
-owner_amount = owner_remainder as u64;
+// INSURANCE_FUND_PENALTY_SHARE_BPS でペナルティを分割（= 5000 → 50/50）。
+let fund_slice = penalty * INSURANCE_FUND_PENALTY_SHARE_BPS / 10_000;
+let liquidator_slice = penalty - fund_slice;
 
 position.collateral = 0;
 position.size = 0;
 position.entry_price = 0;
 position.funding_snapshot_index = funding_now;
+// ─── 借用終了 ───
 
-// ─── 借用スコープ外 ───
-// CPI 1: vault → 清算者
-spl_token_transfer_vault_signed(vault_token_ai, liquidator_token_ai, ..., penalty_amount)?;
-// CPI 2: vault → ポジション所有者
-spl_token_transfer_vault_signed(vault_token_ai, owner_token_ai, ..., owner_amount)?;
+// 基金 state の更新（独自の借用スコープ）:
+//   fund.balance         += fund_slice;
+//   fund.total_deposits  += fund_slice;
+//   shortfall_drain      = if equity < 0 { min(-equity, fund.balance) } else { 0 };
+//   fund.balance         -= shortfall_drain;
+//   fund.total_drawdowns += shortfall_drain;
+
+// その後 4 つの Token Transfer、すべて vault_authority シードで invoke_signed:
+spl_token_transfer_vault_signed(vault_token_ai, liquidator_token_ai, ..., liquidator_slice)?;
+spl_token_transfer_vault_signed(vault_token_ai, fund_token_ai,       ..., fund_slice)?;
+spl_token_transfer_vault_signed(vault_token_ai, owner_token_ai,      ..., owner_remainder)?;
+spl_token_transfer_vault_signed(fund_token_ai,  vault_token_ai,      ..., shortfall_drain)?;
 ```
 
-ペナルティは生き残った equity で上限を取る（残 equity が 10 単位のポジションから 50 単位の bounty を払うことはできない）。2 つの CPI は順次、両方とも同じ vault-authority シードで `invoke_signed`。両方が成功してポジションが完全に巻き戻るか、トランザクション全体が revert する — アトミシティが帳簿を整合させる。
+ペナルティは生き残った equity で上限を取る（残 equity が 10 単位のポジションから 50 単位の bounty を払うことはできない）。4 つの CPI は順次、すべて同じ vault-authority シードで `invoke_signed`。すべてが成功してポジションと基金 state が完全に巻き戻るか、トランザクション全体が revert する。不足分の drain は equity < 0 のパスでのみ非ゼロで発火する。健全な清算ではゼロ額 Transfer をヘルパが短絡する。
 
 ペナルティは 2 つの目的を持つ。
 
@@ -319,25 +328,90 @@ Liquidate ハンドラはポジションが**なぜ**水没したかを検証**�
 
 ---
 
-## §11.6  欠けたピース — 保険基金
+## §11.6  保険基金 — ペナルティ分割と不足分 drain
 
-本章が今もなお実装しないこと 1 つ、本番での役割を明示しておく。
+素のエスクロー パスには 1 つの正直性問題が残る: ポジションが水没（`equity < 0`）でクローズすると、ユーザの預けた担保はすでに vault にあり、ユーザは 0 を受け取り、残余が暗黙のうちに相手方にサブシディする。「プロトコルがこの損失を吸収した」の会計はどこにもなく、vault がいつもより静かなだけだ。保険基金がこの簿記を直すピースだ。
 
-**保険基金。** market ごとの別 `InsuranceFund` アカウントが、水没クローズの不足分をカバーする quote 通貨プールを持つ。パターン:
+### State
 
-```text
-ClosePosition / Liquidate が equity < 0 を計算したとき:
-    shortfall = -equity
-    if insurance_fund.balance >= shortfall:
-        insurance_fund.balance -= shortfall
-        # 相手方は補填され、人生は続く
-    else:
-        # 自動レバ削減か社会化損失 — より大きなアーキテクチャ問題
+market ごとに 2 つの PDA:
+
+```rust
+// crates/state/src/lib.rs
+pub struct InsuranceFund {
+    pub discriminator: [u8; 8],   // INSFUND\0
+    pub bump: u8,
+    pub _pad0: [u8; 7],
+    pub market: [u8; 32],
+    pub mint: [u8; 32],           // quote_mint（market.quote_mint と一致）
+    pub balance: u64,             // トークン アカウント残高をミラー
+    pub total_deposits: u64,      // 観測性
+    pub total_drawdowns: u64,     // 観測性
+    pub _reserved: [u8; 32],
+}
 ```
 
-保険基金は清算ペナルティの一部（例: 50% 清算者、50% 保険基金）、取引手数料、ときに立ち上げ時の取引所エクイティで資金供給される。保険基金なしには、担保不足のすべての損失ポジションが、相手方 — 通常 LP プールか板の残り — に隠れた損失を課す。
+```text
+fund state PDA  : [b"insurance_fund",       market]       — プログラム所有
+fund token PDA  : [b"insurance_fund_token", market, mint] — SPL Token 所有、
+                                                            authority = vault_authority
+                                                            （Liquidate がすでに
+                                                             署名している PDA と同じ）
+```
 
-本書の現行のエスクロー版ハンドラでは、水没クローズの残余は vault に留まる — 物理的には、ユーザの当初預け入れがまだそこにあるが、アクティブなポジションには結びついていない。その残余が暗黙のうちに相手方にサブシディしている。保険基金はこの残余を適切に経路化する: 引き出し時に各清算ペナルティの一部を基金に回し、水没クローズで vault に残余が出るたびに基金から引き出す。会計はそれ自体が小さな章だ（本トラックに加えるなら 15 章目）— 数学は単純、配線は `Liquidate` と `ClosePosition` を触り、新規 `InsuranceFund` PDA が唯一の state 追加だ。
+`vault_authority` を再利用する判断が実装を小さく保つ。ポジション vault と基金 vault は別のトークン アカウントだが、1 つの signer PDA を共有する — `Liquidate` は新たな authority surface を導入せずに `vault → fund` や `fund → vault` Transfer に署名する方法をすでに知っている。オンチェーン `balance` カウンタは SPL Token アカウントの lamport 側残高と冗長だが、スクリプトと indexer に SPL Token バイトをパースせず安価に走行合計へアクセスさせ、章の「自分で検証」テストがそれに直接 assert することを許す。
+
+### ペナルティ分割
+
+`Liquidate` はペナルティを清算者と基金で分割するようになった:
+
+```rust
+let fund_slice = penalty * INSURANCE_FUND_PENALTY_SHARE_BPS / 10_000;  // = penalty / 2
+let liquidator_slice = penalty - fund_slice;
+```
+
+`INSURANCE_FUND_PENALTY_SHARE_BPS = 5000` で、ペナルティの半分が基金への入金として、残りが清算者の bounty として行く。Liquidate ごとに Token Transfer が 2 つから 3 つに増える — vault → 清算者（清算者スライス）、vault → 基金（基金スライス）、vault → 所有者（残額）。
+
+健全な清算（equity > 0、マージン だけ水没のポジション）では、清算者は CU と tx 手数料コストに見合う額を依然受け取る。`LIQUIDATION_PENALTY_BPS = 100` と 50/50 分割で、清算者の実効 bounty は notional の 1% から 0.5% に下がる。本章の値ではこれで構わない。本番チューニングは典型的ポジション サイズ、清算者インフラ コスト、プロトコルが基金をどれだけ積極的に成長させたいかの関数だ。
+
+### 不足分 drain
+
+`ClosePosition` と `Liquidate` の両方が、ハンドラ末尾で同じ drain ロジックを走らせる:
+
+```rust
+let shortfall_drain = if equity < 0 {
+    let shortfall = (-equity).min(u64::MAX as i128) as u64;
+    shortfall.min(fund.balance)        // 基金残高以上の drain はしない
+} else {
+    0
+};
+fund.balance -= shortfall_drain;
+fund.total_drawdowns += shortfall_drain;
+// ... その後: SPL Token Transfer fund_token → vault_token (shortfall_drain)
+```
+
+Transfer は vault へ行き、ユーザには行かない。ユーザは依然として `payout = if equity < 0 { 0 } else { equity }` を受け取る。drain はプロトコルの簿記用だ — vault が黙って吸収するはずの損失を基金がカバーしたことを表す。Transfer は `vault_authority` が署名するので、同じ `invoke_signed` 呼び出しパスが両方に再利用される。
+
+`fund.balance < shortfall` のとき drain は `fund.balance` で頭打ちになる。カバーされなかった残りは**社会化損失**だ: 残余として vault に留まり、暗黙のうちに取引の相手方に落ちる。本番取引所はこれを **autodeleverage**（最も収益性の高い相手方ポジションを損失が完全に吸収されるまで強制クローズする）か **明示的社会化**（同方向のすべてのオープン ポジションを mark down する）で解く。本章は「残余として留まることを許し、cap を文書化する」というシンプルなパスを出荷する — autodeleverage はそれ自体がアーキテクチャ問題だ。
+
+### CreateInsuranceFund + InsuranceFundDeposit
+
+`CreateInsuranceFund` は 1 回限りのブートストラップ、market ごとに 1 回走らせる。第 6 章の `CreateVault` をミラーする — state アカウントとトークン アカウント両方に PDA 署名付き System `create_account`、加えて fund-token の所有者を `vault_authority` に設定する `InitializeAccount3` CPI。
+
+`InsuranceFundDeposit` は permissionless。quote トークンを持つ誰もが基金に credit できる — 最も一般的にはプロトコル チームの初期 seed だが、実際には寄付や管理者のトップアップも有効な用途だ。ハンドラは標準の「借用スコープ内でカウンタ更新、借用解放、末尾で Transfer」パターンで走り、`total_deposits` が `balance` と並んで進む。
+
+### ClosePosition / Liquidate への 2 アカウント追加
+
+両ハンドラのアカウント リストの末尾に 2 つ加わった:
+
+```
+N-2.  [WRITE]  insurance_fund        — InsuranceFund state PDA
+N-1.  [WRITE]  insurance_fund_token  — 基金の SPL トークン アカウント
+```
+
+`ClosePosition` は今や 12 アカウント、`Liquidate` は 13 アカウント。fund-state の書き込み可は カウンタ更新用、fund-token の書き込み可はペナルティ credit Transfer と（水没クローズ時の）不足分 drain 用。
+
+> **演習 §11.6.** ポジションをオープンし、equity が `maint` を割るまでオラクルを逆方向に押す、ただし equity が負になる**前**に止める。Liquidate。ダンプで観察: 基金の `total_deposits` が `fund_slice` ぶん増えるはずだ。次に、同じ market で fresh なポジションをオープンし、オラクルをさらに押して equity をゼロ未満にする。再び Liquidate — `total_drawdowns` が `min(-equity, fund.balance)` ぶん増えるはずだ。基金が不足分を吸収できなくなるのはいつで、そのとき何を出荷するか?
 
 ---
 

@@ -291,7 +291,6 @@ Across fourteen chapters, we built:
 Things explicitly deferred (so they're easy to find later):
 
 - **Slab-based order book.** Ch.8 ships the flat-array matcher with pagination and pseudocodes the slab in §8.4. Implementing it is well-scoped homework.
-- **Insurance fund.** Ch.11 discusses it (§11.6); not in code. Required before underwater closes can be socialized correctly.
 - **Real Pyth integration.** Ch.9 uses a mock; the §9.5 migration table is the one-page diff to switch to real Pyth.
 
 Things you'd add for a real production deployment:

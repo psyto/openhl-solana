@@ -1,7 +1,7 @@
 # Chapter 11 — Position Lifecycle and Liquidation Engine
 
 > Status: draft (v0.1).
-> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Position`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (helpers + `process_open_position` 1881–1993, `process_close_position` 1995–2061, `process_liquidate` 2063–2152), [`scripts/position/src/main.rs`](../../scripts/position/src/main.rs).
+> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Position`, `InsuranceFund`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (helpers + `process_open_position`, `process_close_position`, `process_liquidate`, `process_create_insurance_fund`, `process_insurance_fund_deposit`), [`scripts/position/src/main.rs`](../../scripts/position/src/main.rs).
 
 ---
 
@@ -17,7 +17,7 @@ The chapter ships three instructions, each of which integrates the SPL Token esc
 
 The collateral now lives where a real perp DEX puts it — the program's vault token account, owned by SPL Token, controlled by an `invoke_signed`-only PDA. The position record holds the *bookkeeping* (size, entry price, snapshot index); the vault holds the *money*. The two stay in sync because every state transition that touches the bookkeeping also runs the matching CPI.
 
-One scope-honesty note remains for this chapter: **insurance fund**. When a position closes underwater (`equity < 0`), the deposited collateral is already sitting in the vault — and the program currently lets that residue absorb the loss. In production you'd route a fraction of every liquidation penalty into an `InsuranceFund` account, draw from it when underwater closes leave a shortfall, and only socialize to the LP pool once the fund is empty. We discuss this in §11.6 but don't implement it; that's a follow-up chapter on its own.
+The chapter also ships the §11.6 **insurance fund**: a per-market `InsuranceFund` PDA + dedicated token account that receives a configurable slice (`INSURANCE_FUND_PENALTY_SHARE_BPS = 5000`, i.e. half) of every liquidation penalty and drains to cover underwater-close shortfalls. The fund's token account is authority-shared with the position vault (`[b"vault_auth", market]`), so no new signer PDA is introduced. Bootstrap via `CreateInsuranceFund` once per market; permissionless top-up via `InsuranceFundDeposit`.
 
 ---
 
@@ -48,7 +48,7 @@ Six load-bearing fields, plus discriminator + bump + padding.
 
 **`entry_price: u64`** is the mark price stamped from the oracle at `OpenPosition` time. It's the reference point for price PnL: `(mark - entry) × size`. We do not maintain a running entry-price for partial closes; the chapter's `ClosePosition` is all-or-nothing. Partial closes would require resetting `entry_price` to a size-weighted blend on each partial — a useful extension but not in scope.
 
-**`collateral: u64`** is the quote-currency margin amount. Strictly positive while the position is open; can be reduced to zero by underwater close or liquidation. Cannot go negative — losses beyond collateral are socialized to the insurance fund (or, in our scope-deferred version, just lost).
+**`collateral: u64`** is the quote-currency margin amount. Strictly positive while the position is open; can be reduced to zero by underwater close or liquidation. Cannot go negative — losses beyond collateral are absorbed by the per-market insurance fund up to its balance (§11.6); the residual once the fund is empty falls on whoever holds the other side of the trade (no autodeleverage logic in this chapter — that branch is its own architectural problem and is the only insurance-fund piece §11.6 still defers).
 
 **`funding_snapshot_index: i64`** is the cumulative funding index at the last touch (open, close, liquidate). The per-position settle pattern from Chapter 10 makes this the only field needed for funding accounting — the delta between `funding_now` and `funding_snapshot_index` times `size` is the funding PnL accrued since the snapshot.
 
@@ -179,7 +179,7 @@ Four data writes. `entry_price = mark` stamps the oracle's price as the position
 
 ## §11.4  Walking `ClosePosition`
 
-`process_close_position`. Simpler than open in one dimension (no PDA creation) but more involved in another: it adds an outbound SPL Token CPI signed by the vault authority PDA via `invoke_signed`.
+`process_close_position`. Simpler than open in one dimension (no PDA creation) but more involved in another: it runs two outbound SPL Token CPIs signed by the vault authority PDA via `invoke_signed` — the user payout, and (on underwater close) the insurance fund's shortfall drain. The handler takes 12 accounts; the last two are the insurance fund state and its token account (§11.6).
 
 **Validation + owner check** (lines 2007–2024):
 
@@ -239,7 +239,7 @@ spl_token_transfer_vault_signed(
 
 The vault authority is a PDA at `[VAULT_AUTH_SEED, market]`, so the program signs for it: `invoke_signed` with `[VAULT_AUTH_SEED, market_key, &[bump]]`. The vault token account drops `payout` units; the user's token account receives them. If `payout == 0` (underwater close), the helper skips the CPI — no point burning CU on a zero-amount transfer.
 
-**Underwater closes lose collateral, don't pass losses on.** A position that closes with equity = -50 (loss exceeds collateral) sends `payout = 0` to the user, but the 100 units they originally deposited are still sitting in the vault — now decoupled from any position record. That residue is the implicit subsidy to whoever was on the other side of the trade. In production an InsuranceFund draws on these residues + a fraction of liquidation penalties to cover the shortfalls properly; see §11.6.
+**Underwater closes drain the insurance fund.** A position that closes with equity = -50 sends `payout = 0` to the user, and the handler additionally drains `min(50, fund.balance)` from the insurance fund's token account into the vault. The drain is the bookkeeping side of "the protocol covered the shortfall instead of the residue silently subsidizing the counterparty" — see §11.6 for the full design including the cap behavior when the fund runs dry.
 
 > **Exercise §11.4.** Open a position at entry = 100, size = 5, collateral = 100. Move the oracle to mark = 80. Close. The expected equity is `100 + 5 × (80 - 100) = 0`. Verify the user's quote token balance after the close is unchanged from before the open (because payout = 0 — the 100 they deposited went into the vault and stayed there).
 
@@ -247,7 +247,7 @@ The vault authority is a PDA at `[VAULT_AUTH_SEED, market]`, so the program sign
 
 ## §11.5  Walking `Liquidate`
 
-`process_liquidate`. The crucial difference from close: **anyone can call it**. The handler runs *two* outbound SPL Token CPIs — vault → liquidator for the penalty bounty, vault → position-owner for the remainder — both signed by the vault authority PDA.
+`process_liquidate`. The crucial difference from close: **anyone can call it**. The handler runs *four* outbound SPL Token CPIs — vault → liquidator (the liquidator's slice of the penalty), vault → insurance fund (the fund's slice of the penalty), vault → position-owner (the remainder), and fund → vault (the shortfall drain when equity < 0) — all signed by the same vault authority PDA. The handler takes 13 accounts; the last two are the InsuranceFund state and its token account (§11.6).
 
 **Validation**: the *liquidator* must be a signer, but the program does *not* check that the liquidator matches the position's user. Anyone can call liquidate on anyone's position. Additional escrow-side checks: token_program is SPL Token, both `owner_token` and `liquidator_token` are SPL Token-owned, vault_token matches the derived PDA, vault_authority matches the derived PDA (and the bump is captured for the two invoke_signed calls below).
 
@@ -277,7 +277,7 @@ if equity >= maint_required {
 
 If `equity >= maintenance_margin`, the position is fine and the call is rejected. The liquidator just paid tx fees for nothing — a small disincentive to spam-call liquidate against healthy positions. (Production protocols sometimes refund tx fees when this happens, or simply expect liquidators to do their own off-chain health check before submitting.)
 
-**Apply penalty + force-close + run two CPIs**:
+**Apply penalty (split between liquidator and fund) + force-close + run four CPIs**:
 
 ```rust
 // Inside a borrow scope (so position data ref drops before CPIs):
@@ -287,22 +287,31 @@ let equity_positive = if equity < 0 { 0 } else { equity };
 let penalty = raw_penalty.min(equity_positive);             // cap at available equity
 let owner_remainder = (equity_positive - penalty).max(0);
 
-penalty_amount = penalty as u64;
-owner_amount = owner_remainder as u64;
+// Split the penalty per INSURANCE_FUND_PENALTY_SHARE_BPS (= 5000 → 50/50).
+let fund_slice = penalty * INSURANCE_FUND_PENALTY_SHARE_BPS / 10_000;
+let liquidator_slice = penalty - fund_slice;
 
 position.collateral = 0;
 position.size = 0;
 position.entry_price = 0;
 position.funding_snapshot_index = funding_now;
+// ─── borrow ends ───
 
-// ─── outside the borrow scope ───
-// CPI 1: vault → liquidator
-spl_token_transfer_vault_signed(vault_token_ai, liquidator_token_ai, ..., penalty_amount)?;
-// CPI 2: vault → position owner
-spl_token_transfer_vault_signed(vault_token_ai, owner_token_ai, ..., owner_amount)?;
+// Fund state updates (own borrow scope):
+//   fund.balance         += fund_slice;
+//   fund.total_deposits  += fund_slice;
+//   shortfall_drain      = if equity < 0 { min(-equity, fund.balance) } else { 0 };
+//   fund.balance         -= shortfall_drain;
+//   fund.total_drawdowns += shortfall_drain;
+
+// Then four Token Transfers, all invoke_signed with vault_authority seeds:
+spl_token_transfer_vault_signed(vault_token_ai, liquidator_token_ai, ..., liquidator_slice)?;
+spl_token_transfer_vault_signed(vault_token_ai, fund_token_ai,       ..., fund_slice)?;
+spl_token_transfer_vault_signed(vault_token_ai, owner_token_ai,      ..., owner_remainder)?;
+spl_token_transfer_vault_signed(fund_token_ai,  vault_token_ai,      ..., shortfall_drain)?;
 ```
 
-The penalty is capped at the equity that survives (you can't pay a 50-unit bounty out of a position with 10 units of equity remaining). The two CPIs are sequential, both `invoke_signed` with the same vault-authority seeds. Either both succeed and the position is fully wound down, or the whole transaction reverts — atomicity is what keeps the books consistent.
+The penalty is capped at the equity that survives (you can't pay a 50-unit bounty out of a position with 10 units of equity remaining). The four CPIs are sequential, all `invoke_signed` with the same vault-authority seeds. Either every Transfer succeeds and the position + fund state are fully wound, or the whole transaction reverts. The shortfall drain only fires (non-zero) on the equity < 0 path; on a healthy liquidation it's a 0-amount Transfer that the helper short-circuits.
 
 The penalty serves two purposes:
 
@@ -319,25 +328,90 @@ The Liquidate handler does NOT verify *why* the position is underwater. It could
 
 ---
 
-## §11.6  The missing piece — insurance fund
+## §11.6  Insurance fund — penalty split, shortfall drain
 
-One thing this chapter still does not implement, with its production role called out.
+The vanilla escrow path leaves one honesty problem: when a position closes underwater (`equity < 0`), the user's deposited collateral is already in the vault, the user gets 0, and the residue implicitly subsidizes the counterparty. There's no accounting of "the protocol absorbed this loss" — the vault is just quieter than it should be. The insurance fund is the bookkeeping piece that fixes this.
 
-**Insurance fund.** A separate `InsuranceFund` account per market holds a pool of quote-currency that covers underwater-close shortfalls. The pattern:
+### The state
 
-```text
-when ClosePosition / Liquidate computes equity < 0:
-    shortfall = -equity
-    if insurance_fund.balance >= shortfall:
-        insurance_fund.balance -= shortfall
-        # counterparty made whole, life continues
-    else:
-        # auto-deleverage or socialized loss — bigger architectural question
+Two PDAs per market:
+
+```rust
+// crates/state/src/lib.rs
+pub struct InsuranceFund {
+    pub discriminator: [u8; 8],   // INSFUND\0
+    pub bump: u8,
+    pub _pad0: [u8; 7],
+    pub market: [u8; 32],
+    pub mint: [u8; 32],           // quote_mint (matches market.quote_mint)
+    pub balance: u64,             // mirrors the token-account balance
+    pub total_deposits: u64,      // observability
+    pub total_drawdowns: u64,     // observability
+    pub _reserved: [u8; 32],
+}
 ```
 
-The insurance fund is funded by a fraction of liquidation penalties (e.g., 50% to liquidator, 50% to insurance fund), exchange fees, and sometimes by exchange equity at launch. Without an insurance fund, every losing position with insufficient collateral imposes a hidden loss on whoever was on the other side — usually the LP pool or the rest of the book.
+```text
+fund state PDA  : [b"insurance_fund",       market]      — program-owned
+fund token PDA  : [b"insurance_fund_token", market, mint] — SPL Token-owned,
+                                                             authority = vault_authority
+                                                             (the same PDA Liquidate
+                                                              already signs as)
+```
 
-In our current escrowed handlers, the residue of an underwater close stays in the vault — physically, the user's original deposit is still there, just not associated with any active position. That residue is implicitly subsidizing the counterparty. An insurance fund would route those leftovers properly: a fraction of each liquidation penalty into the fund at withdrawal time, a draw from the fund whenever an underwater close would otherwise leave a vault residue. The accounting is a small chapter on its own (15th in the track if added) — the math is simple, the wiring touches `Liquidate` and `ClosePosition`, and the new `InsuranceFund` PDA is the only state addition.
+Reusing `vault_authority` is the choice that keeps the implementation small. The position vault and the fund vault are different token accounts but share one signer PDA — so `Liquidate` already knows how to sign `vault → fund` or `fund → vault` Transfers without introducing a new authority surface. The on-chain `balance` counter is redundant with the SPL Token account's lamport-side balance, but it gives scripts and indexers cheap access to the running total without parsing SPL Token bytes, and it lets the chapter's "verify yourself" tests assert on it directly.
+
+### Penalty split
+
+`Liquidate` now splits the penalty between the liquidator and the fund:
+
+```rust
+let fund_slice = penalty * INSURANCE_FUND_PENALTY_SHARE_BPS / 10_000;  // = penalty / 2
+let liquidator_slice = penalty - fund_slice;
+```
+
+With `INSURANCE_FUND_PENALTY_SHARE_BPS = 5000`, half the penalty goes to the fund as a deposit, the rest to the liquidator as their bounty. Three Token Transfers fire per liquidate now instead of two — vault → liquidator (liquidator slice), vault → fund (fund slice), vault → owner (remainder).
+
+In a healthy liquidation (equity > 0, position only underwater on margin), the liquidator still gets paid enough to make liquidation worth their CU + tx-fee cost. With `LIQUIDATION_PENALTY_BPS = 100` and the 50/50 split, the liquidator's effective bounty drops from 1% of notional to 0.5%. For our chapter values that's fine; production tuning is a function of typical position size, liquidator infrastructure costs, and how aggressively the protocol wants to grow the fund.
+
+### Shortfall drain
+
+`ClosePosition` and `Liquidate` both run the same drain logic at the end of their handler:
+
+```rust
+let shortfall_drain = if equity < 0 {
+    let shortfall = (-equity).min(u64::MAX as i128) as u64;
+    shortfall.min(fund.balance)        // never drain more than the fund holds
+} else {
+    0
+};
+fund.balance -= shortfall_drain;
+fund.total_drawdowns += shortfall_drain;
+// ... then: SPL Token Transfer fund_token → vault_token (shortfall_drain)
+```
+
+The Transfer goes *into* the vault, not to the user. The user still receives `payout = if equity < 0 { 0 } else { equity }`. The drain is bookkeeping for the protocol — it represents the fund covering the loss the vault would otherwise have absorbed silently. The Transfer is signed by `vault_authority`, the same PDA that signs the vault → user payout, so the same `invoke_signed` call path is reused for both.
+
+When `fund.balance < shortfall` the drain caps at `fund.balance`. The uncovered remainder is a *socialized loss*: it stays in the vault as residue and falls implicitly on whoever holds the other side of the trade. Production exchanges resolve this with **autodeleverage** (force-close the most profitable counterparty positions until the loss is fully absorbed) or **explicit socialization** (mark all open positions in the same direction down). Our chapter ships the simpler path of "let it stay residue, document the cap" — autodeleverage is its own architectural problem.
+
+### CreateInsuranceFund + InsuranceFundDeposit
+
+`CreateInsuranceFund` is the one-shot bootstrap, run once per market. It mirrors `CreateVault` from Chapter 6 — System `create_account` with PDA signing for both the state account and the token account, plus an `InitializeAccount3` CPI to set the fund-token's owner to `vault_authority`.
+
+`InsuranceFundDeposit` is permissionless. Anyone with quote tokens can credit the fund — most commonly the protocol team for initial seed, but in practice donations or admin top-ups are valid uses too. The handler runs in the standard "update counters in borrow scope, drop borrow, Transfer at the end" pattern, with `total_deposits` advancing alongside `balance`.
+
+### Two account additions to ClosePosition / Liquidate
+
+Both handlers grew two accounts at the end of their list:
+
+```
+N-2.  [WRITE]  insurance_fund        — InsuranceFund state PDA
+N-1.  [WRITE]  insurance_fund_token  — fund's SPL token account
+```
+
+`ClosePosition` is now 12 accounts; `Liquidate` is 13. The fund-state writability is for the counter updates; the fund-token writability is for the penalty-credit Transfer and (on underwater close) the shortfall drain.
+
+> **Exercise §11.6.** Open a position, push the oracle hard against it until equity falls below `maint`, but stop *before* equity goes negative. Liquidate. Observe in the dump: the fund's `total_deposits` should grow by `fund_slice`. Now reduce the oracle further to push equity below zero on the same market with a fresh position. Liquidate again — `total_drawdowns` should grow by `min(-equity, fund.balance)`. When does the fund stop being able to absorb shortfalls, and what would you ship at that point?
 
 ---
 

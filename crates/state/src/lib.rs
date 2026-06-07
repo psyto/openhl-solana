@@ -429,6 +429,47 @@ impl BuilderProfile {
     pub const LEN: usize = core::mem::size_of::<Self>();
 }
 
+/// Fixed 8-byte tag identifying an `InsuranceFund` account.
+pub const INSURANCE_FUND_DISCRIMINATOR: [u8; 8] = *b"INSFUND\0";
+
+/// Per-market insurance fund. Holds the bookkeeping side of a separate
+/// SPL Token account at `[INSURANCE_FUND_TOKEN_SEED, market, mint]` that
+/// receives the protocol's slice of liquidation penalties and drains to
+/// cover underwater-close shortfalls. The token-account authority is the
+/// shared per-market vault_authority PDA (the same one signing position
+/// vault transfers in Chapter 11), so no new authority PDA is needed.
+///
+/// Layout (136 bytes):
+/// ```text
+///    0 | 0x00  discriminator         [u8; 8]   — INSFUND\0
+///    8 | 0x08  bump                  u8        — PDA bump
+///    9 | 0x09  _pad0                 [u8; 7]
+///   16 | 0x10  market                [u8; 32]  — owning market
+///   48 | 0x30  mint                  [u8; 32]  — quote mint
+///   80 | 0x50  balance               u64       — mirrors the fund token balance
+///   88 | 0x58  total_deposits        u64       — observability: total ever credited
+///   96 | 0x60  total_drawdowns       u64       — observability: total ever drained
+///  104 | 0x68  _reserved             [u8; 32]
+///  136                                          — total size
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct InsuranceFund {
+    pub discriminator: [u8; 8],
+    pub bump: u8,
+    pub _pad0: [u8; 7],
+    pub market: [u8; 32],
+    pub mint: [u8; 32],
+    pub balance: u64,
+    pub total_deposits: u64,
+    pub total_drawdowns: u64,
+    pub _reserved: [u8; 32],
+}
+
+impl InsuranceFund {
+    pub const LEN: usize = core::mem::size_of::<Self>();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,5 +582,15 @@ mod tests {
     #[test]
     fn builder_profile_discriminator_is_human_readable() {
         assert_eq!(&BUILDER_PROFILE_DISCRIMINATOR, b"BUILDER\0");
+    }
+
+    #[test]
+    fn insurance_fund_size_is_136_bytes() {
+        assert_eq!(InsuranceFund::LEN, 136);
+    }
+
+    #[test]
+    fn insurance_fund_discriminator_is_human_readable() {
+        assert_eq!(&INSURANCE_FUND_DISCRIMINATOR, b"INSFUND\0");
     }
 }

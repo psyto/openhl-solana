@@ -1,39 +1,27 @@
-//! Chapter 11 worked example — drives openhl-core's position lifecycle.
+//! Chapter 11 worked example — drives openhl-core's position lifecycle
+//! including the §11.6 insurance fund.
 //!
 //! Modes (mutually exclusive):
 //!   --open --size <i64> --collateral <u64>   → OpenPosition (tag 16)
 //!   --close                                  → ClosePosition (tag 17)
 //!   --liquidate --target-user <pubkey>       → Liquidate (tag 18)
+//!   --create-insurance-fund                  → CreateInsuranceFund (tag 27)
+//!   --deposit-insurance --amount <u64>       → InsuranceFundDeposit (tag 28)
 //!   (no mode)                                → dump position + computed
 //!                                              equity/notional/maint margin
 //!
-//! All three mutating modes now require --mint (the quote-asset SPL Mint
-//! the market vault holds) and SPL Token accounts. The vault PDA and
-//! vault-authority PDA at [b"vault", market, mint] / [b"vault_auth",
-//! market] must already exist — create them with `create-vault` from
-//! Chapter 6 if needed.
-//!
-//! Usage:
-//!   position --rpc http://127.0.0.1:8899 \
-//!            --payer ~/.config/solana/id.json \
-//!            --program <openhl-core program ID> \
-//!            --market <market PDA> \
-//!            --mint <quote SPL mint> \
-//!            [--open --size 5 --collateral 100
-//!                   --user-token-account <user's quote token account> |
-//!             --close
-//!                   --user-token-account <pubkey> |
-//!             --liquidate --target-user <pubkey>
-//!                         --owner-token-account <pubkey>
-//!                         --liquidator-token-account <pubkey>]
+//! Close and Liquidate now pass the InsuranceFund state PDA and its token
+//! account, so the on-chain handlers can split the liquidation penalty
+//! and drain on underwater closes. Run --create-insurance-fund once per
+//! market before closing or liquidating any position.
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use openhl_core::{
-    FUNDING_SEED, LIQUIDATION_PENALTY_BPS, MAINT_MARGIN_BPS, ORACLE_SEED, POSITION_SEED,
-    SPL_TOKEN_PROGRAM_ID, VAULT_AUTH_SEED, VAULT_SEED,
+    FUNDING_SEED, INSURANCE_FUND_SEED, INSURANCE_FUND_TOKEN_SEED, LIQUIDATION_PENALTY_BPS,
+    MAINT_MARGIN_BPS, ORACLE_SEED, POSITION_SEED, SPL_TOKEN_PROGRAM_ID, VAULT_AUTH_SEED, VAULT_SEED,
 };
-use openhl_state::{Oracle, Position};
+use openhl_state::{InsuranceFund, Oracle, Position};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
@@ -92,6 +80,18 @@ struct Cli {
     /// Required for --liquidate. Typically the liquidator's own ATA.
     #[arg(long)]
     liquidator_token_account: Option<String>,
+
+    /// One-shot bootstrap: allocate the per-market InsuranceFund and its
+    /// token account. Run once per market before --close/--liquidate.
+    #[arg(long)]
+    create_insurance_fund: bool,
+
+    /// Permissionless deposit into the insurance fund. Uses
+    /// --user-token-account as the source.
+    #[arg(long)]
+    deposit_insurance: bool,
+    #[arg(long, requires = "deposit_insurance")]
+    amount: Option<u64>,
 }
 
 fn main() -> Result<()> {
@@ -133,11 +133,17 @@ fn main() -> Result<()> {
     println!("oracle PDA:    {oracle_pda}");
     println!("funding PDA:   {funding_pda}");
 
-    if cli.open || cli.close || cli.liquidate {
+    let mutating = cli.open
+        || cli.close
+        || cli.liquidate
+        || cli.create_insurance_fund
+        || cli.deposit_insurance;
+
+    if mutating {
         let mint: Pubkey = cli
             .mint
             .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--mint required for --open/--close/--liquidate"))?
+            .ok_or_else(|| anyhow::anyhow!("--mint required for mutating modes"))?
             .parse()
             .context("parse --mint")?;
         let (vault_pda, _) = Pubkey::find_program_address(
@@ -148,14 +154,31 @@ fn main() -> Result<()> {
             &[VAULT_AUTH_SEED, market.as_ref()],
             &program_id,
         );
+        let (fund_pda, _) =
+            Pubkey::find_program_address(&[INSURANCE_FUND_SEED, market.as_ref()], &program_id);
+        let (fund_token_pda, _) = Pubkey::find_program_address(
+            &[INSURANCE_FUND_TOKEN_SEED, market.as_ref(), mint.as_ref()],
+            &program_id,
+        );
         println!("mint:          {mint}");
         println!("vault PDA:     {vault_pda}");
         println!("vault_auth:    {vault_auth_pda}");
+        println!("fund PDA:      {fund_pda}");
+        println!("fund_token:    {fund_token_pda}");
         println!();
 
-        let modes_set = [cli.open, cli.close, cli.liquidate].iter().filter(|b| **b).count();
+        let modes_set = [
+            cli.open,
+            cli.close,
+            cli.liquidate,
+            cli.create_insurance_fund,
+            cli.deposit_insurance,
+        ]
+        .iter()
+        .filter(|b| **b)
+        .count();
         if modes_set > 1 {
-            bail!("--open, --close, --liquidate are mutually exclusive");
+            bail!("mutating modes are mutually exclusive");
         }
 
         if cli.open {
@@ -212,6 +235,8 @@ fn main() -> Result<()> {
                     AccountMeta::new(vault_pda, false),
                     AccountMeta::new_readonly(vault_auth_pda, false),
                     AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+                    AccountMeta::new(fund_pda, false),
+                    AccountMeta::new(fund_token_pda, false),
                 ],
                 data: vec![17u8],
             };
@@ -244,8 +269,55 @@ fn main() -> Result<()> {
                     AccountMeta::new(vault_pda, false),
                     AccountMeta::new_readonly(vault_auth_pda, false),
                     AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+                    AccountMeta::new(fund_pda, false),
+                    AccountMeta::new(fund_token_pda, false),
                 ],
                 data: vec![18u8],
+            };
+            send(&client, &payer, ix)?;
+        } else if cli.create_insurance_fund {
+            let ix = Instruction {
+                program_id,
+                accounts: vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(market, false),
+                    AccountMeta::new_readonly(mint, false),
+                    AccountMeta::new(fund_pda, false),
+                    AccountMeta::new(fund_token_pda, false),
+                    AccountMeta::new_readonly(vault_auth_pda, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                    AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+                ],
+                data: vec![27u8],
+            };
+            send(&client, &payer, ix)?;
+        } else if cli.deposit_insurance {
+            let amount = cli.amount.ok_or_else(|| anyhow::anyhow!("--amount required"))?;
+            let user_token: Pubkey = cli
+                .user_token_account
+                .as_deref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("--user-token-account required for --deposit-insurance")
+                })?
+                .parse()
+                .context("parse --user-token-account")?;
+
+            let mut data = Vec::with_capacity(1 + 8);
+            data.push(28u8);
+            data.extend_from_slice(&amount.to_le_bytes());
+
+            let ix = Instruction {
+                program_id,
+                accounts: vec![
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(fund_pda, false),
+                    AccountMeta::new_readonly(market, false),
+                    AccountMeta::new_readonly(mint, false),
+                    AccountMeta::new(user_token, false),
+                    AccountMeta::new(fund_token_pda, false),
+                    AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
+                ],
+                data,
             };
             send(&client, &payer, ix)?;
         }
@@ -294,6 +366,29 @@ fn main() -> Result<()> {
         }
         Ok(_) => println!("  (position account exists but is wrong size)"),
         Err(_) => println!("  (position account does not exist yet)"),
+    }
+
+    // If the user passed --mint, also dump the insurance fund state.
+    if let Some(mint_str) = cli.mint.as_deref() {
+        if let Ok(mint) = mint_str.parse::<Pubkey>() {
+            let (fund_pda, _) =
+                Pubkey::find_program_address(&[INSURANCE_FUND_SEED, market.as_ref()], &program_id);
+            println!();
+            println!("insurance fund ({fund_pda}):");
+            match client.get_account(&fund_pda) {
+                Ok(account) if account.data.len() >= InsuranceFund::LEN => {
+                    let fund: &InsuranceFund =
+                        bytemuck::from_bytes(&account.data[..InsuranceFund::LEN]);
+                    println!("  market:                 {}", Pubkey::new_from_array(fund.market));
+                    println!("  mint:                   {}", Pubkey::new_from_array(fund.mint));
+                    println!("  balance:                {}", fund.balance);
+                    println!("  total_deposits:         {}", fund.total_deposits);
+                    println!("  total_drawdowns:        {}", fund.total_drawdowns);
+                }
+                _ => println!("  (insurance fund does not exist yet)"),
+            }
+            let _ = mint;
+        }
     }
 
     Ok(())
