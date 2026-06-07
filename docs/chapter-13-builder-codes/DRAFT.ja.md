@@ -75,7 +75,7 @@ Builder code は 2 つの手数料シェア キャップが要る、1 つでは�
 
 **Builder 自己キャップ (`BuilderProfile.max_fee_share_bps`)** — この**特定の** builder が留保する最大 fraction。登録時に自己宣言、ユーザに見える。
 
-任意の取引での実効シェアは `min(builder.max_fee_share_bps, PROTOCOL_BUILDER_SHARE_CAP_BPS)`。`programs/openhl-core/src/lib.rs:2742–2748` から:
+任意の取引での実効シェアは `min(builder.max_fee_share_bps, PROTOCOL_BUILDER_SHARE_CAP_BPS)`。`programs/openhl-core/src/lib.rs:4044–4049` から:
 
 ```rust
 share_bps = profile.max_fee_share_bps;

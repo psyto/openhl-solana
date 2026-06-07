@@ -1,7 +1,7 @@
 # 第10章 — ファンディングレートの仕組み
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`FundingState`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_funding_state` 1605–1680 行、`process_update_funding` 1682–1758 行）、[`scripts/funding/src/main.rs`](../../scripts/funding/src/main.rs)。
+> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`FundingState`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_funding_state` 2162–2232 行、`process_update_funding` 2239–2317 行）、[`scripts/funding/src/main.rs`](../../scripts/funding/src/main.rs)。
 
 ---
 
@@ -96,7 +96,7 @@ load-bearing なフィールドは 3 つ。
 
 ## §10.3  `UpdateFunding` を歩く
 
-`programs/openhl-core/src/lib.rs:1682–1758` の `process_update_funding` が唯一の変更子。検証を除いた本体:
+`programs/openhl-core/src/lib.rs:2239–2317` の `process_update_funding` が唯一の変更子。検証を除いた本体:
 
 ```rust
 let new_rate = new_rate_raw
@@ -270,7 +270,7 @@ Sealevel スケジューリングへの影響:
 ### 自分で検証する 3 項目
 
 1. **蓄積子は区分線形。** UpdateFunding 呼び出しを既知の秒数間隔で異なるレートで 3 回走らせよ。各呼び出し後の累積指数は `prior_index + prior_rate × elapsed_seconds` と正確に一致するはずだ（1e9 スケーリングの整数除算内で）。
-2. **クランプが強制される。** `--rate 5000000`（キャップを大きく超える）を試せ。[`lib.rs:1703–1705`](../../programs/openhl-core/src/lib.rs#L1703) のクランプが `MAX_FUNDING_RATE_PER_SEC_ABS = 1_000_000` に縮め、`clamped to` ログ行が見えるはずだ。
+2. **クランプが強制される。** `--rate 5000000`（キャップを大きく超える）を試せ。[`lib.rs:2260–2262`](../../programs/openhl-core/src/lib.rs#L2260) のクランプが `MAX_FUNDING_RATE_PER_SEC_ABS = 1_000_000` に縮め、`clamped to` ログ行が見えるはずだ。
 3. **slot vs 時間の区別が重要。** `UpdateFunding --rate 100` を走らせ、即座に別の `UpdateFunding --rate 200`（同じ slot）を走らせよ。2 回目は `elapsed=0s` を報告し、指数は進まないはずだ。10 秒待って 3 回目を `--rate 0` で走らせる — 今度は `elapsed≈10` が見え、指数は `200 × 10` だけ進むはずだ。
 
 ---

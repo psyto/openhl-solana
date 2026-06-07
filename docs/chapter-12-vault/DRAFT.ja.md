@@ -1,7 +1,7 @@
 # 第12章 — ネイティブ Vault プログラム（プール取引）
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`TradingVault`、`VaultShare`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_trading_vault` 2195–2280 行、`process_vault_deposit` 2282–2413 行、`process_vault_withdraw` 2415–2500 行、`process_vault_update_nav` 2502–2544 行）、[`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs)。
+> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`TradingVault`、`VaultShare`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_trading_vault` 3402–3480 行、`process_vault_deposit` 3494–3655 行、`process_vault_withdraw` 3669–3786 行、`process_vault_update_nav` 3793–3833 行）、[`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs)。
 
 ---
 
@@ -89,7 +89,7 @@ their_value = their_shares × total_assets / total_shares
 
 deposit は**すべての既存預金者**についてこの不変条件を保たねばならない: deposit 前の価値 = deposit 後の価値。withdrawal も同じ: 残りの預金者の価値は不変。NAV 更新は全員の価値を同じ比率で変える。
 
-**Deposit。** `programs/openhl-core/src/lib.rs:2327–2335` の `process_vault_deposit` から:
+**Deposit。** `programs/openhl-core/src/lib.rs:3564–3572` の `process_vault_deposit` から:
 
 ```rust
 let shares_to_mint: u64 = if vault.total_shares == 0 || vault.total_assets == 0 {
@@ -126,7 +126,7 @@ new_NAV_per_share = new_total_assets / new_total_shares
 
 share あたり NAV は不変。不変条件は保たれる。
 
-**Withdrawal。** `lib.rs:2452–2459` の `process_vault_withdraw` から:
+**Withdrawal。** `lib.rs:3729–3736` の `process_vault_withdraw` から:
 
 ```rust
 let assets_to_return: u64 = {
@@ -159,7 +159,7 @@ new_NAV_per_share = (total_assets - shares_burned × total_assets / total_shares
 
 withdrawal も不変条件を保つ。
 
-**NAV 更新。** `lib.rs:2535–2536` の `process_vault_update_nav` から:
+**NAV 更新。** `lib.rs:3823–3824` の `process_vault_update_nav` から:
 
 ```rust
 let prev = vault.total_assets;
@@ -186,7 +186,7 @@ vault.total_assets = new_total_assets;
 
 **vault 状態を読み mint する shares を計算**: vault データを借用、渡された market/mint を vault.market/vault.mint と相互チェック、最初の deposit（1:1）vs 以降（pro-rata）で分岐。
 
-**vault 集約を更新**（2344–2353 行）:
+**vault 集約を更新**（3580–3587 行）:
 
 ```rust
 vault.total_shares = vault.total_shares.checked_add(shares_to_mint)?;
@@ -196,7 +196,7 @@ drop(vault_data);
 
 `checked_add`（`saturating_add` ではない）: 加算がオーバーフローしうるなら、静かにキャップする代わりに deposit を拒否する。`u64::MAX` shares を超えて deposit を受け入れる vault は別の問題を抱えている。明示的な `drop(vault_data)` が share アカウントに触れる前に可変借用を解放する — share 作成が vault アカウント チェックパスを CPI で逆戻りしうるので必要だ。
 
-**share アカウントの条件付き create-or-update**（2355–2403 行）:
+**share アカウントの条件付き create-or-update**（3591–3636 行）:
 
 ```rust
 let share_exists = share_ai.owner == program_id && share_ai.data_len() == VaultShare::LEN;
@@ -311,7 +311,7 @@ seeds が `vault_authority_ai.key` に等しいアドレスの有効な PDA を�
 
 ## §12.5  マネージャ信用問題 — `VaultUpdateNAV`
 
-2502–2544 行の `process_vault_update_nav` は短いが、ここに vault モデル全体の信用前提が住む:
+3793–3833 行の `process_vault_update_nav` は短いが、ここに vault モデル全体の信用前提が住む:
 
 ```rust
 if vault.manager != *manager_ai.key.as_ref() {

@@ -60,7 +60,7 @@ PDA 派生は `user` と `market` の両方をシードに使う: `[b"position",
 
 ## §11.2  equity、notional、証拠金式
 
-ハンドラを歩く前に式を固定する。`programs/openhl-core/src/lib.rs:1814–1834` から。
+ハンドラを歩く前に式を固定する。`programs/openhl-core/src/lib.rs:2329–2342` から。
 
 ```rust
 fn compute_equity(position: &Position, mark: u64, funding_index_now: i64) -> i128 {
@@ -119,16 +119,16 @@ if position_ai.key != &expected {
 }
 ```
 
-**外部入力を読む**（1922–1923 行）:
+**外部入力を読む**（2911–2912 行）:
 
 ```rust
 let mark = read_fresh_oracle(oracle_ai, program_id)?;
 let funding_snapshot = read_funding_index(funding_ai, program_id)?;
 ```
 
-`read_fresh_oracle`（1838–1858 行）は第 9 章の staleness ガントレットをヘルパに分離した — 同じチェック（owner + discriminator + price>0 + Clock に対する age）、3 つのポジション ハンドラで再利用。`read_funding_index`（1860–1869 行）はファンディング指数をスナップショットする簡単な読み。
+`read_fresh_oracle`（2353–2372 行）は第 9 章の staleness ガントレットをヘルパに分離した — 同じチェック（owner + discriminator + price>0 + Clock に対する age）、3 つのポジション ハンドラで再利用。`read_funding_index`（2597–2607 行）はファンディング指数をスナップショットする簡単な読み。
 
-**初期証拠金チェック**（1932–1942 行）:
+**初期証拠金チェック**（2915–2926 行）:
 
 ```rust
 let notional_val = notional(size, mark);
@@ -181,7 +181,7 @@ position.funding_snapshot_index = funding_snapshot;
 
 `process_close_position`。オープンより単純な部分（PDA 作成なし）と複雑な部分が両方ある: vault authority PDA が `invoke_signed` で署名する outbound SPL Token CPI が 2 つ — ユーザへのペイアウトと（水没クローズ時の）保険基金からの不足分 drain — 加わる。ハンドラは 12 アカウントを取り、最後の 2 つは保険基金の state とトークン アカウント（§11.6）。
 
-**検証 + 所有者チェック**（2007–2024 行）:
+**検証 + 所有者チェック**（3052–3062 行）:
 
 ```rust
 if position.user != *user_ai.key.as_ref() {
@@ -192,7 +192,7 @@ if position.user != *user_ai.key.as_ref() {
 
 ポジションの所有者だけが自発的にクローズできる。Liquidate（§11.5）が他の誰でも通れる経路。user チェックは PDA 派生ではなくポジション内に保存した `user` フィールドを使う — 同じ情報、読みやすい。
 
-**外部入力を読み equity を計算**（2026–2040 行）:
+**外部入力を読み equity を計算**（3040–3072 行）:
 
 ```rust
 let mark = read_fresh_oracle(oracle_ai, program_id)?;
@@ -259,7 +259,7 @@ if !liquidator_ai.is_signer { return Err(...); }
 
 この無許可性が清算エンジンの中心。システムは小さな bounty（清算ペナルティ）を、最初に水没ポジションに気づいて清算 tx を提出した誰かに支払う。これなしには、清算はプロトコル チームが集中清算 bot を走らせることに依存する — 動くがアップタイム リスクが入る。
 
-**ヘルス チェック**（2098–2111 行）:
+**ヘルス チェック**（3233–3253 行）:
 
 ```rust
 let equity = compute_equity(position, mark, funding_now);

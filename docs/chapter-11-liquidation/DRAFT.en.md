@@ -60,7 +60,7 @@ The PDA derivation uses both `user` and `market` as seeds: `[b"position", user.k
 
 ## §11.2  Equity, notional, and the margin formulas
 
-Before walking the handlers, fix the formulas. From `programs/openhl-core/src/lib.rs:1814–1834`:
+Before walking the handlers, fix the formulas. From `programs/openhl-core/src/lib.rs:2329–2342`:
 
 ```rust
 fn compute_equity(position: &Position, mark: u64, funding_index_now: i64) -> i128 {
@@ -119,16 +119,16 @@ if position_ai.key != &expected {
 }
 ```
 
-**Read external inputs** (lines 1922–1923):
+**Read external inputs** (lines 2911–2912):
 
 ```rust
 let mark = read_fresh_oracle(oracle_ai, program_id)?;
 let funding_snapshot = read_funding_index(funding_ai, program_id)?;
 ```
 
-`read_fresh_oracle` (lines 1838–1858) factors the Chapter 9 staleness gauntlet into a helper — same checks (owner + discriminator + price>0 + age vs Clock), reused across all three position handlers. `read_funding_index` (lines 1860–1869) is the simpler read used to snapshot the funding index.
+`read_fresh_oracle` (lines 2353–2372) factors the Chapter 9 staleness gauntlet into a helper — same checks (owner + discriminator + price>0 + age vs Clock), reused across all three position handlers. `read_funding_index` (lines 2597–2607) is the simpler read used to snapshot the funding index.
 
-**Initial margin check** (lines 1932–1942):
+**Initial margin check** (lines 2915–2926):
 
 ```rust
 let notional_val = notional(size, mark);
@@ -181,7 +181,7 @@ Four data writes. `entry_price = mark` stamps the oracle's price as the position
 
 `process_close_position`. Simpler than open in one dimension (no PDA creation) but more involved in another: it runs two outbound SPL Token CPIs signed by the vault authority PDA via `invoke_signed` — the user payout, and (on underwater close) the insurance fund's shortfall drain. The handler takes 12 accounts; the last two are the insurance fund state and its token account (§11.6).
 
-**Validation + owner check** (lines 2007–2024):
+**Validation + owner check** (lines 3052–3062):
 
 ```rust
 if position.user != *user_ai.key.as_ref() {
@@ -192,7 +192,7 @@ if position.user != *user_ai.key.as_ref() {
 
 Only the position's owner may close it voluntarily. Liquidate (§11.5) is the route for anyone else. The user check uses the `user` field stored in the position rather than the PDA derivation — same information, easier to read.
 
-**Read external inputs + compute equity** (lines 2026–2040):
+**Read external inputs + compute equity** (lines 3040–3072):
 
 ```rust
 let mark = read_fresh_oracle(oracle_ai, program_id)?;
@@ -259,7 +259,7 @@ if !liquidator_ai.is_signer { return Err(...); }
 
 This permissionless property is the heart of the liquidation engine. The system pays a small bounty (the liquidation penalty) to whoever first notices an underwater position and submits the liquidation tx. Without this, liquidations would depend on the protocol team running a centralized liquidator bot — which works but introduces uptime risk.
 
-**Health check** (lines 2098–2111):
+**Health check** (lines 3233–3253):
 
 ```rust
 let equity = compute_equity(position, mark, funding_now);

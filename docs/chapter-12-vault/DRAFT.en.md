@@ -1,7 +1,7 @@
 # Chapter 12 — Native Vault Program (Pooled Trading)
 
 > Status: draft (v0.1).
-> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`TradingVault`, `VaultShare`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_trading_vault` 2195–2280, `process_vault_deposit` 2282–2413, `process_vault_withdraw` 2415–2500, `process_vault_update_nav` 2502–2544), [`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs).
+> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`TradingVault`, `VaultShare`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_trading_vault` 3402–3480, `process_vault_deposit` 3494–3655, `process_vault_withdraw` 3669–3786, `process_vault_update_nav` 3793–3833), [`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs).
 
 ---
 
@@ -91,7 +91,7 @@ their_value = their_shares × total_assets / total_shares
 
 A deposit must preserve this invariant for *all existing depositors*: their pre-deposit value equals their post-deposit value. A withdrawal does the same: the remaining depositors' value is unchanged. NAV updates change everyone's value by the same proportion.
 
-**Deposit.** From `process_vault_deposit` at `programs/openhl-core/src/lib.rs:2327–2335`:
+**Deposit.** From `process_vault_deposit` at `programs/openhl-core/src/lib.rs:3564–3572`:
 
 ```rust
 let shares_to_mint: u64 = if vault.total_shares == 0 || vault.total_assets == 0 {
@@ -128,7 +128,7 @@ new_NAV_per_share = new_total_assets / new_total_shares
 
 The NAV per share is unchanged. The invariant holds.
 
-**Withdrawal.** From `process_vault_withdraw` at `lib.rs:2452–2459`:
+**Withdrawal.** From `process_vault_withdraw` at `lib.rs:3729–3736`:
 
 ```rust
 let assets_to_return: u64 = {
@@ -161,7 +161,7 @@ new_NAV_per_share = (total_assets - shares_burned × total_assets / total_shares
 
 Withdrawal also preserves the invariant.
 
-**NAV update.** From `process_vault_update_nav` at `lib.rs:2535–2536`:
+**NAV update.** From `process_vault_update_nav` at `lib.rs:3823–3824`:
 
 ```rust
 let prev = vault.total_assets;
@@ -188,7 +188,7 @@ This is generally acceptable for vaults because (1) the dust is rounding-error s
 
 **Read vault state and compute shares to mint**: borrow vault data, cross-check the passed market/mint against vault.market/vault.mint, branch on first-deposit (1:1) vs subsequent (pro-rata).
 
-**Update vault aggregate** (lines 2344–2353):
+**Update vault aggregate** (lines 3580–3587):
 
 ```rust
 vault.total_shares = vault.total_shares.checked_add(shares_to_mint)?;
@@ -198,7 +198,7 @@ drop(vault_data);
 
 `checked_add` (not `saturating_add`): if the addition would overflow, refuse the deposit rather than silently capping. A vault that accepts deposits past `u64::MAX` shares has a different problem to solve. The explicit `drop(vault_data)` releases the mutable borrow before we touch the share account — necessary because share creation may CPI back through the vault account check path.
 
-**Conditional create-or-update of the share account** (lines 2355–2403):
+**Conditional create-or-update of the share account** (lines 3591–3636):
 
 ```rust
 let share_exists = share_ai.owner == program_id && share_ai.data_len() == VaultShare::LEN;
@@ -242,9 +242,9 @@ Same helper from Chapter 11. The depositor signs the outer transaction; the sign
 
 Simpler than deposit because there's nothing to create — but it does pay out tokens from the vault, which means an `invoke_signed` CPI signed by the vault-authority PDA. `process_vault_withdraw`:
 
-**Compute assets to return** at lines 2452–2459 — the inverse of the deposit formula, as covered in §12.2.
+**Compute assets to return** at lines 3729–3736 — the inverse of the deposit formula, as covered in §12.2.
 
-**Authorization** at lines 2470–2473:
+**Authorization** at lines 3744–3747:
 
 ```rust
 if share.owner != *owner_ai.key.as_ref() {
@@ -255,7 +255,7 @@ if share.owner != *owner_ai.key.as_ref() {
 
 Only the share's recorded owner may burn it. This is a *per-share* authorization, not vault-wide — different from the manager check in UpdateNAV. There is no "vault admin can liquidate any share" path in this design (which a real production vault might add for compliance reasons).
 
-**Sufficient-balance check** at lines 2474–2480:
+**Sufficient-balance check** at lines 3748–3755:
 
 ```rust
 if share.shares < shares_to_burn {
@@ -265,7 +265,7 @@ if share.shares < shares_to_burn {
 
 You can't burn more shares than you hold.
 
-**Cost basis reduction** at lines 2484–2489:
+**Cost basis reduction** at lines 3760–3762:
 
 ```rust
 let basis_reduction = (((shares_to_burn as u128) * (share.cost_basis as u128))
@@ -313,7 +313,7 @@ If the seeds don't form a valid PDA whose address equals `vault_authority_ai.key
 
 ## §12.5  The manager-trust problem — `VaultUpdateNAV`
 
-`process_vault_update_nav` at lines 2502–2544 is short, but it is where the entire vault model's trust assumption lives:
+`process_vault_update_nav` at lines 3793–3833 is short, but it is where the entire vault model's trust assumption lives:
 
 ```rust
 if vault.manager != *manager_ai.key.as_ref() {

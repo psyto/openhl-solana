@@ -1,7 +1,7 @@
 # Chapter 10 — Funding Rate Mechanics
 
 > Status: draft (v0.1).
-> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`FundingState`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_funding_state` 1605–1680, `process_update_funding` 1682–1758), [`scripts/funding/src/main.rs`](../../scripts/funding/src/main.rs).
+> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`FundingState`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_funding_state` 2162–2232, `process_update_funding` 2239–2317), [`scripts/funding/src/main.rs`](../../scripts/funding/src/main.rs).
 
 ---
 
@@ -96,7 +96,7 @@ The other fields are mechanical: discriminator for the standard check, bump for 
 
 ## §10.3  Walking `UpdateFunding`
 
-`process_update_funding` at `programs/openhl-core/src/lib.rs:1682–1758` is the only mutator. Its body, ignoring validation:
+`process_update_funding` at `programs/openhl-core/src/lib.rs:2239–2317` is the only mutator. Its body, ignoring validation:
 
 ```rust
 let new_rate = new_rate_raw
@@ -270,7 +270,7 @@ Sealevel scheduling impact:
 ### Three things to verify yourself
 
 1. **The accumulator is piecewise-linear.** Run three UpdateFunding calls a known number of seconds apart with different rates. The cumulative index after each call should match `prior_index + prior_rate × elapsed_seconds` exactly (within the integer division of the 1e9 scaling).
-2. **The clamp is enforced.** Try `--rate 5000000` (way above the cap). The chapter's clamp at [`lib.rs:1703–1705`](../../programs/openhl-core/src/lib.rs#L1703) should reduce it to `MAX_FUNDING_RATE_PER_SEC_ABS = 1_000_000`, and you'll see the `clamped to` log line.
+2. **The clamp is enforced.** Try `--rate 5000000` (way above the cap). The chapter's clamp at [`lib.rs:2260–2262`](../../programs/openhl-core/src/lib.rs#L2260) should reduce it to `MAX_FUNDING_RATE_PER_SEC_ABS = 1_000_000`, and you'll see the `clamped to` log line.
 3. **The slot-vs-time distinction matters.** Run `UpdateFunding --rate 100`, immediately run another `UpdateFunding --rate 200` (same slot). The second call should report `elapsed=0s` and the index should not advance. Wait 10 seconds, run a third with `--rate 0` — now you'll see `elapsed≈10` and the index advanced by `200 × 10`.
 
 ---

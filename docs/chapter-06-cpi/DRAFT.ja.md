@@ -1,7 +1,7 @@
 # 第6章 — Vault Deposits で歩く CPI 内部
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_vault` 615–728 行、`process_deposit` 731–800 行）、[`scripts/create-vault/src/main.rs`](../../scripts/create-vault/src/main.rs)、[`scripts/deposit/src/main.rs`](../../scripts/deposit/src/main.rs)。
+> 教材コード: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_vault` 888–997 行、`process_deposit` 1004–1072 行）、[`scripts/create-vault/src/main.rs`](../../scripts/create-vault/src/main.rs)、[`scripts/deposit/src/main.rs`](../../scripts/deposit/src/main.rs)。
 > 検証対象バージョン: solana-cpi 2.2.1、solana-program 2.3.0、SPL Token プログラム（TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA）。
 
 ---
@@ -77,11 +77,11 @@ pub fn invoke(instruction: &Instruction, account_infos: &[AccountInfo]) -> Progr
 
 ## §6.3  CreateVault を歩く — 2 連続 CPI
 
-CreateVault は、両方の CPI 形式が同じハンドラに現れる場所だ。`programs/openhl-core/src/lib.rs:680–720` から。
+CreateVault は、両方の CPI 形式が同じハンドラに現れる場所だ。`programs/openhl-core/src/lib.rs:888–997` から。
 
-**PDA 派生**（668–678 行）が 2 つの pubkey を準備する: `[VAULT_SEED, market.key, mint.key]` の `vault_token_account` と、`[VAULT_AUTH_SEED, market.key]` の `vault_authority`。第 3 章と同じ find_program_address 機構。bump が返り、vault bump は下で使う。authority bump はまだ不要だ（出金を追加する後の章で、プログラムが vault authority として署名する必要が出てきたときに重要になる）。
+**PDA 派生**（928–950 行）が 2 つの pubkey を準備する: `[VAULT_SEED, market.key, mint.key]` の `vault_token_account` と、`[VAULT_AUTH_SEED, market.key]` の `vault_authority`。第 3 章と同じ find_program_address 機構。bump が返り、vault bump は下で使う。authority bump はまだ不要だ（出金を追加する後の章で、プログラムが vault authority として署名する必要が出てきたときに重要になる）。
 
-**CPI 1 — System::create_account**、689–700 行。
+**CPI 1 — System::create_account**、952–971 行。
 
 ```rust
 let create_ix = system_instruction::create_account(
@@ -107,7 +107,7 @@ invoke_signed(
 
 AccountInfo 配列に注目: `[payer_ai, vault_ai, system_ai]`。System プログラムが `create_account` で必要とするのはこの 3 つだけ（ハンドラの他のアカウント — market、mint、vault_authority、token_program — は System が必要としないので渡さない）。
 
-**CPI 2 — SPL Token InitializeAccount3**、707–720 行。
+**CPI 2 — SPL Token InitializeAccount3**、973–993 行。
 
 ```rust
 let mut init_data = Vec::with_capacity(1 + 32);
@@ -136,7 +136,7 @@ CPI 2 つ、ハンドラ 1 つ、両方の署名形式。このパターンは P
 
 ## §6.4  Deposit を歩く — ユーザは外側で署名
 
-Deposit はより単純なケースだ。`programs/openhl-core/src/lib.rs:771–800` から。
+Deposit はより単純なケースだ。`programs/openhl-core/src/lib.rs:1004–1072` から。
 
 命令データ。
 
@@ -256,7 +256,7 @@ openhl-core CPI マップ:
 ### 自分で検証する 3 項目
 
 1. **`invoke` はシードなしの `invoke_signed`。** `solana-cpi-2.2.1/src/lib.rs:137` を開き、3 行の本体を読め。両者の違いは「PDA シードを渡したか」だけだと身体化せよ。それ以外のすべては同じシステムコール。
-2. **被呼び出しプログラムの AccountInfo。** CreateVault の両 CPI で、`invoke[_signed]` に渡される `accounts` スライスは被呼び出しプログラムの AccountInfo を含む — CPI 1 では `system_ai`、CPI 2 では `token_ai`。これを忘れるのは初期 Solana で最も頻出のミスの 1 つで、ランタイムは紛らわしい `AccountNotFound` 風味のエラーを返す。[`lib.rs:691, 720`](../../programs/openhl-core/src/lib.rs#L691) を読んで確認せよ。
+2. **被呼び出しプログラムの AccountInfo。** CreateVault の両 CPI で、`invoke[_signed]` に渡される `accounts` スライスは被呼び出しプログラムの AccountInfo を含む — CPI 1 では `system_ai`、CPI 2 では `token_ai`。これを忘れるのは初期 Solana で最も頻出のミスの 1 つで、ランタイムは紛らわしい `AccountNotFound` 風味のエラーを返す。[`lib.rs:962, 993`](../../programs/openhl-core/src/lib.rs#L962) を読んで確認せよ。
 3. **ユーザは一度署名し、SPL Token がそれを使う。** バリデータに対して `deposit` を実行せよ。ユーザ鍵ペアが外側トランザクションに署名する。SPL Token は `is_signer = true`（ユーザについて）の `Transfer` 命令を受け取る。トランスファが確定する。どこにも 2 度目の署名はない。1 署名、伝播。
 
 ---

@@ -75,7 +75,7 @@ Builder codes need *two* fee-share caps, not one, because two parties have diffe
 
 **Builder self-cap (`BuilderProfile.max_fee_share_bps`)** — the maximum fraction this *particular* builder will keep. Self-declared at registration; user-visible.
 
-The effective share on any trade is `min(builder.max_fee_share_bps, PROTOCOL_BUILDER_SHARE_CAP_BPS)`. From `programs/openhl-core/src/lib.rs:2742–2748`:
+The effective share on any trade is `min(builder.max_fee_share_bps, PROTOCOL_BUILDER_SHARE_CAP_BPS)`. From `programs/openhl-core/src/lib.rs:4044–4049`:
 
 ```rust
 share_bps = profile.max_fee_share_bps;

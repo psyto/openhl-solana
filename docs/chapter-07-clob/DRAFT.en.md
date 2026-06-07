@@ -1,7 +1,7 @@
 # Chapter 7 — On-Chain CLOB Data Structures
 
 > Status: draft (v0.1).
-> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Order` + `OrderBook`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_order_book` at 833–891, `process_place_order` at 904–1000, `process_cancel_order` at 1002–1064), [`scripts/book/src/main.rs`](../../scripts/book/src/main.rs).
+> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Order` + `OrderBook`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_order_book` at 1087–1151, `process_place_order` at 1158–1249, `process_cancel_order` at 1256–1323), [`scripts/book/src/main.rs`](../../scripts/book/src/main.rs).
 
 ---
 
@@ -90,7 +90,7 @@ Why `size == 0` and not a separate `is_active: bool`?
 - A boolean field would cost a byte plus padding to maintain alignment. The `size` field already exists and a real order always has `size > 0`. Repurposing it as the active sentinel saves the extra field.
 - Zero-initialization on account creation makes the convention work for free: a newly allocated `OrderBook`'s slots are all "empty" without any explicit setup pass.
 
-The cost is a one-line invariant the program must respect: never write an `Order` with `size == 0`. Both handlers explicitly reject `size == 0` in the payload as the first guard. From `process_place_order` (lib.rs:929–932):
+The cost is a one-line invariant the program must respect: never write an `Order` with `size == 0`. Both handlers explicitly reject `size == 0` in the payload as the first guard. From `process_place_order` (lib.rs:1179–1182):
 
 ```rust
 if price == 0 || size == 0 {
@@ -107,11 +107,11 @@ That's the price of repurposing the field. Anchor's `#[derive(BorshSerialize)]` 
 
 ## §7.3  Walking `place_order`
 
-From `programs/openhl-core/src/lib.rs:904–1000`. The handler decomposes into three parts.
+From `programs/openhl-core/src/lib.rs:1158–1249`. The handler decomposes into three parts.
 
-**Validation** (lines 911–950): payload size, side byte (must be 0 or 1), price and size non-zero, user is a signer, book owner matches our program, book size matches `OrderBook::LEN`, book discriminator matches.
+**Validation** (lines 1163–1196): payload size, side byte (must be 0 or 1), price and size non-zero, user is a signer, book owner matches our program, book size matches `OrderBook::LEN`, book discriminator matches.
 
-**The linear scan** at lines 958–965:
+**The linear scan** at lines 1212–1218:
 
 ```rust
 let mut chosen_slot: Option<usize> = None;
@@ -134,7 +134,7 @@ The CU cost shape:
 
 In absolute terms these numbers are tiny — even the worst case is under 1% of the default 200 KCU budget. But the *shape* is the lesson: O(N) means the cost grows with the data, and for an order book that growth can outrun the budget at scale. A slab keeps the placement at O(log N), so even with 1024 orders the placement still costs less than 16 iterations of our array does at N = 32.
 
-**The write** (lines 970–987): increment `next_order_id`, increment `active_count`, copy the user pubkey into `owner`, construct an `Order` literal, drop it into the chosen slot. All O(1) once the slot is found.
+**The write** (lines 1224–1238): increment `next_order_id`, increment `active_count`, copy the user pubkey into `owner`, construct an `Order` literal, drop it into the chosen slot. All O(1) once the slot is found.
 
 The CU brackets at lines 952 (before scan) and 988 (after write) let you read the cost from the validator log. Two `sol_log_compute_units` calls, subtract, get the actual CU consumed for "scan + write" on this particular instruction.
 
@@ -144,9 +144,9 @@ The CU brackets at lines 952 (before scan) and 988 (after write) let you read th
 
 ## §7.4  Walking `cancel_order`
 
-`process_cancel_order` (lines 1002–1064) is structurally the same as `place_order` — linear scan, then mutation — but with a different match key and a different mutation.
+`process_cancel_order` (lines 1256–1323) is structurally the same as `place_order` — linear scan, then mutation — but with a different match key and a different mutation.
 
-**The scan** at lines 1037–1043:
+**The scan** at lines 1291–1297:
 
 ```rust
 let mut found: Option<usize> = None;
@@ -160,7 +160,7 @@ for (i, slot) in book.slots.iter().enumerate() {
 
 `slot.size != 0` skips empty slots; `slot.order_id == order_id` selects by ID. Worst case is "order is in the last slot" or "order not found" — both pay full O(N).
 
-**The authorization check** at lines 1050–1053:
+**The authorization check** at lines 1303–1307:
 
 ```rust
 if book.slots[slot_idx].owner != *user_ai.key.as_ref() {
