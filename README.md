@@ -15,12 +15,37 @@ This repository is the companion code for the **SolDojo Solana Internals** track
 
 ```
 crates/
-  state/                  — shared account layouts (Pod structs)
-scripts/
-  allocate-market/        — Chapter 1 worked example: allocate raw Market account, dump bytes
-programs/                 — (added in Chapter 2: first native program)
+  state/                  — shared account layouts (Pod structs) used by every
+                            program + every script. The byte layouts the
+                            chapters cite.
+programs/
+  openhl-core/            — single Solana program holding every instruction
+                            (CreateMarket, OpenPosition, Match, Liquidate, …).
+                            Built without Anchor; one file, one entrypoint!.
+scripts/                   — per-chapter worked examples. Each `cargo run -p X`.
+  allocate-market/        — ch.1: allocate a raw Market account, dump bytes
+  init-market/            — ch.2: initialize the Market account
+  create-market/          — ch.3: derive + create the per-market PDA
+  bench/                  — ch.4: CU instrumentation harness
+  stats/                  — ch.5: Stats singleton + parallelism counter-example
+  create-vault/           — ch.6: allocate the per-(market, mint) vault PDA
+  deposit/                — ch.6: SPL Token Transfer into the vault via CPI
+  book/                   — ch.7: flat-array OrderBook (place / cancel / dump)
+  match/                  — ch.8: Match instruction with pagination cap
+  oracle/                 — ch.9: mock Oracle publisher (set price, dump state)
+  funding/                — ch.10: drive CreateFundingState / UpdateFunding
+  position/               — ch.11: OpenPosition / ClosePosition / Liquidate +
+                            CreateInsuranceFund / InsuranceFundDeposit
+  vault/                  — ch.12: TradingVault deposit / withdraw / NAV update
+  builder/                — ch.13: RegisterBuilder / PlaceOrderWithBuilder /
+                            ClaimBuilderFees / CreateFeeVault
+  slab/                   — ch.15: critbit Slab (create / place / match / dump)
 docs/
-  chapter-01-account-model/
+  chapter-01-account-model/ … chapter-15-slab/
+                          — chapter drafts (EN + JA). Each directory holds
+                            DRAFT.en.md and DRAFT.ja.md; the chapters cite
+                            this repo via file:line so readers can navigate
+                            straight to the code under discussion.
 ```
 
 ## Curriculum track
