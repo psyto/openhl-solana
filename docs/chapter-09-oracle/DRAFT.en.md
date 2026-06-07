@@ -1,7 +1,7 @@
 # Chapter 9 — Oracle Ingestion: Pyth Internals
 
 > Status: draft (v0.1).
-> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Oracle`, plus the Pyth v1 layout constants for §9.5), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_oracle`, `process_set_oracle_price`, `process_place_order_checked`, `process_place_order_checked_pyth`, the `read_fresh_oracle` and `read_fresh_pyth_v1_oracle` helpers), [`scripts/oracle/src/main.rs`](../../scripts/oracle/src/main.rs).
+> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Oracle`, plus the Pyth v1 and v2 layout constants for §9.5), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_oracle`, `process_set_oracle_price`, `process_place_order_checked`, `process_place_order_checked_pyth`, `process_place_order_checked_pyth_v2`, and the `read_fresh_oracle` / `read_fresh_pyth_v1_oracle` / `read_fresh_pyth_v2_oracle` helpers), [`scripts/oracle/src/main.rs`](../../scripts/oracle/src/main.rs).
 > Reference targets: Pyth Network mainnet program (`FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH`), Switchboard On-Demand.
 
 ---
@@ -278,17 +278,85 @@ The peer instruction. Same payload as `PlaceOrderChecked` (`[side u8][price u64 
 
 Everything downstream — sanity-band, fee escrow, book write — is identical to the mock path. Both handlers share the same `SANITY_BAND_BPS`, `PROTOCOL_FEE_BPS`, and the same `spl_token_transfer_user_signed` Transfer at the end. The migration's surface is exactly what §9.5 promised: localized.
 
-### The v1 / v2 caveat
+### Pyth v2 — same chapter, different architecture
 
-The "v1" in `read_fresh_pyth_v1_oracle` matters. Pyth's v1 model — publishers writing a static PriceAccount each slot, readers parsing it — is being deprecated in favor of v2's pull-oracle architecture, where publishers sign update messages off-chain that any caller can verify (via Wormhole VAA verification) and apply to a price-cache account. v2 is structurally different: not a layout change but a model change. Reading "real Pyth" in 2025 increasingly means v2, which requires cryptographic verification we don't ship here.
+The "v1" in `read_fresh_pyth_v1_oracle` matters. Pyth's v1 model — publishers writing a static PriceAccount each slot, readers parsing it — is being deprecated in favor of v2's *pull-oracle* architecture. The critical insight for a perp DEX is that the v2 architecture splits cleanly across two layers:
 
-What you'd actually do for v2:
+1. **Pyth's `pyth-solana-receiver` program** does the cryptographic work. It accepts a Pyth update message wrapped in a Wormhole VAA (Verified Action Approval — a payload signed by 2/3+ of Wormhole's guardian set), verifies the guardian signatures using Solana's secp256k1 precompile, checks any Merkle proofs in the bundled update, and writes the verified price into a `PriceUpdateV2` account.
+2. **The consumer** (you, the perp DEX) reads that `PriceUpdateV2` account. No VAA verification. No guardian-set management. No cryptography on your hot path.
 
-1. Add a `VerifyPythUpdate` instruction that takes a Pyth update message + the Wormhole guardian set, verifies the signatures, and writes the verified price into a per-market price-cache PDA owned by your program.
-2. Trading instructions then read from that cache PDA (using the same mock-shape gauntlet — the cache is structurally a mock `Oracle` you populate at update-time).
-3. The trading critical path stays bytes-up; only the update path involves the SDK.
+If you confused those two layers (and an earlier draft of this section did), you'd conclude that v2 needs ~2000 lines of cryptographic code on your side. It doesn't. The Wormhole work lives in Pyth's program, which is shared infrastructure; what you ship on the perp DEX is structurally the same as the v1 reader, just against a different account layout.
 
-That's a separate chapter — the Wormhole verification step is its own machinery, and parking it inside ch.9 would blow the chapter's scope. The v1 reader here is the smaller of the two paths and is what Phoenix and most existing Solana CLOBs still rely on; ship that, ship the v2 path later if you need it.
+`PlaceOrderCheckedPythV2` (tag 33) ships the consumer side. The reader:
+
+```rust
+fn read_fresh_pyth_v2_oracle(oracle_ai: &AccountInfo) -> Result<u64, ProgramError> {
+    let data = oracle_ai.try_borrow_data()?;
+    if data.len() < PYTH_V2_MIN_LEN { return Err(InvalidAccountData); }
+
+    // (1) Anchor account discriminator. PriceUpdateV2 uses Anchor's
+    // sha256("account:PriceUpdateV2")[..8] convention.
+    if data[0..8] != PYTH_V2_PRICE_UPDATE_DISCRIMINATOR { return Err(...); }
+
+    // (2) VerificationLevel — log only. Production may demand Full.
+    let level_tag = data[PYTH_V2_OFFSET_VERIFICATION_LEVEL];
+    // Partial { num_signatures }  | Full
+
+    // (3) Staleness — against posted_slot, the Solana slot in which
+    // the receiver wrote the update.
+    let posted_slot = u64::from_le_bytes(data[PYTH_V2_OFFSET_POSTED_SLOT..]);
+    if Clock::get()?.slot.saturating_sub(posted_slot) > MAX_ORACLE_STALENESS_SLOTS {
+        return Err(InvalidAccountData);
+    }
+
+    // (4) Price + log exponent / conf / publish_time.
+    let price_i = i64::from_le_bytes(data[PYTH_V2_OFFSET_PRICE..]);
+    if price_i <= 0 { return Err(InvalidAccountData); }
+    Ok(price_i as u64)
+}
+```
+
+PriceUpdateV2's on-chain layout, parsed by offset (Anchor borsh-serializes Pyth's struct):
+
+```text
+offset | size | field                            | what we do with it
+-------+------+----------------------------------+---------------------------------------
+   0   |  8   | anchor_discriminator             | == [34,241,35,99,157,126,244,205]
+   8   | 32   | write_authority (Pubkey)         | (ignored — receiver's signing PDA)
+  40   |  1   | verification_level tag           | log; 0=Partial, 1=Full
+  41   |  1   | verification_level.num_signatures| log (only when tag==Partial)
+  42   | 32   | price_message.feed_id            | (caller pins the expected feed off-chain)
+  74   |  8   | price_message.price (i64)        | > 0; returned as u64 mark
+  82   |  8   | price_message.conf  (u64)        | log
+  90   |  4   | price_message.exponent (i32)     | log; production normalizes by 10^expo
+  94   |  8   | price_message.publish_time (i64) | log; informational (Pyth's Unix timestamp)
+ 102   |  8   | price_message.prev_publish_time  | unused
+ 110   |  8   | price_message.ema_price          | unused (the chapter uses the spot price)
+ 118   |  8   | price_message.ema_conf           | unused
+ 126   |  8   | posted_slot (u64)                | staleness gauntlet
+ 134                                                — end
+```
+
+The offsets are exported as `PYTH_V2_OFFSET_*` from `crates/state/src/lib.rs`. As with v1, we don't mirror the full Pod struct — six field reads, no Anchor dep, the byte layout *is* the contract.
+
+### The two-instruction transaction pattern
+
+There's one piece of architecture the v2 reader assumes: the `PriceUpdateV2` account has to be *fresh* when the trade instruction runs. In practice the consumer transaction does this by including the receiver's `post_update_v2` instruction as the first instruction, and the trade instruction as the second:
+
+```text
+tx = [
+  pyth-solana-receiver::post_update_v2(vaa_data, update_data, …),  // verifies VAA, writes account
+  openhl::place_order_checked_pyth_v2(side, price, size),          // reads the just-written account
+]
+```
+
+`post_update_v2` writes a per-(feed_id, write_authority) `PriceUpdateV2` PDA that `place_order_checked_pyth_v2` then reads. The client fetches the latest VAA from Pyth's price-update service (an HTTP endpoint that aggregates publisher signatures into VAAs ready to submit), bundles it into the first instruction, and lets the staleness gauntlet enforce that everything stays in sync. There is no on-chain CPI from our handler into the receiver — they communicate through the account, not directly.
+
+This is also why our v2 handler doesn't take a "post" instruction or any Wormhole accounts: the consumer transaction is the wiring; the program just reads.
+
+### What's still genuinely deferred
+
+Now that the consumer side ships, what's left is **running your own Wormhole-style receiver**. That'd be useful if you wanted to read Pyth updates from a Wormhole chain that doesn't have an official Pyth receiver, or if you wanted to verify additional message types (governance updates, mapping changes) the receiver doesn't expose. It's its own chapter — secp256k1 signature recovery against a stored guardian set, replay protection, Merkle proof verification on bundled updates. The perp DEX consumer path here doesn't need any of it.
 
 ### The Switchboard fallback
 

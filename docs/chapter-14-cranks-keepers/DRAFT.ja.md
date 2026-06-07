@@ -290,7 +290,7 @@ Indexer はオフチェーン スタックの肝心なピースだ — 上記の
 
 明示的に繰り延べたもの（だから後で見つけやすい）:
 
-- **Pyth v2 / プルオラクル統合。** Ch.9 §9.5 は Pyth v1 の静的 `PriceAccount` に対して動作する `PlaceOrderCheckedPyth` を出荷する。Pyth v2 のプル アーキテクチャ（Wormhole VAA 検証 → price-cache PDA write）への移行は構造的に異なり、それ自体が後続章だ。
+- **自前ホスト型 Wormhole スタイル オラクル receiver。** Ch.9 §9.5 は Pyth v1（`PlaceOrderCheckedPyth`）と Pyth v2（`PlaceOrderCheckedPythV2`、Pyth の receiver プログラムが生成する `PriceUpdateV2` アカウントを読む）両方のコンシューマ リーダーを出荷する。真に未解決なのは receiver*である*こと — 保存された guardian set に対する Wormhole VAA 署名検証、bundled updates の Merkle proof 検証、自前の price-cache PDA への書き込み。Pyth receiver がデプロイされていないチェーンから updates を消費したい場合、または追加メッセージ型を検証したい場合にのみ必要。独自章。
 
 本物の本番デプロイのために追加するもの:
 

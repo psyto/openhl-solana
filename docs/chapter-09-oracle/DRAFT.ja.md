@@ -1,7 +1,7 @@
 # 第9章 — オラクル取り込み: Pyth 内部
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Oracle`、加えて §9.5 のための Pyth v1 レイアウト定数）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_oracle`、`process_set_oracle_price`、`process_place_order_checked`、`process_place_order_checked_pyth`、ヘルパ `read_fresh_oracle` と `read_fresh_pyth_v1_oracle`）、[`scripts/oracle/src/main.rs`](../../scripts/oracle/src/main.rs)。
+> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Oracle`、加えて §9.5 のための Pyth v1 と v2 のレイアウト定数）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_oracle`、`process_set_oracle_price`、`process_place_order_checked`、`process_place_order_checked_pyth`、`process_place_order_checked_pyth_v2`、ヘルパ `read_fresh_oracle` / `read_fresh_pyth_v1_oracle` / `read_fresh_pyth_v2_oracle`）、[`scripts/oracle/src/main.rs`](../../scripts/oracle/src/main.rs)。
 > 参照対象: Pyth Network mainnet プログラム（`FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH`）、Switchboard On-Demand。
 
 ---
@@ -278,17 +278,85 @@ fn read_fresh_pyth_v1_oracle(oracle_ai: &AccountInfo) -> Result<u64, ProgramErro
 
 下流すべて — サニティバンド、手数料エスクロー、book write — はモックパスと同一。両ハンドラは同じ `SANITY_BAND_BPS`、`PROTOCOL_FEE_BPS`、末尾の同じ `spl_token_transfer_user_signed` Transfer を共有する。マイグレーションの surface は §9.5 が約束したとおり: 局所的。
 
-### v1 / v2 注意
+### Pyth v2 — 同じ章、違うアーキテクチャ
 
-`read_fresh_pyth_v1_oracle` の「v1」が重要。Pyth の v1 モデル — パブリッシャが毎スロット静的 PriceAccount に書き、リーダーがそれをパース — は廃止されつつあり、v2 のプルオラクル アーキテクチャに置き換わる。そこではパブリッシャがオフチェーンで update メッセージに署名し、誰でも検証（Wormhole VAA 検証経由）して price-cache アカウントに適用できる。v2 は構造的に違う: レイアウト変更ではなくモデル変更だ。2025 年に「本物の Pyth」を読むことはますます v2 を意味し、本章で出荷しない暗号検証が必要だ。
+`read_fresh_pyth_v1_oracle` の「v1」が重要。Pyth の v1 モデル — パブリッシャが毎スロット静的 PriceAccount に書き、リーダーがそれをパース — は廃止されつつあり、v2 の **プルオラクル** アーキテクチャに置き換わる。Perp DEX にとって重要な洞察は、v2 アーキテクチャが 2 つの層にきれいに分かれることだ:
 
-v2 で実際にやること:
+1. **Pyth の `pyth-solana-receiver` プログラム**が暗号作業をする。Wormhole VAA（Verified Action Approval — Wormhole の guardian set の 2/3 以上が署名したペイロード）に包まれた Pyth update メッセージを受け取り、Solana の secp256k1 precompile で guardian 署名を検証し、bundled update の Merkle proof があれば検証し、検証済み価格を `PriceUpdateV2` アカウントに書く。
+2. **コンシューマ**（あなた、perp DEX）がその `PriceUpdateV2` アカウントを読む。VAA 検証なし。Guardian set 管理なし。あなたのホット パスに暗号なし。
 
-1. `VerifyPythUpdate` 命令を加える。Pyth update メッセージ + Wormhole guardian set を取り、署名を検証し、検証済み価格を自分のプログラムが所有する market ごとの price-cache PDA に書く。
-2. 取引命令はその後そのキャッシュ PDA から読む（同じモック形状ガントレットを使う — キャッシュは update 時にあなたが populate する構造的にモック `Oracle` だ）。
-3. 取引のクリティカルパスは bytes-up のまま; update パスだけが SDK を伴う。
+その 2 層を混同したら（本セクションの初期ドラフトはした）、v2 はあなたの側に ~2000 行の暗号コードが必要だと結論するだろう。そうではない。Wormhole 作業は Pyth のプログラムに住み、それは共有インフラだ; perp DEX で出荷するのは構造的に v1 リーダーと同じ、ただし異なるアカウント レイアウトに対するもの。
 
-それは別章だ — Wormhole 検証ステップは独自の機械装置で、第 9 章内に駐めると章のスコープが破綻する。ここの v1 リーダーは 2 つのパスのうち小さい方で、Phoenix とほとんどの既存 Solana CLOB がまだ依存しているもの; それを出荷し、必要なら後で v2 パスを出荷せよ。
+`PlaceOrderCheckedPythV2`（タグ 33）がコンシューマ側を出荷する。リーダー:
+
+```rust
+fn read_fresh_pyth_v2_oracle(oracle_ai: &AccountInfo) -> Result<u64, ProgramError> {
+    let data = oracle_ai.try_borrow_data()?;
+    if data.len() < PYTH_V2_MIN_LEN { return Err(InvalidAccountData); }
+
+    // (1) Anchor account discriminator。PriceUpdateV2 は Anchor の
+    // sha256("account:PriceUpdateV2")[..8] 規約を使う。
+    if data[0..8] != PYTH_V2_PRICE_UPDATE_DISCRIMINATOR { return Err(...); }
+
+    // (2) VerificationLevel — ログのみ。本番は Full を要求するかも。
+    let level_tag = data[PYTH_V2_OFFSET_VERIFICATION_LEVEL];
+    // Partial { num_signatures }  | Full
+
+    // (3) Staleness — posted_slot に対して、receiver が update を書いた
+    // Solana slot。
+    let posted_slot = u64::from_le_bytes(data[PYTH_V2_OFFSET_POSTED_SLOT..]);
+    if Clock::get()?.slot.saturating_sub(posted_slot) > MAX_ORACLE_STALENESS_SLOTS {
+        return Err(InvalidAccountData);
+    }
+
+    // (4) 価格 + exponent / conf / publish_time をログ。
+    let price_i = i64::from_le_bytes(data[PYTH_V2_OFFSET_PRICE..]);
+    if price_i <= 0 { return Err(InvalidAccountData); }
+    Ok(price_i as u64)
+}
+```
+
+PriceUpdateV2 のオンチェーン レイアウト、オフセットでパース（Anchor が Pyth の構造体を borsh シリアライズする）:
+
+```text
+offset | size | field                            | 何に使うか
+-------+------+----------------------------------+---------------------------------------
+   0   |  8   | anchor_discriminator             | == [34,241,35,99,157,126,244,205]
+   8   | 32   | write_authority (Pubkey)         | （無視 — receiver の署名 PDA）
+  40   |  1   | verification_level tag           | ログ; 0=Partial、1=Full
+  41   |  1   | verification_level.num_signatures| ログ（tag==Partial のときのみ）
+  42   | 32   | price_message.feed_id            | （呼び出し側がオフチェーンで期待 feed を固定）
+  74   |  8   | price_message.price (i64)        | > 0; u64 mark として返す
+  82   |  8   | price_message.conf  (u64)        | ログ
+  90   |  4   | price_message.exponent (i32)     | ログ; 本番は 10^expo で正規化
+  94   |  8   | price_message.publish_time (i64) | ログ; 情報用（Pyth の Unix timestamp）
+ 102   |  8   | price_message.prev_publish_time  | 未使用
+ 110   |  8   | price_message.ema_price          | 未使用（章は spot 価格を使う）
+ 118   |  8   | price_message.ema_conf           | 未使用
+ 126   |  8   | posted_slot (u64)                | Staleness ガントレット
+ 134                                                — 終わり
+```
+
+オフセットは `crates/state/src/lib.rs` から `PYTH_V2_OFFSET_*` としてエクスポートされる。v1 と同様、完全な Pod 構造体をミラーしない — 6 フィールド読み込み、Anchor 依存なし、バイト レイアウトが**契約**だ。
+
+### 2 命令 トランザクション パターン
+
+v2 リーダーが前提とするアーキテクチャの一片: トレード命令が走るとき `PriceUpdateV2` アカウントが*fresh*でなければならない。実際にはコンシューマ トランザクションは receiver の `post_update_v2` 命令を最初の命令として、トレード命令を 2 番目として含めることでこれを行う:
+
+```text
+tx = [
+  pyth-solana-receiver::post_update_v2(vaa_data, update_data, …),  // VAA 検証、アカウント書き込み
+  openhl::place_order_checked_pyth_v2(side, price, size),          // 今書かれたアカウントを読む
+]
+```
+
+`post_update_v2` は per-(feed_id, write_authority) `PriceUpdateV2` PDA を書き、`place_order_checked_pyth_v2` がそれを読む。クライアントは Pyth の price-update service（パブリッシャ署名を VAA に集約する HTTP エンドポイント）から最新 VAA を fetch し、最初の命令にバンドルし、staleness ガントレットがすべてを同期させる。本書のハンドラから receiver へのオンチェーン CPI はない: アカウント経由で通信し、直接ではない。
+
+これはまた、本書の v2 ハンドラが「post」命令や Wormhole アカウントを取らない理由でもある: コンシューマ トランザクションが配線、プログラムは単に読む。
+
+### 真に繰り延べられているもの
+
+コンシューマ側が出荷された今、残るのは**自前の Wormhole スタイル receiver を走らせること**だ。Wormhole チェーンに公式 Pyth receiver がないところから Pyth updates を読みたい場合、あるいは receiver が公開しない追加メッセージ型（ガバナンス updates、mapping changes）を検証したい場合に有用だ。それ自体が独自章だ — 保存された guardian set に対する secp256k1 署名復元、リプレイ保護、bundled updates の Merkle proof 検証。ここの perp DEX コンシューマ パスはそのどれも必要としない。
 
 ### Switchboard フォールバック
 

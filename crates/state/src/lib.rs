@@ -678,6 +678,70 @@ pub const PYTH_V1_OFFSET_AGG_PUB_SLOT: usize = 232;
 /// to the per-publisher `comp[]` array; we just don't touch it.
 pub const PYTH_V1_MIN_LEN: usize = 240;
 
+// =============================================================================
+// Pyth v2 PriceUpdateV2 — byte-layout constants (Chapter 9 §9.5 v2 walk).
+// =============================================================================
+//
+// Unlike v1's static PriceAccount, v2 PriceUpdateV2 accounts are written by
+// Pyth's `pyth-solana-receiver` program after it verifies a Wormhole VAA
+// off the consumer's hot path. The consumer (us) does not verify VAAs;
+// we just parse the receiver-produced account bytes-up and trust that
+// the receiver did its job. See ch.9 §9.5 for the architectural argument.
+//
+// The receiver uses Anchor, so PriceUpdateV2 accounts begin with the
+// 8-byte Anchor account discriminator = sha256("account:PriceUpdateV2")[..8].
+// All numeric fields are little-endian (Anchor borsh).
+
+/// Anchor account discriminator for a PriceUpdateV2 account, as written
+/// by Pyth's `pyth-solana-receiver`. Equal to
+/// `sha256("account:PriceUpdateV2")[..8]`. Hardcoded so we don't need
+/// to depend on `pyth-solana-receiver-sdk`; the chapter explains how to
+/// rederive it if Pyth ever bumps the type name.
+pub const PYTH_V2_PRICE_UPDATE_DISCRIMINATOR: [u8; 8] =
+    [34, 241, 35, 99, 157, 126, 244, 205];
+
+/// Tag value for `VerificationLevel::Partial { num_signatures }`.
+/// One byte follows holding the publisher-signature count the receiver
+/// considered. We accept both Partial and Full in the reader, with the
+/// caller free to add a minimum signature gate.
+pub const PYTH_V2_VERIFICATION_PARTIAL: u8 = 0;
+
+/// Tag value for `VerificationLevel::Full`.
+pub const PYTH_V2_VERIFICATION_FULL: u8 = 1;
+
+/// Offset of `write_authority: Pubkey` inside PriceUpdateV2.
+pub const PYTH_V2_OFFSET_WRITE_AUTHORITY: usize = 8;
+
+/// Offset of `verification_level` enum tag.
+pub const PYTH_V2_OFFSET_VERIFICATION_LEVEL: usize = 40;
+
+/// Offset of `verification_level.num_signatures` (only meaningful when
+/// the tag at offset 40 is PYTH_V2_VERIFICATION_PARTIAL).
+pub const PYTH_V2_OFFSET_VERIFICATION_NUM_SIGS: usize = 41;
+
+/// Offset of `price_message.feed_id: [u8; 32]`.
+pub const PYTH_V2_OFFSET_FEED_ID: usize = 42;
+
+/// Offset of `price_message.price: i64`.
+pub const PYTH_V2_OFFSET_PRICE: usize = 74;
+
+/// Offset of `price_message.conf: u64`.
+pub const PYTH_V2_OFFSET_CONF: usize = 82;
+
+/// Offset of `price_message.exponent: i32`.
+pub const PYTH_V2_OFFSET_EXPONENT: usize = 90;
+
+/// Offset of `price_message.publish_time: i64`.
+pub const PYTH_V2_OFFSET_PUBLISH_TIME: usize = 94;
+
+/// Offset of `posted_slot: u64` (Solana slot at which the receiver wrote
+/// this update — what we run the staleness gauntlet against).
+pub const PYTH_V2_OFFSET_POSTED_SLOT: usize = 126;
+
+/// Total fixed size of PriceUpdateV2 (Anchor disc + write_authority +
+/// verification_level + price_message + posted_slot).
+pub const PYTH_V2_MIN_LEN: usize = 134;
+
 #[cfg(test)]
 mod tests {
     use super::*;

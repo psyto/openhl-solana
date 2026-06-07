@@ -290,7 +290,7 @@ Across fourteen chapters, we built:
 
 Things explicitly deferred (so they're easy to find later):
 
-- **Pyth v2 / pull-oracle integration.** Ch.9 §9.5 ships a working `PlaceOrderCheckedPyth` against Pyth v1's static `PriceAccount`. Migrating to Pyth v2's pull architecture (Wormhole VAA verification → price-cache PDA writes) is structurally different and is its own follow-on chapter.
+- **A self-hosted Wormhole-style oracle receiver.** Ch.9 §9.5 ships consumer readers for both Pyth v1 (`PlaceOrderCheckedPyth`) and Pyth v2 (`PlaceOrderCheckedPythV2`, which reads `PriceUpdateV2` accounts that Pyth's receiver program produces). What's still genuinely open is *being* a receiver — verifying Wormhole VAA signatures against a stored guardian set, doing Merkle proof verification on bundled updates, writing your own price-cache PDAs. You only need this if you're consuming updates from a chain where Pyth's receiver isn't deployed, or you want to verify additional message types. Its own chapter.
 
 Things you'd add for a real production deployment:
 

@@ -144,6 +144,12 @@
 //!                           from a real Pyth v1 PriceAccount via
 //!                           bytes-up parsing (no SDK dep). Same
 //!                           sanity-band + fee-escrow plumbing.
+//!  33  PlaceOrderCheckedPythV2 — also Chapter 9 §9.5. Peer that
+//!                           reads from Pyth's v2 PriceUpdateV2
+//!                           account (written by the
+//!                           pyth-solana-receiver program after VAA
+//!                           verification — we don't verify, we
+//!                           just consume).
 //!
 //! The entire program is one file on purpose. Splitting it into the usual
 //! `instruction.rs` / `processor.rs` / `state.rs` modules buys nothing
@@ -160,8 +166,12 @@ use openhl_state::{
     POSITION_DISCRIMINATOR, PYTH_V1_ACCOUNT_TYPE_PRICE, PYTH_V1_MAGIC, PYTH_V1_MIN_LEN,
     PYTH_V1_OFFSET_AGG_CONF, PYTH_V1_OFFSET_AGG_PRICE, PYTH_V1_OFFSET_AGG_PUB_SLOT,
     PYTH_V1_OFFSET_AGG_STATUS, PYTH_V1_OFFSET_EXPO, PYTH_V1_STATUS_TRADING, PYTH_V1_VERSION,
-    SLAB_DISCRIMINATOR, SLAB_NONE_INDEX, SLAB_POOL_CAPACITY, SLAB_TREE_CAPACITY,
-    STATS_DISCRIMINATOR, TRADING_VAULT_DISCRIMINATOR, VAULT_SHARE_DISCRIMINATOR,
+    PYTH_V2_MIN_LEN, PYTH_V2_OFFSET_CONF, PYTH_V2_OFFSET_EXPONENT, PYTH_V2_OFFSET_POSTED_SLOT,
+    PYTH_V2_OFFSET_PRICE, PYTH_V2_OFFSET_PUBLISH_TIME, PYTH_V2_OFFSET_VERIFICATION_LEVEL,
+    PYTH_V2_OFFSET_VERIFICATION_NUM_SIGS, PYTH_V2_PRICE_UPDATE_DISCRIMINATOR,
+    PYTH_V2_VERIFICATION_FULL, PYTH_V2_VERIFICATION_PARTIAL, SLAB_DISCRIMINATOR, SLAB_NONE_INDEX,
+    SLAB_POOL_CAPACITY, SLAB_TREE_CAPACITY, STATS_DISCRIMINATOR, TRADING_VAULT_DISCRIMINATOR,
+    VAULT_SHARE_DISCRIMINATOR,
 };
 use solana_program::{
     account_info::AccountInfo,
@@ -387,6 +397,7 @@ pub fn process_instruction(
         30 => process_slab_place_order(program_id, accounts, payload),
         31 => process_slab_match(program_id, accounts, payload),
         32 => process_place_order_checked_pyth(program_id, accounts, payload),
+        33 => process_place_order_checked_pyth_v2(program_id, accounts, payload),
         unknown => {
             msg!("unknown instruction tag: {}", unknown);
             Err(ProgramError::InvalidInstructionData)
@@ -1966,6 +1977,163 @@ fn process_place_order_checked_pyth(
     Ok(())
 }
 
+/// Pyth v2-backed peer to `PlaceOrderChecked` (Chapter 9 §9.5 v2 walk).
+///
+/// Identical to `PlaceOrderCheckedPyth` (tag 32) except slot 2 holds a
+/// PriceUpdateV2 account written by Pyth's `pyth-solana-receiver`
+/// program. The client-side transaction is expected to include a
+/// `pyth-solana-receiver::post_update_v2` instruction before this one,
+/// so `posted_slot` is fresh by the time the gauntlet runs.
+///
+/// Payload (same as PlaceOrderChecked): [side u8][price u64 LE][size u64 LE]
+///
+/// Accounts: same shape as PlaceOrderCheckedPyth, modulo what's at slot 2.
+///   0. `[WRITE, SIGNER]` user
+///   1. `[WRITE]`         book
+///   2. `[]`              pyth_price_update  — PriceUpdateV2 account
+///   3. `[]`              market
+///   4. `[]`              mint
+///   5. `[WRITE]`         user_token
+///   6. `[WRITE]`         fee_vault_token
+///   7. `[]`              token_program
+fn process_place_order_checked_pyth_v2(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != PLACE_ORDER_CHECKED_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let order_side = payload[0];
+    let price = u64::from_le_bytes(payload[1..9].try_into().expect("8 bytes"));
+    let size = u64::from_le_bytes(payload[9..17].try_into().expect("8 bytes"));
+    if order_side != side::BID && order_side != side::ASK {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if price == 0 || size == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let user_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let book_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let pyth_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let market_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let mint_ai = accounts.get(4).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let user_token_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let fee_vault_ai = accounts.get(6).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let token_ai = accounts.get(7).ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+    if !user_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if book_ai.owner != program_id || book_ai.data_len() != OrderBook::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if market_ai.owner != program_id || market_ai.data_len() != Market::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if mint_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if user_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if token_ai.key != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    let (expected_book, _) =
+        Pubkey::find_program_address(&[BOOK_SEED, market_ai.key.as_ref()], program_id);
+    if book_ai.key != &expected_book {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    {
+        let market_data = market_ai.try_borrow_data()?;
+        let market: &Market = bytemuck::from_bytes(&market_data[..Market::LEN]);
+        if market.discriminator != MARKET_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        if market.quote_mint != *mint_ai.key.as_ref() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
+    verify_fee_vault_token_account(fee_vault_ai, mint_ai.key, program_id)?;
+
+    // (1) Pyth v2 reader. The reader doesn't verify VAAs; that's done by
+    // Pyth's receiver program before the consumer transaction lands.
+    let mark = read_fresh_pyth_v2_oracle(pyth_ai)?;
+
+    // (2)-(5) — identical to PlaceOrderChecked / PlaceOrderCheckedPyth.
+    let band = mark.saturating_mul(SANITY_BAND_BPS) / 10_000;
+    let low = mark.saturating_sub(band);
+    let high = mark.saturating_add(band);
+    if price < low || price > high {
+        msg!(
+            "place_order_checked_pyth_v2: price {} outside band [{}, {}] (mark={})",
+            price,
+            low,
+            high,
+            mark
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let notional_val = (price as u128) * (size as u128);
+    let protocol_fee = (notional_val * (PROTOCOL_FEE_BPS as u128) / 10_000) as u64;
+    msg!(
+        "place_order_checked_pyth_v2: side={} price={} size={} mark={} protocol_fee={}",
+        order_side,
+        price,
+        size,
+        mark,
+        protocol_fee
+    );
+
+    {
+        let mut data = book_ai.try_borrow_mut_data()?;
+        let book: &mut OrderBook = bytemuck::from_bytes_mut(&mut data[..OrderBook::LEN]);
+        if book.discriminator != ORDER_BOOK_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        let mut chosen_slot: Option<usize> = None;
+        for (i, slot) in book.slots.iter().enumerate() {
+            if slot.size == 0 {
+                chosen_slot = Some(i);
+                break;
+            }
+        }
+        let slot_idx = chosen_slot.ok_or(ProgramError::AccountDataTooSmall)?;
+        let order_id = book.next_order_id;
+        book.next_order_id = book.next_order_id.saturating_add(1);
+        book.active_count = book.active_count.saturating_add(1);
+        let mut owner = [0u8; 32];
+        owner.copy_from_slice(user_ai.key.as_ref());
+        book.slots[slot_idx] = Order {
+            order_id,
+            price,
+            size,
+            owner,
+            side: order_side,
+            _pad: [0u8; 7],
+        };
+        msg!(
+            "place_order_checked_pyth_v2: placed order_id={} into slot {}",
+            order_id,
+            slot_idx
+        );
+    }
+
+    spl_token_transfer_user_signed(
+        user_token_ai,
+        fee_vault_ai,
+        user_ai,
+        token_ai,
+        protocol_fee,
+    )?;
+
+    Ok(())
+}
+
 // =============================================================================
 // Funding — CreateFundingState + UpdateFunding (Chapter 10).
 // =============================================================================
@@ -2309,6 +2477,119 @@ fn read_fresh_pyth_v1_oracle(
         return Err(ProgramError::InvalidAccountData);
     }
     msg!("pyth: price={} conf={} expo={}", price_i, conf, expo);
+    Ok(price_i as u64)
+}
+
+/// Read a fresh aggregate price from a Pyth v2 `PriceUpdateV2` account
+/// — the post-VAA-verification output of Pyth's `pyth-solana-receiver`
+/// program. We do NOT verify the VAA ourselves; the receiver is shared
+/// infrastructure and has done that already. We only need to:
+///
+///   1. Confirm the account is what its 8-byte Anchor discriminator
+///      claims it is.
+///   2. Apply the staleness gauntlet against `posted_slot`.
+///   3. Refuse non-positive prices, same as the v1 + mock paths.
+///
+/// The consumer transaction (client-side) is expected to call Pyth's
+/// receiver `post_update_v2` instruction *before* this trade instruction,
+/// in the same transaction, so `posted_slot` is fresh. The chapter
+/// (§9.5 v2 walk) explains the two-instruction pattern.
+///
+/// As with the v1 reader, `exponent` is logged but not applied to the
+/// returned u64 — the chapter calls out the normalization step a
+/// production deployment would add.
+fn read_fresh_pyth_v2_oracle(
+    oracle_ai: &AccountInfo,
+) -> Result<u64, ProgramError> {
+    let data = oracle_ai.try_borrow_data()?;
+    if data.len() < PYTH_V2_MIN_LEN {
+        msg!(
+            "pyth_v2: account too small ({} bytes, need {})",
+            data.len(),
+            PYTH_V2_MIN_LEN
+        );
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // (1) Anchor account discriminator.
+    if data[0..8] != PYTH_V2_PRICE_UPDATE_DISCRIMINATOR {
+        msg!("pyth_v2: discriminator mismatch (not a PriceUpdateV2)");
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // (2) VerificationLevel — log for observability. The chapter does NOT
+    // gate on it; a production deployment that demands `Full` (= every
+    // guardian signature verified) would add `if level != FULL { ... }`.
+    let level_tag = data[PYTH_V2_OFFSET_VERIFICATION_LEVEL];
+    let level_str = match level_tag {
+        x if x == PYTH_V2_VERIFICATION_PARTIAL => {
+            let n = data[PYTH_V2_OFFSET_VERIFICATION_NUM_SIGS];
+            msg!("pyth_v2: verification_level = Partial({} sigs)", n);
+            "partial"
+        }
+        x if x == PYTH_V2_VERIFICATION_FULL => {
+            msg!("pyth_v2: verification_level = Full");
+            "full"
+        }
+        other => {
+            msg!("pyth_v2: unknown verification_level tag {}", other);
+            return Err(ProgramError::InvalidAccountData);
+        }
+    };
+    let _ = level_str;
+
+    // (3) Staleness — same Clock-based check as v1 + mock, measured
+    // against posted_slot (the Solana slot in which the receiver wrote
+    // this update).
+    let posted_slot = u64::from_le_bytes(
+        data[PYTH_V2_OFFSET_POSTED_SLOT..PYTH_V2_OFFSET_POSTED_SLOT + 8]
+            .try_into()
+            .expect("8 bytes"),
+    );
+    let clock = Clock::get()?;
+    let age = clock.slot.saturating_sub(posted_slot);
+    if age > MAX_ORACLE_STALENESS_SLOTS {
+        msg!(
+            "pyth_v2: stale ({} slots, max {})",
+            age,
+            MAX_ORACLE_STALENESS_SLOTS
+        );
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // (4) Read price + log exponent + conf.
+    let price_i = i64::from_le_bytes(
+        data[PYTH_V2_OFFSET_PRICE..PYTH_V2_OFFSET_PRICE + 8]
+            .try_into()
+            .expect("8 bytes"),
+    );
+    let conf = u64::from_le_bytes(
+        data[PYTH_V2_OFFSET_CONF..PYTH_V2_OFFSET_CONF + 8]
+            .try_into()
+            .expect("8 bytes"),
+    );
+    let exponent = i32::from_le_bytes(
+        data[PYTH_V2_OFFSET_EXPONENT..PYTH_V2_OFFSET_EXPONENT + 4]
+            .try_into()
+            .expect("4 bytes"),
+    );
+    let publish_time = i64::from_le_bytes(
+        data[PYTH_V2_OFFSET_PUBLISH_TIME..PYTH_V2_OFFSET_PUBLISH_TIME + 8]
+            .try_into()
+            .expect("8 bytes"),
+    );
+
+    if price_i <= 0 {
+        msg!("pyth_v2: non-positive price ({})", price_i);
+        return Err(ProgramError::InvalidAccountData);
+    }
+    msg!(
+        "pyth_v2: price={} conf={} exponent={} publish_time={}",
+        price_i,
+        conf,
+        exponent,
+        publish_time
+    );
     Ok(price_i as u64)
 }
 
