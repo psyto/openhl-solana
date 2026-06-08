@@ -15,6 +15,7 @@ members = [
     "scripts/match",
     "scripts/oracle",
     "scripts/position",
+    "scripts/scenario",
     "scripts/slab",
     "scripts/stats",
     "scripts/vault",

@@ -1,0 +1,18 @@
+[package]
+name = "scenario"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Sandbox scenario surface. Discovers, inspects, and walks through pre-baked openhl-solana scenarios. See fabrknt/website/SANDBOX-PATTERN.md for the cross-engine 5-element spec this implements."
+
+[[bin]]
+name = "scenario"
+path = "src/main.rs"
+
+[dependencies]
+clap     = { workspace = true }
+anyhow   = { workspace = true }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
