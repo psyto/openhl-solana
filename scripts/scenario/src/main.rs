@@ -271,14 +271,32 @@ fn run_embedded(scenario: &Scenario, path: &Path) -> Result<EmbeddedReport> {
             continue;
         }
 
-        let argv: Vec<&str> = trimmed.split_whitespace().collect();
-        let (program, args) = match argv.split_first() {
-            Some((p, a)) => (*p, a.to_vec()),
-            None => continue,
+        // Shell-metacharacter detection: steps that chain commands via
+        // `&&`, `||`, `;`, or pipes can't be naïvely whitespace-split
+        // — route those through `sh -c`. Non-meta commands keep the
+        // direct-spawn path.
+        let has_shell_metas = trimmed.contains("&&")
+            || trimmed.contains("||")
+            || trimmed.contains(';')
+            || trimmed.contains('|')
+            || trimmed.contains('>')
+            || trimmed.contains('<');
+
+        let mut cmd = if has_shell_metas {
+            let mut c = Command::new("sh");
+            c.args(["-c", trimmed]);
+            c
+        } else {
+            let argv: Vec<&str> = trimmed.split_whitespace().collect();
+            let (program, args) = match argv.split_first() {
+                Some((p, a)) => (*p, a.to_vec()),
+                None => continue,
+            };
+            let mut c = Command::new(program);
+            c.args(&args);
+            c
         };
 
-        let mut cmd = Command::new(program);
-        cmd.args(&args);
         let status = cmd.status();
 
         match status {
@@ -298,9 +316,11 @@ fn run_embedded(scenario: &Scenario, path: &Path) -> Result<EmbeddedReport> {
             Err(e) => {
                 println!();
                 println!("  ✗ step {} failed to spawn: {e}", i + 1);
-                println!(
-                    "    (program: {program:?}; verify {program} is in PATH and the workspace is built)"
-                );
+                if has_shell_metas {
+                    println!("    (routed via `sh -c` because the command contains shell metacharacters; check that `sh` is available)");
+                } else {
+                    println!("    (verify the first token of the command is in PATH and the workspace is built)");
+                }
                 report.failed += 1;
             }
         }

@@ -16,15 +16,15 @@ This is the engine behind Fabrknt's [Solana Perp Sandbox](https://fabrknt.com/so
 
 - Not Anchor. Every program uses `entrypoint!`, `AccountInfo`, and manual deserialization. Anchor is the abstraction this engine deliberately avoids — partly so byte layouts are pinned, partly so CU costs are inspectable without an abstraction tax.
 - Not production. No mainnet deployment, no fee capture, no governance, no keeper infra. The `match` instruction deliberately omits settlement transfers from the hot path; the mock oracle is open-auth; the `Stats` singleton is included as a parallelism counter-example, not a recommendation.
-- Not a Solana tutorial in itself. The depth-and-learning surface for Solana internals lives on SolDojo (see [Curriculum companion](#curriculum-companion) below). This repo is the product-facing sandbox engine.
+- Not a Solana tutorial. The depth-and-learning surface for Solana internals lives on SolDojo; this repo is product-facing. SolDojo imports some of this code as worked examples, but the curriculum framing is theirs — see [Curriculum companion](#curriculum-companion-separate-audience) for the boundary.
 
 ## Design choices worth noting
 
 These choices are what make the engine valuable as a sandbox surface:
 
 - **Bytes-up layouts.** Every account state can be dumped, byte-diffed, and reasoned about without a deserializer. Scenarios can verify "after this instruction, byte 0x28 holds X" with no library.
-- **CU costs surfaced.** The `bench` script (Chapter 4 in the curriculum) is a CU instrumentation harness; per-instruction CU is one of the headline numbers the sandbox tracks.
-- **Deliberate counter-examples.** The flat-array `OrderBook` (Chapter 7/8) is kept alongside the critbit `Slab` (Chapter 15) so a scenario can compare the two on the same matching workload — a direct illustration of how Solana compute constraints shape DEX design.
+- **CU costs surfaced.** A dedicated `bench` script is a CU instrumentation harness; per-instruction CU is one of the headline numbers the sandbox tracks.
+- **Deliberate counter-examples.** The flat-array `OrderBook` is kept alongside the critbit `Slab` so a scenario can compare the two on the same matching workload — a direct illustration of how Solana compute constraints shape DEX design.
 
 ## How to explore (today)
 
@@ -81,35 +81,33 @@ Per `fabrknt/website/SANDBOX-PATTERN.md`, every Fabrknt sandbox must ship five e
 | Element | Status | Notes |
 |---|---|---|
 | (1) Pre-baked scenarios | **present** | `scenarios/` directory with 3 scenarios (`bring-up`, `matching-cu-comparison`, `liquidation-walkthrough`). More to follow as additional script combinations are scripted. |
-| (2) Business-readable output | **v1 present** | `scenario run` spawns each step as a sub-process with stdio inherited, wrapped with a headline header, per-step separators, and a final pass/fail verdict. Step output (each script's CU prints + account dumps) streams live. v2 will tee stdio so declared expect-substrings can be verified. |
+| (2) Business-readable output | **partial** | `scenario run` spawns each step as a sub-process and inherits stdio — the underlying script output (CU prints, account dumps, raw program logs) is operator-style, wrapped only by a scenario header + per-step pass/fail verdict + final tally. A true business-readable layer (named outcomes, CU summary table, account-state diff in non-operator language) is v2 work. |
 | (3) Parameter dial | partial | Per-step args (e.g., `--price 80`) provide a dial. Engine-level parameters (tick size, funding interval, liquidation buffer) are still recompiled into the program. |
 | (4) Scenario replay | **present** | Each scenario file is a deterministic step list — re-running yields the same sub-process invocations. Bit-identical state requires `solana-test-validator --reset` between runs. |
 | (5) CTA | **done** | `scenario list` / `show` / `run` all render a three-option CTA footer (adopt engine / custom build / hosted access) with `product=solana-perp` for waitlist enrichment. |
 
 ## Scripts as scenario surface
 
-The 15 scripts under `scripts/` map roughly to perp DEX feature areas. Today they are ordered by curriculum chapter; the sandbox grouping (planned) collapses them into themed scenarios:
+The scripts under `scripts/` cover the perp DEX feature areas. The sandbox scenarios compose them by theme:
 
-| Script | Curriculum ch. | Sandbox theme (planned) |
-|---|---|---|
-| `allocate-market`, `init-market`, `create-market` | ch.1–3 | Bring-up |
-| `bench` | ch.4 | CU cost comparison |
-| `stats` | ch.5 | Sealevel parallelism counter-example |
-| `create-vault`, `deposit` | ch.6 | Collateral flow |
-| `book`, `match`, `slab` | ch.7, 8, 15 | Order matching (flat-array vs critbit) |
-| `oracle` | ch.9 | Oracle ingestion |
-| `funding` | ch.10 | Funding accumulator |
-| `position` | ch.11 | Liquidation + insurance fund |
-| `vault` | ch.12 | Trading vault NAV |
-| `builder` | ch.13 | Builder codes / fee claim |
+| Sandbox theme | Scripts |
+|---|---|
+| Bring-up | `allocate-market`, `init-market`, `create-market` |
+| CU cost measurement | `bench` |
+| Sealevel parallelism counter-example | `stats` |
+| Collateral flow | `create-vault`, `deposit` |
+| Order matching (flat-array vs critbit) | `book`, `match-cli`, `slab` |
+| Oracle ingestion | `oracle` |
+| Funding accumulator | `funding` |
+| Liquidation + insurance fund | `position` |
+| Trading vault NAV | `vault` |
+| Builder codes / fee claim | `builder` |
 
-## Curriculum companion
+## Curriculum companion (separate audience)
 
-This repo doubles as the code companion for the **SolDojo Solana Internals** track. Chapter drafts live under [`docs/chapter-XX-*/`](./docs/) (DRAFT.en.md / DRAFT.ja.md), with each chapter teaching one piece of the Solana runtime by building one primitive against it. Published lessons live on SolDojo and import the drafts from this repo via provenance notes.
+This repo's code is also imported by the **SolDojo Solana Internals** track. The chapter drafts under [`docs/chapter-XX-*/`](./docs/) and any `Chapter N` references in `crates/state` / program source are SolDojo material — they are explicitly NOT part of the Fabrknt sandbox surface. A buyer arriving via Fabrknt should never need to read them; a learner arriving via SolDojo walks them chapter-by-chapter.
 
-**Important:** the curriculum framing is the SolDojo audience, not the Fabrknt sandbox audience. A buyer arriving via Fabrknt who wants to understand the sandbox should not need to read 15 chapters first. A learner arriving via SolDojo who wants to understand the runtime walks chapter-by-chapter. Both paths use the same code; the two READMEs (this one + SolDojo's) frame it for the right audience.
-
-Chapter directories stay at `docs/chapter-XX-*/` (not moved) to preserve the file-path provenance SolDojo's imports already cite.
+Directories are kept at `docs/chapter-XX-*/` only so SolDojo's existing provenance imports don't break.
 
 ## Build
 
@@ -123,8 +121,8 @@ cargo test --workspace                # unit + integration tests
 
 - [`fabrknt/website/CONCEPT.md`](../fabrknt/website/CONCEPT.md) — the Fabrknt brand and 2x2 sandbox structure.
 - [`fabrknt/website/SANDBOX-PATTERN.md`](../fabrknt/website/SANDBOX-PATTERN.md) — cross-engine spec for the five sandbox elements.
-- [`docs/`](./docs/) — chapter drafts (SolDojo curriculum source).
 - Sibling Fabrknt engines: [`rdk/openhl`](../rdk/openhl/) (EVM Perp Sandbox), [`rdk/princeps`](../rdk/princeps/) (EVM Prime Broker Sandbox).
+- [`docs/`](./docs/) — chapter drafts (SolDojo material; out-of-scope for the sandbox).
 
 ## License
 
