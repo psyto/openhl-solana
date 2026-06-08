@@ -13,3 +13,4 @@ test-ledger/
 # Local keys
 *.json
 !Cargo.json
+!scenarios/*.json

@@ -1,0 +1,30 @@
+{
+  "name": "bring-up",
+  "category": "bring-up",
+  "description": "Bring a Solana perp market up from zero. Walk through every account the on-chain program needs to operate: the Market header (allocate → initialize), the per-market PDA (create-market), and the per-(market, mint) vault PDA (create-vault). End with a deposit to confirm the vault works. This scenario is the minimum needed before any of the trading / liquidation / funding scenarios make sense.",
+  "headline": "Stand up a fresh perp market on local-validator: 5 instructions, ~50 KCU total.",
+  "steps": [
+    {
+      "explanation": "Allocate a raw Market account (Chapter 1). Pure SystemProgram::CreateAccount; no openhl-core invocation yet.",
+      "command": "cargo run -p allocate-market"
+    },
+    {
+      "explanation": "Initialize the allocated Market in place (Chapter 2). First call into openhl-core's `Initialize` instruction; writes the discriminator + initial state.",
+      "command": "cargo run -p init-market",
+      "expect": "Market initialized"
+    },
+    {
+      "explanation": "Derive + create the per-market PDA via `invoke_signed` (Chapter 3). PDA seeds are `[\"market\", market.key]`. This is what most subsequent instructions sign against.",
+      "command": "cargo run -p create-market"
+    },
+    {
+      "explanation": "Allocate the per-(market, mint) collateral vault PDA (Chapter 6, part 1). Seeds: `[\"vault\", market, mint]`.",
+      "command": "cargo run -p create-vault"
+    },
+    {
+      "explanation": "Deposit collateral into the vault via CPI to SPL Token (Chapter 6, part 2). Demonstrates the CPI permission pattern and shows the vault accepting funds.",
+      "command": "cargo run -p deposit",
+      "expect": "deposit successful"
+    }
+  ]
+}
