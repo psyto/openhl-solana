@@ -37,10 +37,14 @@ cargo run -p scenario -- list
 # Inspect one without running.
 cargo run -p scenario -- show liquidation-walkthrough
 
-# Print the step-by-step recipe (cargo-run invocations + explanations).
-# v0 prints the steps; v1 will execute them in-process and aggregate
-# CU-cost output across steps. See `scripts/scenario/src/main.rs`.
+# Run the scenario: each step (cargo run -p X -- args) is spawned as
+# a sub-process with stdio inherited so per-step CU prints + account
+# dumps stream live. Requires solana-test-validator + a deployed
+# openhl-core (see PREREQUISITES section of the output).
 cargo run -p scenario -- run liquidation-walkthrough
+
+# Pass --dry-run to print only the step list without executing.
+cargo run -p scenario -- run liquidation-walkthrough --dry-run
 ```
 
 Three scenarios ship today: `bring-up` (allocate → init → create-market → create-vault → deposit), `matching-cu-comparison` (flat OrderBook vs critbit Slab CU comparison), `liquidation-walkthrough` (open position → oracle drop → liquidate).
@@ -76,10 +80,10 @@ Per `fabrknt/website/SANDBOX-PATTERN.md`, every Fabrknt sandbox must ship five e
 
 | Element | Status | Notes |
 |---|---|---|
-| (1) Pre-baked scenarios | **partial → present** | `scenarios/` directory with 3 scenarios (`bring-up`, `matching-cu-comparison`, `liquidation-walkthrough`). More to follow as additional script combinations are scripted. |
-| (2) Business-readable output | partial | `scenario list` / `show` / `run` produce ASCII tables with headlines. Per-step CU costs from each underlying script are still raw stdout (e.g., `match-cli`'s CU print). v1 will aggregate the per-step output into a single headline + delta. |
-| (3) Parameter dial | partial | Per-step args (e.g., `--price 80` in `liquidation-walkthrough`) provide a dial. Engine-level parameters (tick size, funding interval, liquidation buffer) are still recompiled into the program. |
-| (4) Scenario replay | partial | Each scenario file is a deterministic step list — re-running yields the same sequence. Bit-identical state requires `solana-test-validator --reset` between runs. |
+| (1) Pre-baked scenarios | **present** | `scenarios/` directory with 3 scenarios (`bring-up`, `matching-cu-comparison`, `liquidation-walkthrough`). More to follow as additional script combinations are scripted. |
+| (2) Business-readable output | **v1 present** | `scenario run` spawns each step as a sub-process with stdio inherited, wrapped with a headline header, per-step separators, and a final pass/fail verdict. Step output (each script's CU prints + account dumps) streams live. v2 will tee stdio so declared expect-substrings can be verified. |
+| (3) Parameter dial | partial | Per-step args (e.g., `--price 80`) provide a dial. Engine-level parameters (tick size, funding interval, liquidation buffer) are still recompiled into the program. |
+| (4) Scenario replay | **present** | Each scenario file is a deterministic step list — re-running yields the same sub-process invocations. Bit-identical state requires `solana-test-validator --reset` between runs. |
 | (5) CTA | **done** | `scenario list` / `show` / `run` all render a three-option CTA footer (adopt engine / custom build / hosted access) with `product=solana-perp` for waitlist enrichment. |
 
 ## Scripts as scenario surface

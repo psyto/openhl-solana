@@ -8,11 +8,17 @@
 //! (4) replay (the JSON IS the replay format — re-running yields the
 //! same sequence), (5) CTA footer with three options.
 //!
-//! v0 prints the step list with explanations rather than executing in
-//! sub-processes. Embedded execution + CU-cost aggregation lands in v1.
+//! v1 spawns each `cargo run -p X -- ...` step as a sub-process with
+//! stdio inherited, so each script's own output (CU cost prints,
+//! account dumps, etc.) streams live to the operator's terminal.
+//! Comment / off-CLI hint lines are skipped and printed as info.
+//!
+//! v0 (legacy `render_run_v0`) prints only the step list; kept
+//! exported for the `--dry-run` flag.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -44,13 +50,18 @@ enum Action {
         #[arg(long, default_value = "scenarios")]
         dir: PathBuf,
     },
-    /// Print the scenario's step-by-step recipe of cargo-run invocations.
-    /// (Embedded in-process execution + CU-cost aggregation lands in v1.)
+    /// Run the scenario: spawn each `cargo run -p X -- …` step as a
+    /// sub-process with stdio inherited so each script's CU prints +
+    /// account dumps stream live. Pass `--dry-run` to print only the
+    /// step list without executing.
     Run {
         /// Scenario name (file stem without `.json`).
         name: String,
         #[arg(long, default_value = "scenarios")]
         dir: PathBuf,
+        /// Skip embedded execution; print only the step list.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
 }
 
@@ -201,6 +212,118 @@ fn cta_footer() -> String {
     out
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EmbeddedReport {
+    total: usize,
+    skipped: usize,
+    passed: usize,
+    failed: usize,
+    expectations_unverified: usize,
+}
+
+/// v1 embedded execution: walk each step, spawn `cargo run -p X` (or
+/// any other shell-style command) as a sub-process with stdio
+/// inherited. Comment lines (starting with `#`) are printed as info.
+fn run_embedded(scenario: &Scenario, path: &Path) -> Result<EmbeddedReport> {
+    println!(
+        "─── scenario: {} ────────────────────────────────────",
+        scenario.name
+    );
+    println!("HEADLINE (curator claim): {}", scenario.headline);
+    println!();
+    println!("DESCRIPTION:");
+    for line in scenario.description.lines() {
+        println!("  {line}");
+    }
+    println!();
+    println!("PREREQUISITES (operator's responsibility):");
+    println!("  solana-test-validator --reset    # in another terminal");
+    println!("  cargo build-sbf -p openhl-core");
+    println!("  solana program deploy target/deploy/openhl_core.so");
+    println!();
+
+    let mut report = EmbeddedReport {
+        total: scenario.steps.len(),
+        skipped: 0,
+        passed: 0,
+        failed: 0,
+        expectations_unverified: 0,
+    };
+
+    for (i, step) in scenario.steps.iter().enumerate() {
+        println!(
+            "─── Step {} of {} ───────────────────────────",
+            i + 1,
+            scenario.steps.len()
+        );
+        println!("  {}", step.explanation);
+        println!("  $ {}", step.command);
+        if let Some(expect) = &step.expect {
+            println!("  # (looking for: {expect})");
+        }
+        println!();
+
+        let trimmed = step.command.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            println!("  (informational step — no command executed)");
+            println!();
+            report.skipped += 1;
+            continue;
+        }
+
+        let argv: Vec<&str> = trimmed.split_whitespace().collect();
+        let (program, args) = match argv.split_first() {
+            Some((p, a)) => (*p, a.to_vec()),
+            None => continue,
+        };
+
+        let mut cmd = Command::new(program);
+        cmd.args(&args);
+        let status = cmd.status();
+
+        match status {
+            Ok(s) if s.success() => {
+                println!();
+                println!("  ✓ step {} succeeded (exit 0)", i + 1);
+                report.passed += 1;
+                if step.expect.is_some() {
+                    report.expectations_unverified += 1;
+                }
+            }
+            Ok(s) => {
+                println!();
+                println!("  ✗ step {} exited {}", i + 1, s.code().unwrap_or(-1));
+                report.failed += 1;
+            }
+            Err(e) => {
+                println!();
+                println!("  ✗ step {} failed to spawn: {e}", i + 1);
+                println!(
+                    "    (program: {program:?}; verify {program} is in PATH and the workspace is built)"
+                );
+                report.failed += 1;
+            }
+        }
+        println!();
+    }
+
+    println!("─── verdict ───────────────────────────────────────────");
+    println!(
+        "{} step(s): {} passed / {} failed / {} skipped (informational)",
+        report.total, report.passed, report.failed, report.skipped
+    );
+    if report.expectations_unverified > 0 {
+        println!(
+            "{} step(s) declared expected-output substrings; v1 cannot verify these because it inherits stdio (v2 will tee).",
+            report.expectations_unverified
+        );
+    }
+    println!("source: {}", path.display());
+    print!("{}", cta_footer());
+
+    Ok(report)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.action {
@@ -220,10 +343,20 @@ fn main() -> Result<()> {
             let s = load_from_path(&path)?;
             print!("{}", render_show(&s, &path));
         }
-        Action::Run { name, dir } => {
+        Action::Run { name, dir, dry_run } => {
             let path = dir.join(format!("{name}.json"));
             let s = load_from_path(&path)?;
-            print!("{}", render_run_v0(&s, &path));
+            if dry_run {
+                print!("{}", render_run_v0(&s, &path));
+            } else {
+                let report = run_embedded(&s, &path)?;
+                if report.failed > 0 {
+                    return Err(anyhow!(
+                        "{} step(s) failed during scenario run",
+                        report.failed
+                    ));
+                }
+            }
         }
     }
     Ok(())
