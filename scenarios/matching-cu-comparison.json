@@ -1,25 +1,25 @@
 {
   "name": "matching-cu-comparison",
-  "category": "performance",
-  "description": "Compare the compute-unit cost of two orderbook implementations on the same matching workload: the deliberately-simple flat-array OrderBook (Chapter 7/8) and the critbit-tree Slab (Chapter 15). The flat OrderBook is O(N) per fill — it exposes how Solana's per-instruction CU budget (default 200K) constrains DEX design at scale. The Slab amortizes to O(log N). Both are valid on-chain implementations; the gap is exactly what Solana's compute model rewards. Use this scenario when evaluating which data structure to use on your own market.",
+  "category": "comparison",
+  "description": "Compare the compute-unit cost of two orderbook implementations on the same matching workload: the deliberately-simple flat-array OrderBook and the critbit-tree Slab. The flat OrderBook is O(N) per fill — it exposes how Solana's per-instruction CU budget (default 200K) constrains DEX design at scale. The Slab amortizes to O(log N). Both are valid on-chain implementations; the gap is exactly what Solana's compute model rewards. Use this scenario when evaluating which data structure to use on your own market.",
   "headline": "Same matching workload, two orderbook backends. Flat O(N) vs critbit O(log N) measured in CUs.",
   "steps": [
     {
-      "explanation": "Boot the flat-array OrderBook and place 16 resting maker orders on each side (Chapter 7).",
+      "explanation": "Boot the flat-array OrderBook and place 16 resting maker orders on each side.",
       "command": "cargo run -p book"
     },
     {
-      "explanation": "Cross with a market order; measure CUs consumed (Chapter 8). The match-cli surfaces the CU cost on stdout.",
+      "explanation": "Cross with a market order; measure CUs consumed. The match-cli surfaces the CU cost on stdout.",
       "command": "cargo run -p match-cli",
       "expect": "compute units consumed"
     },
     {
-      "explanation": "Repeat the workload against the critbit Slab (Chapter 15). Compare its CU output against match-cli's.",
+      "explanation": "Repeat the workload against the critbit Slab. Compare its CU output against match-cli's.",
       "command": "cargo run -p slab",
       "expect": "compute units consumed"
     },
     {
-      "explanation": "Run the dedicated CU instrumentation harness for finer-grained measurements (Chapter 4).",
+      "explanation": "Run the dedicated CU instrumentation harness for finer-grained measurements.",
       "command": "cargo run -p bench"
     }
   ]

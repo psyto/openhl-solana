@@ -1,15 +1,15 @@
 {
   "name": "liquidation-walkthrough",
-  "category": "liquidation",
+  "category": "stress",
   "description": "Walk through the liquidation engine on Solana end-to-end. First set an oracle price and open a leveraged position. Then push the oracle through the maintenance threshold. Observe the liquidation engine close the position and route the loss to the insurance fund. Compare what happens with and without the insurance fund having balance — the latter is where ADL (auto-deleveraging) would fire in a fully wired runtime. Useful for evaluating how the perp liquidation path behaves on Solana's account model + CU budget.",
   "headline": "Open a leveraged long; oracle drops; liquidation engine closes the position; insurance fund absorbs the loss.",
   "steps": [
     {
-      "explanation": "Initialize the mock oracle and set the initial price (Chapter 9). The mock oracle is open-auth on purpose; production deployments swap it for Pyth-signed observations.",
+      "explanation": "Initialize the mock oracle and set the initial price. The mock oracle is open-auth on purpose; production deployments swap it for Pyth-signed observations.",
       "command": "cargo run -p oracle"
     },
     {
-      "explanation": "Open a long position via OpenPosition (Chapter 11).",
+      "explanation": "Open a long position via OpenPosition.",
       "command": "cargo run -p position -- open"
     },
     {
@@ -17,12 +17,12 @@
       "command": "cargo run -p oracle -- set-price --price 80"
     },
     {
-      "explanation": "Invoke the Liquidate instruction. The on-chain engine closes the underwater position and debits the insurance fund for the shortfall (Chapter 11).",
+      "explanation": "Invoke the Liquidate instruction. The on-chain engine closes the underwater position and debits the insurance fund for the shortfall.",
       "command": "cargo run -p position -- liquidate",
       "expect": "liquidated"
     },
     {
-      "explanation": "Run the funding-rate accumulator for one period (Chapter 10). With the position closed, this is a clean per-block step — useful for confirming funding ticks proceed cleanly after a liquidation.",
+      "explanation": "Run the funding-rate accumulator for one period. With the position closed, this is a clean per-block step — useful for confirming funding ticks proceed cleanly after a liquidation.",
       "command": "cargo run -p funding"
     }
   ]
