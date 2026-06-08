@@ -212,6 +212,20 @@ fn cta_footer() -> String {
     out
 }
 
+/// Detect whether `command` contains shell metacharacters that mean it
+/// can't be naïvely whitespace-split into argv. Returns true for
+/// command chains (`&&`, `||`, `;`) and pipes (`|`).
+///
+/// **Intentionally excluded**: `<` and `>`. Curated scenarios use
+/// `<PLACEHOLDER>` syntax for operator-substituted values; treating
+/// those as shell redirects breaks every placeholder step.
+fn has_shell_metacharacters(command: &str) -> bool {
+    command.contains("&&")
+        || command.contains("||")
+        || command.contains(';')
+        || command.contains('|')
+}
+
 #[derive(Debug, Clone, Copy)]
 struct EmbeddedReport {
     total: usize,
@@ -271,18 +285,7 @@ fn run_embedded(scenario: &Scenario, path: &Path) -> Result<EmbeddedReport> {
             continue;
         }
 
-        // Shell-metacharacter detection: steps that chain commands via
-        // `&&`, `||`, `;`, or pipes can't be naïvely whitespace-split
-        // — route those through `sh -c`. Non-meta commands keep the
-        // direct-spawn path.
-        //
-        // `<` and `>` are intentionally excluded — scenarios use
-        // `<PLACEHOLDER>` syntax for operator-substituted values, and
-        // treating them as shell redirects would break those steps.
-        let has_shell_metas = trimmed.contains("&&")
-            || trimmed.contains("||")
-            || trimmed.contains(';')
-            || trimmed.contains('|');
+        let has_shell_metas = has_shell_metacharacters(trimmed);
 
         let mut cmd = if has_shell_metas {
             let mut c = Command::new("sh");
@@ -442,5 +445,33 @@ mod tests {
         assert!(out.contains("Step 1 — Allocate the Market account."));
         assert!(out.contains("$ cargo run -p allocate-market"));
         assert!(out.contains("expect output to include: Market account allocated"));
+    }
+
+    /// Regression tests for shell-metachar detection.
+
+    #[test]
+    fn metachar_routes_chains_through_sh() {
+        assert!(has_shell_metacharacters("cargo run -p a && cargo run -p b"));
+        assert!(has_shell_metacharacters("a || b"));
+        assert!(has_shell_metacharacters("a; b"));
+        assert!(has_shell_metacharacters("a | grep b"));
+    }
+
+    /// Regression: openhl-solana scenarios don't currently use angle-
+    /// bracket placeholders, but the detection must still match the
+    /// sibling runners' behavior so a future scenario like `cargo run
+    /// -p deposit -- --account <ACCOUNT_ID>` doesn't break.
+    #[test]
+    fn metachar_does_not_match_angle_bracket_placeholders() {
+        assert!(!has_shell_metacharacters(
+            "cargo run -p deposit -- --account <ACCOUNT_ID>"
+        ));
+        assert!(!has_shell_metacharacters("cmd <input> output"));
+    }
+
+    #[test]
+    fn metachar_does_not_match_plain_commands() {
+        assert!(!has_shell_metacharacters("cargo run -p oracle"));
+        assert!(!has_shell_metacharacters("cargo run -p position -- liquidate"));
     }
 }
