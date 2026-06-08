@@ -16,3 +16,8 @@ clap     = { workspace = true }
 anyhow   = { workspace = true }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Used by the in-process account_layout_demo to inspect on-chain
+# account layouts (sizes, discriminators, versions) without needing
+# a validator or deployed program. State-crate-only, no Solana
+# runtime dependency for this binary.
+openhl-state = { path = "../../crates/state" }

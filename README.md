@@ -47,7 +47,11 @@ cargo run -p scenario -- run liquidation-walkthrough
 cargo run -p scenario -- run liquidation-walkthrough --dry-run
 ```
 
-Three scenarios ship today: `bring-up` (allocate → init → create-market → create-vault → deposit), `matching-cu-comparison` (flat OrderBook vs critbit Slab CU comparison), `liquidation-walkthrough` (open position → oracle drop → liquidate).
+Four scenarios ship today:
+- **`account-layout-demo`** (v2, no validator needed) — pure-Rust inspection of every on-chain account type via `openhl-state` constants; renders a byte-precise size table + OrderBook-vs-Slab density comparison.
+- `bring-up` — allocate → init → create-market → create-vault → deposit (v1, sub-process).
+- `matching-cu-comparison` — flat OrderBook vs critbit Slab CU comparison on a live validator (v1, sub-process).
+- `liquidation-walkthrough` — open position → oracle drop → liquidate (v1, sub-process).
 
 ### Drive individual scripts directly
 
@@ -81,7 +85,7 @@ Per `fabrknt/website/SANDBOX-PATTERN.md`, every Fabrknt sandbox must ship five e
 | Element | Status | Notes |
 |---|---|---|
 | (1) Pre-baked scenarios | **present** | `scenarios/` directory with 3 scenarios (`bring-up`, `matching-cu-comparison`, `liquidation-walkthrough`). More to follow as additional script combinations are scripted. |
-| (2) Business-readable output | **partial** | `scenario run` spawns each step as a sub-process and inherits stdio — the underlying script output (CU prints, account dumps, raw program logs) is operator-style, wrapped only by a scenario header + per-step pass/fail verdict + final tally. A true business-readable layer (named outcomes, CU summary table, account-state diff in non-operator language) is v2 work. |
+| (2) Business-readable output | **v2 done for v2-eligible scenarios** | Scenarios whose steps are all in-process-eligible (currently: `account-layout-demo`) take the v2 path: in-process dispatch into `run_account_layout_demo_structured`, then HEADLINE (with ✓/⚠/unverified badge per `expected_outcomes` verification), TIMELINE, DELTA, OUTCOMES, NEXT. `account-layout-demo` declares 5 outcomes that all verify ✓. Scenarios that need a real validator + deployed program (`bring-up`, `matching-cu-comparison`, `liquidation-walkthrough`) still spawn sub-processes with stdio inherited (v1); converting them requires either lib-izing the scripts or stdio-capture-and-parse — tracked in `fabrknt/website/SANDBOX-BACKLOG.md`. |
 | (3) Parameter dial | partial | Per-step args (e.g., `--price 80`) provide a dial. Engine-level parameters (tick size, funding interval, liquidation buffer) are still recompiled into the program. |
 | (4) Scenario replay | **present** | Each scenario file is a deterministic step list — re-running yields the same sub-process invocations. Bit-identical state requires `solana-test-validator --reset` between runs. |
 | (5) CTA | **done** | `scenario list` / `show` / `run` all render a three-option CTA footer (adopt engine / custom build / hosted access) with `product=solana-perp` for waitlist enrichment. |

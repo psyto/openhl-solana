@@ -1,0 +1,51 @@
+{
+  "name": "account-layout-demo",
+  "category": "walkthrough",
+  "description": "Self-contained, no-validator demo of the on-chain account model. Walks every account type the engine defines (Market, OrderBook, Position, Oracle, Vault, …) and reports the byte-precise layout: discriminator tag, size, version. Compares the flat-array OrderBook against the critbit Slab on density (bytes per order capacity). Pure Rust against `openhl-state` constants — no validator, no program deploy, runs in milliseconds. Useful for asking: how much of the Solana 10KB-per-account budget does one market consume? Where does the Slab pack more orders per byte? Which structs are versioned and which are layout-stable?",
+  "headline": "11 distinct account types, byte-precise; the critbit Slab packs more orders per byte than the flat-array OrderBook.",
+  "steps": [
+    {
+      "explanation": "Inspect every on-chain account type via `openhl-state` constants and report discriminator / size / version, plus the OrderBook-vs-Slab density comparison.",
+      "command": "cargo run -p scenario -- account-layout-demo",
+      "expect": "OrderBook"
+    }
+  ],
+  "expected_outcomes": [
+    {
+      "name": "min-account-types",
+      "description": "At least 10 distinct account types are inspected",
+      "check": {
+        "account_types_min": 10
+      }
+    },
+    {
+      "name": "market-is-versioned",
+      "description": "Market has fixed size of 256 bytes (v0 layout)",
+      "check": {
+        "account_type_size": {
+          "type_name": "Market",
+          "expected": 256
+        }
+      }
+    },
+    {
+      "name": "orderbook-capacity-32",
+      "description": "OrderBook capacity is exactly 32 orders (the documented flat-array limit)",
+      "check": {
+        "orderbook_capacity_exact": 32
+      }
+    },
+    {
+      "name": "slab-beats-orderbook",
+      "description": "Slab packs more orders per byte than the flat OrderBook",
+      "check": "slab_beats_orderbook_on_density"
+    },
+    {
+      "name": "slab-min-capacity",
+      "description": "Slab capacity is at least 33 orders (strictly larger than the flat 32)",
+      "check": {
+        "slab_capacity_min": 33
+      }
+    }
+  ]
+}

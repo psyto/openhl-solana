@@ -42,6 +42,8 @@
 //! v0 (legacy `render_run_v0`) prints only the step list; kept
 //! exported for the `--dry-run` flag.
 
+mod account_layout_demo;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -89,6 +91,13 @@ enum Action {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+    /// Standalone account-layout inspection demo. Walks every on-chain
+    /// account type defined in `openhl-state` and reports
+    /// discriminator + byte size + version. Pure Rust against
+    /// `openhl-state` constants — no validator, no deployed program.
+    /// Same flow the scenario runner v2 path dispatches for the
+    /// `account-layout-demo` scenario.
+    AccountLayoutDemo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +107,151 @@ struct Scenario {
     description: String,
     headline: String,
     steps: Vec<ScenarioStep>,
+    /// v2 Phase 3: optional declarative outcome checks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    expected_outcomes: Vec<ExpectedOutcome>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExpectedOutcome {
+    name: String,
+    description: String,
+    check: SolanaCheck,
+}
+
+/// Engine-specific check schema for openhl-solana. Externally-tagged
+/// JSON so authors write `{"account_types_min": 10}` instead of
+/// `{"kind": "account_types_min", "value": 10}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SolanaCheck {
+    /// Assert at least N distinct account types are inspected.
+    AccountTypesMin(usize),
+    /// Assert exactly N account types are inspected.
+    AccountTypesExact(usize),
+    /// Assert OrderBook total size equals N bytes.
+    OrderbookSizeExact(usize),
+    /// Assert OrderBook capacity (orders) is exactly N.
+    OrderbookCapacityExact(usize),
+    /// Assert Slab capacity (orders) is at least N.
+    SlabCapacityMin(usize),
+    /// Assert Slab packs more orders per byte than the flat OrderBook
+    /// (the engineering claim the scenario headline rests on).
+    SlabBeatsOrderbookOnDensity,
+    /// Assert a specific account type appears with the given byte size.
+    AccountTypeSize { type_name: String, expected: usize },
+}
+
+#[derive(Debug, Clone)]
+enum OutcomeStatus {
+    Pass,
+    Fail(String),
+}
+
+fn evaluate_solana_check(
+    check: &SolanaCheck,
+    result: &account_layout_demo::AccountLayoutDemoResult,
+) -> OutcomeStatus {
+    match check {
+        SolanaCheck::AccountTypesMin(min) => {
+            let observed = result.distinct_account_types();
+            if observed >= *min {
+                OutcomeStatus::Pass
+            } else {
+                OutcomeStatus::Fail(format!(
+                    "observed account_types = {observed} (expected ≥ {min})"
+                ))
+            }
+        }
+        SolanaCheck::AccountTypesExact(expected) => {
+            let observed = result.distinct_account_types();
+            if observed == *expected {
+                OutcomeStatus::Pass
+            } else {
+                OutcomeStatus::Fail(format!("observed account_types = {observed}"))
+            }
+        }
+        SolanaCheck::OrderbookSizeExact(expected) => {
+            if result.orderbook_size == *expected {
+                OutcomeStatus::Pass
+            } else {
+                OutcomeStatus::Fail(format!(
+                    "observed OrderBook size = {} bytes",
+                    result.orderbook_size
+                ))
+            }
+        }
+        SolanaCheck::OrderbookCapacityExact(expected) => {
+            if result.orderbook_capacity == *expected {
+                OutcomeStatus::Pass
+            } else {
+                OutcomeStatus::Fail(format!(
+                    "observed OrderBook capacity = {}",
+                    result.orderbook_capacity
+                ))
+            }
+        }
+        SolanaCheck::SlabCapacityMin(min) => {
+            if result.slab_capacity >= *min {
+                OutcomeStatus::Pass
+            } else {
+                OutcomeStatus::Fail(format!(
+                    "observed Slab capacity = {} (expected ≥ {min})",
+                    result.slab_capacity
+                ))
+            }
+        }
+        SolanaCheck::SlabBeatsOrderbookOnDensity => {
+            if result.slab_capacity > result.orderbook_capacity {
+                OutcomeStatus::Pass
+            } else {
+                OutcomeStatus::Fail(format!(
+                    "Slab capacity ({}) ≤ OrderBook capacity ({})",
+                    result.slab_capacity, result.orderbook_capacity
+                ))
+            }
+        }
+        SolanaCheck::AccountTypeSize { type_name, expected } => {
+            match result.entries.iter().find(|e| e.type_name == type_name) {
+                Some(e) if e.size_bytes == *expected => OutcomeStatus::Pass,
+                Some(e) => OutcomeStatus::Fail(format!(
+                    "{type_name} size = {} bytes (expected {expected})",
+                    e.size_bytes
+                )),
+                None => OutcomeStatus::Fail(format!("{type_name} not found")),
+            }
+        }
+    }
+}
+
+/// v2 in-process dispatch target.
+#[derive(Debug, Clone, Copy)]
+enum InProcessTarget {
+    AccountLayoutDemo,
+}
+
+fn try_parse_in_process(command: &str) -> Option<InProcessTarget> {
+    let trimmed = command.trim();
+    // Match the documented in-process command: invoking the scenario
+    // binary's own AccountLayoutDemo subcommand. Re-routed in-process
+    // by the runner so the demo doesn't actually spawn a sub-process.
+    if trimmed == "cargo run -p scenario -- account-layout-demo" {
+        return Some(InProcessTarget::AccountLayoutDemo);
+    }
+    None
+}
+
+fn is_v2_eligible(scenario: &Scenario) -> bool {
+    !scenario.steps.is_empty()
+        && scenario
+            .steps
+            .iter()
+            .all(|s| try_parse_in_process(&s.command).is_some())
+}
+
+#[derive(Debug, Clone)]
+enum StepResult {
+    AccountLayoutDemo(account_layout_demo::AccountLayoutDemoResult),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,10 +415,170 @@ struct EmbeddedReport {
     expectations_unverified: usize,
 }
 
+/// Embedded execution dispatcher. v2-eligible scenarios (every step
+/// matches an [`InProcessTarget`]) take the in-process v2 path with
+/// HEADLINE / TIMELINE / DELTA / OUTCOMES / NEXT contract. Other
+/// scenarios fall back to v1 sub-process spawn with stdio inherit.
+fn run_embedded(scenario: &Scenario, path: &Path) -> Result<EmbeddedReport> {
+    if is_v2_eligible(scenario) {
+        return run_embedded_v2(scenario, path);
+    }
+    run_embedded_v1(scenario, path)
+}
+
+fn run_embedded_v2(scenario: &Scenario, path: &Path) -> Result<EmbeddedReport> {
+    println!(
+        "─── scenario: {} ────────────────────────────────────",
+        scenario.name
+    );
+    println!();
+
+    let mut results: Vec<StepResult> = Vec::with_capacity(scenario.steps.len());
+    let report = EmbeddedReport {
+        total: scenario.steps.len(),
+        skipped: 0,
+        passed: scenario.steps.len(),
+        failed: 0,
+        expectations_unverified: 0,
+    };
+
+    for step in &scenario.steps {
+        let target = try_parse_in_process(&step.command)
+            .expect("v2-eligible scenario must have all-in-process steps");
+        match target {
+            InProcessTarget::AccountLayoutDemo => {
+                results.push(StepResult::AccountLayoutDemo(
+                    account_layout_demo::run_account_layout_demo_structured(),
+                ));
+            }
+        }
+    }
+
+    render_v2_sections(scenario, path, &results, &report);
+
+    Ok(report)
+}
+
+fn render_v2_sections(
+    scenario: &Scenario,
+    path: &Path,
+    results: &[StepResult],
+    report: &EmbeddedReport,
+) {
+    let last_account_layout = results.iter().rev().find_map(|r| match r {
+        StepResult::AccountLayoutDemo(d) => Some(d),
+    });
+
+    let evaluated: Vec<(&ExpectedOutcome, OutcomeStatus)> = scenario
+        .expected_outcomes
+        .iter()
+        .map(|o| {
+            let status = if let Some(d) = last_account_layout {
+                evaluate_solana_check(&o.check, d)
+            } else {
+                OutcomeStatus::Fail("no account-layout result available".to_string())
+            };
+            (o, status)
+        })
+        .collect();
+    let any_failed = evaluated.iter().any(|(_, s)| matches!(s, OutcomeStatus::Fail(_)));
+    let has_outcomes = !evaluated.is_empty();
+
+    if has_outcomes && !any_failed {
+        println!("HEADLINE ✓: {}", scenario.headline);
+    } else if has_outcomes && any_failed {
+        println!("HEADLINE ⚠: {}", scenario.headline);
+    } else {
+        println!("HEADLINE (unverified): {}", scenario.headline);
+    }
+    println!();
+
+    println!("TIMELINE:");
+    for r in results {
+        match r {
+            StepResult::AccountLayoutDemo(d) => {
+                println!(
+                    "    inspect    {} on-chain account types via openhl-state constants",
+                    d.distinct_account_types()
+                );
+                println!("    aggregate  {} bytes total (one of each)", d.total_bytes());
+                println!(
+                    "    compare    OrderBook ({} bytes / {} orders) vs Slab ({} bytes / ~{} orders)",
+                    d.orderbook_size, d.orderbook_capacity, d.slab_size, d.slab_capacity
+                );
+            }
+        }
+    }
+    println!();
+
+    println!("DELTA:");
+    for r in results {
+        match r {
+            StepResult::AccountLayoutDemo(d) => {
+                println!("  {:<16}  {:<10}  {:>6}  Version", "Type", "Tag", "Bytes");
+                println!(
+                    "  {}  {}  {}  {}",
+                    "─".repeat(16),
+                    "─".repeat(10),
+                    "─".repeat(6),
+                    "─".repeat(7)
+                );
+                for e in &d.entries {
+                    let v = e.version.map_or("—".to_string(), |v| format!("v{v}"));
+                    println!(
+                        "  {:<16}  {:<10}  {:>6}  {}",
+                        e.type_name, e.discriminator_text, e.size_bytes, v
+                    );
+                }
+                println!();
+                println!(
+                    "  OrderBook (flat): {} bytes / {} orders → {} bytes/order",
+                    d.orderbook_size, d.orderbook_capacity, d.orderbook_bytes_per_order
+                );
+                println!(
+                    "  Slab (critbit):   {} bytes / ~{} orders → ~{} bytes/order",
+                    d.slab_size, d.slab_capacity, d.slab_bytes_per_order
+                );
+            }
+        }
+    }
+    println!();
+
+    println!("OUTCOMES:");
+    if evaluated.is_empty() {
+        println!("  (no expected_outcomes declared — HEADLINE shown as unverified)");
+    } else {
+        for (outcome, status) in &evaluated {
+            match status {
+                OutcomeStatus::Pass => println!("  ✓ {}", outcome.description),
+                OutcomeStatus::Fail(why) => println!("  ✗ {} ({why})", outcome.description),
+            }
+        }
+        let passed = evaluated
+            .iter()
+            .filter(|(_, s)| matches!(s, OutcomeStatus::Pass))
+            .count();
+        println!();
+        println!("  {passed} of {} outcome(s) verified.", evaluated.len());
+    }
+    println!();
+
+    if report.failed > 0 {
+        println!(
+            "({} of {} step(s) failed during execution)",
+            report.failed, report.total
+        );
+        println!();
+    }
+    println!("source: {}", path.display());
+
+    print!("{}", cta_footer());
+}
+
 /// v1 embedded execution: walk each step, spawn `cargo run -p X` (or
 /// any other shell-style command) as a sub-process with stdio
 /// inherited. Comment lines (starting with `#`) are printed as info.
-fn run_embedded(scenario: &Scenario, path: &Path) -> Result<EmbeddedReport> {
+fn run_embedded_v1(scenario: &Scenario, path: &Path) -> Result<EmbeddedReport> {
     println!(
         "─── scenario: {} ────────────────────────────────────",
         scenario.name
@@ -409,6 +723,9 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Action::AccountLayoutDemo => {
+            account_layout_demo::run_account_layout_demo_cli();
+        }
     }
     Ok(())
 }
@@ -499,5 +816,155 @@ mod tests {
     fn metachar_does_not_match_plain_commands() {
         assert!(!has_shell_metacharacters("cargo run -p oracle"));
         assert!(!has_shell_metacharacters("cargo run -p position -- liquidate"));
+    }
+
+    /// v2 in-process dispatch + Phase 3 expected_outcomes tests.
+
+    #[test]
+    fn try_parse_in_process_matches_account_layout_demo() {
+        assert!(matches!(
+            try_parse_in_process("cargo run -p scenario -- account-layout-demo"),
+            Some(InProcessTarget::AccountLayoutDemo)
+        ));
+    }
+
+    #[test]
+    fn try_parse_in_process_returns_none_for_other_commands() {
+        assert!(try_parse_in_process("cargo run -p oracle").is_none());
+        assert!(try_parse_in_process("cargo run -p match-cli").is_none());
+        assert!(try_parse_in_process("# comment").is_none());
+    }
+
+    fn make_scenario(commands: &[&str]) -> Scenario {
+        Scenario {
+            name: "test".to_string(),
+            category: "stress".to_string(),
+            description: "test".to_string(),
+            headline: "test".to_string(),
+            steps: commands
+                .iter()
+                .map(|c| ScenarioStep {
+                    explanation: "step".to_string(),
+                    command: (*c).to_string(),
+                    expect: None,
+                })
+                .collect(),
+            expected_outcomes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn is_v2_eligible_true_when_all_steps_in_process() {
+        let s = make_scenario(&["cargo run -p scenario -- account-layout-demo"]);
+        assert!(is_v2_eligible(&s));
+    }
+
+    #[test]
+    fn is_v2_eligible_false_when_any_step_is_subprocess() {
+        let s = make_scenario(&[
+            "cargo run -p scenario -- account-layout-demo",
+            "cargo run -p oracle",
+        ]);
+        assert!(!is_v2_eligible(&s));
+    }
+
+    #[test]
+    fn evaluate_solana_check_account_types_min() {
+        let r = account_layout_demo::run_account_layout_demo_structured();
+        assert!(matches!(
+            evaluate_solana_check(&SolanaCheck::AccountTypesMin(5), &r),
+            OutcomeStatus::Pass
+        ));
+        assert!(matches!(
+            evaluate_solana_check(&SolanaCheck::AccountTypesMin(99), &r),
+            OutcomeStatus::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn evaluate_solana_check_slab_beats_orderbook() {
+        let r = account_layout_demo::run_account_layout_demo_structured();
+        assert!(matches!(
+            evaluate_solana_check(&SolanaCheck::SlabBeatsOrderbookOnDensity, &r),
+            OutcomeStatus::Pass
+        ));
+    }
+
+    #[test]
+    fn evaluate_solana_check_account_type_size_lookup() {
+        let r = account_layout_demo::run_account_layout_demo_structured();
+        // Market is 256 bytes per the state crate.
+        assert!(matches!(
+            evaluate_solana_check(
+                &SolanaCheck::AccountTypeSize {
+                    type_name: "Market".to_string(),
+                    expected: 256
+                },
+                &r
+            ),
+            OutcomeStatus::Pass
+        ));
+        assert!(matches!(
+            evaluate_solana_check(
+                &SolanaCheck::AccountTypeSize {
+                    type_name: "Market".to_string(),
+                    expected: 999
+                },
+                &r
+            ),
+            OutcomeStatus::Fail(_)
+        ));
+        assert!(matches!(
+            evaluate_solana_check(
+                &SolanaCheck::AccountTypeSize {
+                    type_name: "NonExistent".to_string(),
+                    expected: 0
+                },
+                &r
+            ),
+            OutcomeStatus::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn scenario_with_expected_outcomes_round_trips() {
+        let json = r#"{
+            "name": "t",
+            "category": "walkthrough",
+            "description": "t",
+            "headline": "t",
+            "steps": [
+                {"explanation": "s", "command": "cargo run -p scenario -- account-layout-demo"}
+            ],
+            "expected_outcomes": [
+                {
+                    "name": "n",
+                    "description": "d",
+                    "check": {"account_types_min": 5}
+                },
+                {
+                    "name": "n2",
+                    "description": "d2",
+                    "check": "slab_beats_orderbook_on_density"
+                }
+            ]
+        }"#;
+        let s: Scenario = serde_json::from_str(json).expect("parse");
+        assert_eq!(s.expected_outcomes.len(), 2);
+        assert!(matches!(
+            s.expected_outcomes[0].check,
+            SolanaCheck::AccountTypesMin(5)
+        ));
+        assert!(matches!(
+            s.expected_outcomes[1].check,
+            SolanaCheck::SlabBeatsOrderbookOnDensity
+        ));
+    }
+
+    #[test]
+    fn scenario_without_expected_outcomes_still_parses() {
+        let json = minimal_scenario_json();
+        let s: Scenario = serde_json::from_str(json).expect("parse");
+        assert!(s.expected_outcomes.is_empty());
     }
 }
