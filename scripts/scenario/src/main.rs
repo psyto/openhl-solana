@@ -275,12 +275,14 @@ fn run_embedded(scenario: &Scenario, path: &Path) -> Result<EmbeddedReport> {
         // `&&`, `||`, `;`, or pipes can't be naïvely whitespace-split
         // — route those through `sh -c`. Non-meta commands keep the
         // direct-spawn path.
+        //
+        // `<` and `>` are intentionally excluded — scenarios use
+        // `<PLACEHOLDER>` syntax for operator-substituted values, and
+        // treating them as shell redirects would break those steps.
         let has_shell_metas = trimmed.contains("&&")
             || trimmed.contains("||")
             || trimmed.contains(';')
-            || trimmed.contains('|')
-            || trimmed.contains('>')
-            || trimmed.contains('<');
+            || trimmed.contains('|');
 
         let mut cmd = if has_shell_metas {
             let mut c = Command::new("sh");
