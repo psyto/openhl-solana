@@ -1,0 +1,69 @@
+{
+  "name": "instruction-dispatch-demo",
+  "category": "walkthrough",
+  "description": "Self-contained, no-validator demo of the openhl-core instruction surface. Every on-chain instruction is dispatched by a 1-byte tag at byte 0 of instruction data; this demo enumerates all 34 tags with their names, categories, and one-line descriptions. Pure Rust against a hand-maintained mirror of `programs/openhl-core/src/lib.rs::process_instruction` — runs in milliseconds, no validator, no deployed program required.\n\nPairs naturally with `account-layout-demo`: that scenario surfaces the on-chain account types (state model); this one surfaces the instruction surface (operations model). Together they give a buyer the engine's full API at a glance.",
+  "headline": "34-instruction dispatch table; tags contiguous 0..=33 with 13 bring-up + 9 order + 3 position + 3 vault + others — a complete perp DEX in one program.",
+  "steps": [
+    {
+      "explanation": "Enumerate every openhl-core instruction tag and print the dispatch table grouped by category.",
+      "command": "cargo run -p scenario -- instruction-dispatch-demo",
+      "expect": "Liquidate"
+    }
+  ],
+  "expected_outcomes": [
+    {
+      "name": "thirty-four-instructions",
+      "description": "openhl-core dispatch table has exactly 34 instructions (tags 0..=33)",
+      "check": {
+        "instruction_count_exact": 34
+      }
+    },
+    {
+      "name": "tags-contiguous",
+      "description": "Tags are contiguous 0..=33 with no gaps",
+      "check": "instruction_tags_contiguous"
+    },
+    {
+      "name": "tag-0-initialize",
+      "description": "Tag 0 is Initialize (the boot instruction)",
+      "check": {
+        "instruction_tag_maps": {"tag": 0, "name": "Initialize"}
+      }
+    },
+    {
+      "name": "tag-10-match",
+      "description": "Tag 10 is Match (the order-crossing instruction)",
+      "check": {
+        "instruction_tag_maps": {"tag": 10, "name": "Match"}
+      }
+    },
+    {
+      "name": "tag-18-liquidate",
+      "description": "Tag 18 is Liquidate (the stress-path instruction)",
+      "check": {
+        "instruction_tag_maps": {"tag": 18, "name": "Liquidate"}
+      }
+    },
+    {
+      "name": "tag-33-pyth-v2",
+      "description": "Tag 33 is PlaceOrderCheckedPythV2 (newest Pyth-checked path)",
+      "check": {
+        "instruction_tag_maps": {"tag": 33, "name": "PlaceOrderCheckedPythV2"}
+      }
+    },
+    {
+      "name": "bring-up-bucket",
+      "description": "At least 10 bring-up instructions (the bulk of the surface is setup)",
+      "check": {
+        "instruction_category_min": {"category": "bring-up", "expected_min": 10}
+      }
+    },
+    {
+      "name": "order-bucket",
+      "description": "At least 5 order-matching instructions (the operational hot path)",
+      "check": {
+        "instruction_category_min": {"category": "order", "expected_min": 5}
+      }
+    }
+  ]
+}

@@ -43,6 +43,7 @@
 //! exported for the `--dry-run` flag.
 
 mod account_layout_demo;
+mod instruction_dispatch_demo;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -98,6 +99,13 @@ enum Action {
     /// Same flow the scenario runner v2 path dispatches for the
     /// `account-layout-demo` scenario.
     AccountLayoutDemo,
+    /// Standalone instruction-dispatch demo. Walks every instruction
+    /// tag in openhl-core's `process_instruction` dispatch and reports
+    /// tag + name + category + one-line description. Pure Rust —
+    /// no validator, no deployed program. Same flow the scenario
+    /// runner v2 path dispatches for the `instruction-dispatch-demo`
+    /// scenario.
+    InstructionDispatchDemo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,9 +130,15 @@ struct ExpectedOutcome {
 /// Engine-specific check schema for openhl-solana. Externally-tagged
 /// JSON so authors write `{"account_types_min": 10}` instead of
 /// `{"kind": "account_types_min", "value": 10}`.
+///
+/// Checks dispatch on their own variant to the matching `StepResult`
+/// type: account-layout checks look at the last `AccountLayoutDemo`
+/// result; instruction-dispatch checks at the last `InstructionDispatch`
+/// result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SolanaCheck {
+    // --- AccountLayoutDemo checks ---
     /// Assert at least N distinct account types are inspected.
     AccountTypesMin(usize),
     /// Assert exactly N account types are inspected.
@@ -140,6 +154,16 @@ enum SolanaCheck {
     SlabBeatsOrderbookOnDensity,
     /// Assert a specific account type appears with the given byte size.
     AccountTypeSize { type_name: String, expected: usize },
+
+    // --- InstructionDispatchDemo checks ---
+    /// Assert exact instruction count in the openhl-core dispatch table.
+    InstructionCountExact(usize),
+    /// Assert tags are contiguous 0..=max (no gaps).
+    InstructionTagsContiguous,
+    /// Assert that a specific tag exists and maps to the named instruction.
+    InstructionTagMaps { tag: u8, name: String },
+    /// Assert that a named category has at least N instructions.
+    InstructionCategoryMin { category: String, expected_min: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -148,7 +172,7 @@ enum OutcomeStatus {
     Fail(String),
 }
 
-fn evaluate_solana_check(
+fn evaluate_solana_check_layout(
     check: &SolanaCheck,
     result: &account_layout_demo::AccountLayoutDemoResult,
 ) -> OutcomeStatus {
@@ -221,6 +245,74 @@ fn evaluate_solana_check(
                 None => OutcomeStatus::Fail(format!("{type_name} not found")),
             }
         }
+        // Instruction-dispatch checks don't target the layout result.
+        SolanaCheck::InstructionCountExact(_)
+        | SolanaCheck::InstructionTagsContiguous
+        | SolanaCheck::InstructionTagMaps { .. }
+        | SolanaCheck::InstructionCategoryMin { .. } => OutcomeStatus::Fail(
+            "this check targets the instruction-dispatch result, not the account layout"
+                .to_string(),
+        ),
+    }
+}
+
+fn evaluate_solana_check_dispatch(
+    check: &SolanaCheck,
+    result: &instruction_dispatch_demo::InstructionDispatchDemoResult,
+) -> OutcomeStatus {
+    match check {
+        SolanaCheck::InstructionCountExact(expected) => {
+            if result.total_instructions() == *expected {
+                OutcomeStatus::Pass
+            } else {
+                OutcomeStatus::Fail(format!(
+                    "observed instruction count = {}",
+                    result.total_instructions()
+                ))
+            }
+        }
+        SolanaCheck::InstructionTagsContiguous => {
+            let max = result.max_tag();
+            let mut missing = Vec::new();
+            for t in 0..=max {
+                if result.find_tag(t).is_none() {
+                    missing.push(t);
+                }
+            }
+            if missing.is_empty() {
+                OutcomeStatus::Pass
+            } else {
+                OutcomeStatus::Fail(format!("missing tags: {missing:?}"))
+            }
+        }
+        SolanaCheck::InstructionTagMaps { tag, name } => {
+            match result.find_tag(*tag) {
+                Some(e) if e.name == name => OutcomeStatus::Pass,
+                Some(e) => OutcomeStatus::Fail(format!(
+                    "tag {tag} → {} (expected {name})",
+                    e.name
+                )),
+                None => OutcomeStatus::Fail(format!("tag {tag} not found")),
+            }
+        }
+        SolanaCheck::InstructionCategoryMin {
+            category,
+            expected_min,
+        } => {
+            let observed = result.count_in_category(category);
+            if observed >= *expected_min {
+                OutcomeStatus::Pass
+            } else {
+                OutcomeStatus::Fail(format!(
+                    "category '{category}' has {observed} (expected ≥ {expected_min})"
+                ))
+            }
+        }
+        // Account-layout checks don't target the dispatch result.
+        _ => OutcomeStatus::Fail(
+            "this check targets the account-layout result, not the instruction dispatch"
+                .to_string(),
+        ),
     }
 }
 
@@ -228,15 +320,19 @@ fn evaluate_solana_check(
 #[derive(Debug, Clone, Copy)]
 enum InProcessTarget {
     AccountLayoutDemo,
+    InstructionDispatchDemo,
 }
 
 fn try_parse_in_process(command: &str) -> Option<InProcessTarget> {
     let trimmed = command.trim();
-    // Match the documented in-process command: invoking the scenario
-    // binary's own AccountLayoutDemo subcommand. Re-routed in-process
-    // by the runner so the demo doesn't actually spawn a sub-process.
+    // Match documented in-process commands: scenario-binary subcommand
+    // invocations get routed in-process by the runner rather than
+    // actually spawning a sub-process.
     if trimmed == "cargo run -p scenario -- account-layout-demo" {
         return Some(InProcessTarget::AccountLayoutDemo);
+    }
+    if trimmed == "cargo run -p scenario -- instruction-dispatch-demo" {
+        return Some(InProcessTarget::InstructionDispatchDemo);
     }
     None
 }
@@ -252,6 +348,7 @@ fn is_v2_eligible(scenario: &Scenario) -> bool {
 #[derive(Debug, Clone)]
 enum StepResult {
     AccountLayoutDemo(account_layout_demo::AccountLayoutDemoResult),
+    InstructionDispatch(instruction_dispatch_demo::InstructionDispatchDemoResult),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -451,6 +548,11 @@ fn run_embedded_v2(scenario: &Scenario, path: &Path) -> Result<EmbeddedReport> {
                     account_layout_demo::run_account_layout_demo_structured(),
                 ));
             }
+            InProcessTarget::InstructionDispatchDemo => {
+                results.push(StepResult::InstructionDispatch(
+                    instruction_dispatch_demo::run_instruction_dispatch_demo_structured(),
+                ));
+            }
         }
     }
 
@@ -467,16 +569,37 @@ fn render_v2_sections(
 ) {
     let last_account_layout = results.iter().rev().find_map(|r| match r {
         StepResult::AccountLayoutDemo(d) => Some(d),
+        _ => None,
+    });
+    let last_dispatch = results.iter().rev().find_map(|r| match r {
+        StepResult::InstructionDispatch(d) => Some(d),
+        _ => None,
     });
 
     let evaluated: Vec<(&ExpectedOutcome, OutcomeStatus)> = scenario
         .expected_outcomes
         .iter()
         .map(|o| {
-            let status = if let Some(d) = last_account_layout {
-                evaluate_solana_check(&o.check, d)
-            } else {
-                OutcomeStatus::Fail("no account-layout result available".to_string())
+            let status = match &o.check {
+                // Account-layout-targeted checks
+                SolanaCheck::AccountTypesMin(_)
+                | SolanaCheck::AccountTypesExact(_)
+                | SolanaCheck::OrderbookSizeExact(_)
+                | SolanaCheck::OrderbookCapacityExact(_)
+                | SolanaCheck::SlabCapacityMin(_)
+                | SolanaCheck::SlabBeatsOrderbookOnDensity
+                | SolanaCheck::AccountTypeSize { .. } => match last_account_layout {
+                    Some(d) => evaluate_solana_check_layout(&o.check, d),
+                    None => OutcomeStatus::Fail("no account-layout result available".to_string()),
+                },
+                // Instruction-dispatch-targeted checks
+                SolanaCheck::InstructionCountExact(_)
+                | SolanaCheck::InstructionTagsContiguous
+                | SolanaCheck::InstructionTagMaps { .. }
+                | SolanaCheck::InstructionCategoryMin { .. } => match last_dispatch {
+                    Some(d) => evaluate_solana_check_dispatch(&o.check, d),
+                    None => OutcomeStatus::Fail("no instruction-dispatch result available".to_string()),
+                },
             };
             (o, status)
         })
@@ -505,6 +628,22 @@ fn render_v2_sections(
                 println!(
                     "    compare    OrderBook ({} bytes / {} orders) vs Slab ({} bytes / ~{} orders)",
                     d.orderbook_size, d.orderbook_capacity, d.slab_size, d.slab_capacity
+                );
+            }
+            StepResult::InstructionDispatch(d) => {
+                println!(
+                    "    enumerate  {} instruction tags in the openhl-core dispatch table",
+                    d.total_instructions()
+                );
+                println!(
+                    "    bring-up   {} instructions allocate / initialize state",
+                    d.count_in_category("bring-up")
+                );
+                println!(
+                    "    operational  {} order, {} position, {} vault, plus oracle / funding / builder / insurance",
+                    d.count_in_category("order"),
+                    d.count_in_category("position"),
+                    d.count_in_category("vault"),
                 );
             }
         }
@@ -539,6 +678,19 @@ fn render_v2_sections(
                     "  Slab (critbit):   {} bytes / ~{} orders → ~{} bytes/order",
                     d.slab_size, d.slab_capacity, d.slab_bytes_per_order
                 );
+            }
+            StepResult::InstructionDispatch(d) => {
+                println!("  {:<4}  {:<28}  {:<11}  Description", "Tag", "Name", "Category");
+                println!("  {}  {}  {}  {}", "─".repeat(4), "─".repeat(28), "─".repeat(11), "─".repeat(60));
+                for e in &d.entries {
+                    println!(
+                        "  {:>3}   {:<28}  {:<11}  {}",
+                        e.tag, e.name, e.category, e.description
+                    );
+                }
+                println!();
+                println!("  Total: {} instructions; tags contiguous 0..={}",
+                    d.total_instructions(), d.max_tag());
             }
         }
     }
@@ -726,6 +878,9 @@ fn main() -> Result<()> {
         Action::AccountLayoutDemo => {
             account_layout_demo::run_account_layout_demo_cli();
         }
+        Action::InstructionDispatchDemo => {
+            instruction_dispatch_demo::run_instruction_dispatch_demo_cli();
+        }
     }
     Ok(())
 }
@@ -872,11 +1027,11 @@ mod tests {
     fn evaluate_solana_check_account_types_min() {
         let r = account_layout_demo::run_account_layout_demo_structured();
         assert!(matches!(
-            evaluate_solana_check(&SolanaCheck::AccountTypesMin(5), &r),
+            evaluate_solana_check_layout(&SolanaCheck::AccountTypesMin(5), &r),
             OutcomeStatus::Pass
         ));
         assert!(matches!(
-            evaluate_solana_check(&SolanaCheck::AccountTypesMin(99), &r),
+            evaluate_solana_check_layout(&SolanaCheck::AccountTypesMin(99), &r),
             OutcomeStatus::Fail(_)
         ));
     }
@@ -885,7 +1040,7 @@ mod tests {
     fn evaluate_solana_check_slab_beats_orderbook() {
         let r = account_layout_demo::run_account_layout_demo_structured();
         assert!(matches!(
-            evaluate_solana_check(&SolanaCheck::SlabBeatsOrderbookOnDensity, &r),
+            evaluate_solana_check_layout(&SolanaCheck::SlabBeatsOrderbookOnDensity, &r),
             OutcomeStatus::Pass
         ));
     }
@@ -895,7 +1050,7 @@ mod tests {
         let r = account_layout_demo::run_account_layout_demo_structured();
         // Market is 256 bytes per the state crate.
         assert!(matches!(
-            evaluate_solana_check(
+            evaluate_solana_check_layout(
                 &SolanaCheck::AccountTypeSize {
                     type_name: "Market".to_string(),
                     expected: 256
@@ -905,7 +1060,7 @@ mod tests {
             OutcomeStatus::Pass
         ));
         assert!(matches!(
-            evaluate_solana_check(
+            evaluate_solana_check_layout(
                 &SolanaCheck::AccountTypeSize {
                     type_name: "Market".to_string(),
                     expected: 999
@@ -915,7 +1070,7 @@ mod tests {
             OutcomeStatus::Fail(_)
         ));
         assert!(matches!(
-            evaluate_solana_check(
+            evaluate_solana_check_layout(
                 &SolanaCheck::AccountTypeSize {
                     type_name: "NonExistent".to_string(),
                     expected: 0

@@ -47,11 +47,12 @@ cargo run -p scenario -- run liquidation-walkthrough
 cargo run -p scenario -- run liquidation-walkthrough --dry-run
 ```
 
-Four scenarios ship today:
-- **`account-layout-demo`** (v2, no validator needed) — pure-Rust inspection of every on-chain account type via `openhl-state` constants; renders a byte-precise size table + OrderBook-vs-Slab density comparison.
-- `bring-up` — allocate → init → create-market → create-vault → deposit (v1, sub-process).
-- `matching-cu-comparison` — flat OrderBook vs critbit Slab CU comparison on a live validator (v1, sub-process).
-- `liquidation-walkthrough` — open position → oracle drop → liquidate (v1, sub-process).
+Five scenarios ship today:
+- **`account-layout-demo`** (walkthrough, v2 no validator) — pure-Rust inspection of every on-chain account type via `openhl-state` constants; renders a byte-precise size table + OrderBook-vs-Slab density comparison; ✓ all 5 outcomes verify.
+- **`instruction-dispatch-demo`** (walkthrough, v2 no validator) — pure-Rust enumeration of all 34 openhl-core instruction tags with names + categories + descriptions; mirrors `programs/openhl-core/src/lib.rs::process_instruction`; ✓ all 8 outcomes verify.
+- `bring-up` (bring-up, v1 sub-process) — allocate → init → create-market → create-vault → deposit.
+- `matching-cu-comparison` (comparison, v1 sub-process) — flat OrderBook vs critbit Slab CU comparison on a live validator.
+- `liquidation-walkthrough` (stress, v1 sub-process) — open position → oracle drop → liquidate.
 
 ### Drive individual scripts directly
 
