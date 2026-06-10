@@ -91,6 +91,23 @@ enum Action {
         /// Skip embedded execution; print only the step list.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        /// v2 dial: shock the oracle mark ±bps. Surfaced in the
+        /// DIAL OVERRIDES section of v2 output; forwarded as the
+        /// `OPENHL_ORACLE_SHOCK_BPS` env var to v1 sub-process steps
+        /// for scripts that honor it.
+        #[arg(long, allow_negative_numbers = true)]
+        oracle_shock: Option<i32>,
+        /// v2 dial: maintenance margin liquidation buffer in bps
+        /// (extra margin above the maintenance threshold required
+        /// before liquidation fires). Forwarded as
+        /// `OPENHL_LIQUIDATION_BUFFER_BPS`.
+        #[arg(long)]
+        liquidation_buffer: Option<u32>,
+        /// v2 dial: matching workload size (number of fill ix
+        /// dispatched per slot in the matching benchmark). Forwarded
+        /// as `OPENHL_MATCHING_WORKLOAD_SIZE`.
+        #[arg(long)]
+        matching_workload_size: Option<u32>,
     },
     /// Standalone account-layout inspection demo. Walks every on-chain
     /// account type defined in `openhl-state` and reports
@@ -512,22 +529,59 @@ struct EmbeddedReport {
     expectations_unverified: usize,
 }
 
+/// Per-run dial overrides supplied by the CLI. Each field is optional.
+/// v2-eligible scenarios surface the dial values in their DIAL
+/// OVERRIDES section (informational — the in-process demos are static
+/// code introspection). v1 sub-process scenarios receive the dials
+/// as `OPENHL_*` environment variables, which the spawned scripts can
+/// consume.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DialOverrides {
+    pub oracle_shock_bps: Option<i32>,
+    pub liquidation_buffer_bps: Option<u32>,
+    pub matching_workload_size: Option<u32>,
+}
+
 /// Embedded execution dispatcher. v2-eligible scenarios (every step
 /// matches an [`InProcessTarget`]) take the in-process v2 path with
 /// HEADLINE / TIMELINE / DELTA / OUTCOMES / NEXT contract. Other
 /// scenarios fall back to v1 sub-process spawn with stdio inherit.
-fn run_embedded(scenario: &Scenario, path: &Path) -> Result<EmbeddedReport> {
+fn run_embedded(
+    scenario: &Scenario,
+    path: &Path,
+    dials: &DialOverrides,
+) -> Result<EmbeddedReport> {
     if is_v2_eligible(scenario) {
-        return run_embedded_v2(scenario, path);
+        return run_embedded_v2(scenario, path, dials);
     }
-    run_embedded_v1(scenario, path)
+    run_embedded_v1(scenario, path, dials)
 }
 
-fn run_embedded_v2(scenario: &Scenario, path: &Path) -> Result<EmbeddedReport> {
+fn run_embedded_v2(
+    scenario: &Scenario,
+    path: &Path,
+    dials: &DialOverrides,
+) -> Result<EmbeddedReport> {
     println!(
         "─── scenario: {} ────────────────────────────────────",
         scenario.name
     );
+    let any_dial = dials.oracle_shock_bps.is_some()
+        || dials.liquidation_buffer_bps.is_some()
+        || dials.matching_workload_size.is_some();
+    if any_dial {
+        println!();
+        println!("DIAL OVERRIDES (from CLI flags; informational for v2 in-process targets):");
+        if let Some(s) = dials.oracle_shock_bps {
+            println!("    oracle_shock_bps       : {s:+}");
+        }
+        if let Some(b) = dials.liquidation_buffer_bps {
+            println!("    liquidation_buffer_bps : {b}");
+        }
+        if let Some(n) = dials.matching_workload_size {
+            println!("    matching_workload_size : {n}");
+        }
+    }
     println!();
 
     let mut results: Vec<StepResult> = Vec::with_capacity(scenario.steps.len());
@@ -730,7 +784,13 @@ fn render_v2_sections(
 /// v1 embedded execution: walk each step, spawn `cargo run -p X` (or
 /// any other shell-style command) as a sub-process with stdio
 /// inherited. Comment lines (starting with `#`) are printed as info.
-fn run_embedded_v1(scenario: &Scenario, path: &Path) -> Result<EmbeddedReport> {
+/// Dials are forwarded as `OPENHL_*` env vars to each spawned step;
+/// scripts that honor them pick up the override.
+fn run_embedded_v1(
+    scenario: &Scenario,
+    path: &Path,
+    dials: &DialOverrides,
+) -> Result<EmbeddedReport> {
     println!(
         "─── scenario: {} ────────────────────────────────────",
         scenario.name
@@ -793,6 +853,18 @@ fn run_embedded_v1(scenario: &Scenario, path: &Path) -> Result<EmbeddedReport> {
             c.args(&args);
             c
         };
+
+        // Forward dials to the spawned step as env vars. Scripts that
+        // honor `OPENHL_*` knobs pick them up; others ignore them.
+        if let Some(s) = dials.oracle_shock_bps {
+            cmd.env("OPENHL_ORACLE_SHOCK_BPS", s.to_string());
+        }
+        if let Some(b) = dials.liquidation_buffer_bps {
+            cmd.env("OPENHL_LIQUIDATION_BUFFER_BPS", b.to_string());
+        }
+        if let Some(n) = dials.matching_workload_size {
+            cmd.env("OPENHL_MATCHING_WORKLOAD_SIZE", n.to_string());
+        }
 
         let status = cmd.status();
 
@@ -860,13 +932,25 @@ fn main() -> Result<()> {
             let s = load_from_path(&path)?;
             print!("{}", render_show(&s, &path));
         }
-        Action::Run { name, dir, dry_run } => {
+        Action::Run {
+            name,
+            dir,
+            dry_run,
+            oracle_shock,
+            liquidation_buffer,
+            matching_workload_size,
+        } => {
             let path = dir.join(format!("{name}.json"));
             let s = load_from_path(&path)?;
             if dry_run {
                 print!("{}", render_run_v0(&s, &path));
             } else {
-                let report = run_embedded(&s, &path)?;
+                let dials = DialOverrides {
+                    oracle_shock_bps: oracle_shock,
+                    liquidation_buffer_bps: liquidation_buffer,
+                    matching_workload_size,
+                };
+                let report = run_embedded(&s, &path, &dials)?;
                 if report.failed > 0 {
                     return Err(anyhow!(
                         "{} step(s) failed during scenario run",
