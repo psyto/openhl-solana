@@ -46,8 +46,11 @@ mod account_layout_demo;
 mod instruction_dispatch_demo;
 
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -526,7 +529,13 @@ struct EmbeddedReport {
     skipped: usize,
     passed: usize,
     failed: usize,
-    expectations_unverified: usize,
+    /// v1: declared `expect` substrings that were found in the
+    /// captured stdout/stderr after the step exited successfully.
+    expectations_verified: usize,
+    /// v1: declared `expect` substrings that did NOT appear in the
+    /// captured stream — the command succeeded (exit 0) but didn't
+    /// say what the scenario claimed it would say.
+    expectations_failed: usize,
 }
 
 /// Per-run dial overrides supplied by the CLI. Each field is optional.
@@ -590,7 +599,10 @@ fn run_embedded_v2(
         skipped: 0,
         passed: scenario.steps.len(),
         failed: 0,
-        expectations_unverified: 0,
+        // v2 encodes expects as declarative `expected_outcomes`;
+        // v1's substring counters stay zero on this path.
+        expectations_verified: 0,
+        expectations_failed: 0,
     };
 
     for step in &scenario.steps {
@@ -781,11 +793,82 @@ fn render_v2_sections(
     print!("{}", cta_footer());
 }
 
+/// Spawn `cmd` with stdout + stderr piped, line-buffer them through
+/// to the parent process's terminal AS THEY HAPPEN (so the operator
+/// sees CU prints, transaction signatures, oracle messages in real
+/// time), AND capture every byte into a `String` buffer the caller
+/// can scan for `expect` substrings after the child exits.
+///
+/// This is the "tee" half of v1's substring-verification path —
+/// closes the gap the earlier v1 advertised explicitly ("v1 cannot
+/// verify these because it inherits stdio"). The validator-mode
+/// scenarios stay v1 (their value IS the live stream), but their
+/// declared `expect` substrings now actually get checked.
+///
+/// Returns `(child_status, captured_output)`. Errors only on spawn
+/// failure; a non-zero exit code is returned as a successful tuple
+/// for the caller to interpret.
+fn spawn_with_tee(mut cmd: Command) -> std::io::Result<(std::process::ExitStatus, String)> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+
+    // Shared captured buffer; both reader threads append into it.
+    let captured = Arc::new(Mutex::new(String::new()));
+
+    let cap_out = Arc::clone(&captured);
+    let stdout_thread = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        let mut sink = std::io::stdout().lock();
+        for line in reader.lines().map_while(Result::ok) {
+            let _ = writeln!(sink, "{line}");
+            if let Ok(mut buf) = cap_out.lock() {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+        }
+    });
+
+    let cap_err = Arc::clone(&captured);
+    let stderr_thread = thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        let mut sink = std::io::stderr().lock();
+        for line in reader.lines().map_while(Result::ok) {
+            let _ = writeln!(sink, "{line}");
+            if let Ok(mut buf) = cap_err.lock() {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+        }
+    });
+
+    let status = child.wait()?;
+    // Joins must come AFTER wait so the pipes have closed; otherwise
+    // the readers would block on a never-EOF stream.
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+
+    let captured = Arc::try_unwrap(captured)
+        .ok()
+        .and_then(|m| m.into_inner().ok())
+        .unwrap_or_default();
+    Ok((status, captured))
+}
+
 /// v1 embedded execution: walk each step, spawn `cargo run -p X` (or
-/// any other shell-style command) as a sub-process with stdio
-/// inherited. Comment lines (starting with `#`) are printed as info.
-/// Dials are forwarded as `OPENHL_*` env vars to each spawned step;
-/// scripts that honor them pick up the override.
+/// any other shell-style command) as a sub-process. stdout + stderr
+/// are tee'd to the operator's terminal so the validator-mode flow
+/// (CU prints, account dumps, transaction signatures) still streams
+/// live; the captured side-channel buffer is then scanned for any
+/// `expect` substring declared on the step and the result counts
+/// against `expectations_verified` / `expectations_failed`. Comment
+/// lines (starting with `#`) are printed as info. Dials are forwarded
+/// as `OPENHL_*` env vars to each spawned step; scripts that honor
+/// them pick up the override.
 fn run_embedded_v1(
     scenario: &Scenario,
     path: &Path,
@@ -813,7 +896,8 @@ fn run_embedded_v1(
         skipped: 0,
         passed: 0,
         failed: 0,
-        expectations_unverified: 0,
+        expectations_verified: 0,
+        expectations_failed: 0,
     };
 
     for (i, step) in scenario.steps.iter().enumerate() {
@@ -866,20 +950,26 @@ fn run_embedded_v1(
             cmd.env("OPENHL_MATCHING_WORKLOAD_SIZE", n.to_string());
         }
 
-        let status = cmd.status();
+        let result = spawn_with_tee(cmd);
 
-        match status {
-            Ok(s) if s.success() => {
+        match result {
+            Ok((status, captured)) if status.success() => {
                 println!();
                 println!("  ✓ step {} succeeded (exit 0)", i + 1);
                 report.passed += 1;
-                if step.expect.is_some() {
-                    report.expectations_unverified += 1;
+                if let Some(expect) = &step.expect {
+                    if captured.contains(expect.as_str()) {
+                        println!("  ✓ expected substring found: {expect:?}");
+                        report.expectations_verified += 1;
+                    } else {
+                        println!("  ✗ expected substring NOT found: {expect:?}");
+                        report.expectations_failed += 1;
+                    }
                 }
             }
-            Ok(s) => {
+            Ok((status, _captured)) => {
                 println!();
-                println!("  ✗ step {} exited {}", i + 1, s.code().unwrap_or(-1));
+                println!("  ✗ step {} exited {}", i + 1, status.code().unwrap_or(-1));
                 report.failed += 1;
             }
             Err(e) => {
@@ -901,10 +991,11 @@ fn run_embedded_v1(
         "{} step(s): {} passed / {} failed / {} skipped (informational)",
         report.total, report.passed, report.failed, report.skipped
     );
-    if report.expectations_unverified > 0 {
+    let total_expects = report.expectations_verified + report.expectations_failed;
+    if total_expects > 0 {
         println!(
-            "{} step(s) declared expected-output substrings; v1 cannot verify these because it inherits stdio (v2 will tee).",
-            report.expectations_unverified
+            "{} declared expected-output substring(s): {} verified ✓ / {} not found ✗",
+            total_expects, report.expectations_verified, report.expectations_failed,
         );
     }
     println!("source: {}", path.display());
@@ -1205,5 +1296,74 @@ mod tests {
         let json = minimal_scenario_json();
         let s: Scenario = serde_json::from_str(json).expect("parse");
         assert!(s.expected_outcomes.is_empty());
+    }
+
+    /// `spawn_with_tee` captures stdout AND stderr into the returned
+    /// String. The validator-mode scenarios print their key markers
+    /// (CU counts, "deposit successful", "liquidated") to stdout or
+    /// stderr depending on the script; the captured buffer has to
+    /// cover both so the v1 `expect` substring check sees them.
+    #[test]
+    fn spawn_with_tee_captures_stdout_and_stderr() {
+        // sh -c with redirect: half to stdout, half to stderr.
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            r#"echo hello-stdout; echo hello-stderr >&2"#,
+        ]);
+        let (status, captured) = spawn_with_tee(cmd).expect("spawn ok");
+        assert!(status.success(), "expected exit 0");
+        assert!(
+            captured.contains("hello-stdout"),
+            "stdout missing from capture; got:\n{captured}"
+        );
+        assert!(
+            captured.contains("hello-stderr"),
+            "stderr missing from capture; got:\n{captured}"
+        );
+    }
+
+    /// Non-zero exit codes return as Ok((status, captured)). The
+    /// caller (run_embedded_v1) treats a non-success status as a
+    /// step failure regardless of what `expect` substrings appeared.
+    #[test]
+    fn spawn_with_tee_surfaces_nonzero_exit_code() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo about-to-fail; exit 7"]);
+        let (status, captured) = spawn_with_tee(cmd).expect("spawn ok");
+        assert!(!status.success());
+        assert_eq!(status.code(), Some(7));
+        // Even on non-zero exit, the buffer still has whatever the
+        // script printed before exiting.
+        assert!(captured.contains("about-to-fail"));
+    }
+
+    /// Spawn failure (binary not in PATH) returns Err — `run_embedded_v1`
+    /// treats this distinctly from a non-zero exit so the operator
+    /// sees "failed to spawn" instead of "exited <code>".
+    #[test]
+    fn spawn_with_tee_errors_when_binary_missing() {
+        let cmd = Command::new("definitely-not-a-real-binary-xyz");
+        let err = spawn_with_tee(cmd).expect_err("missing binary should fail to spawn");
+        // Don't assert on the exact OS error string; just confirm
+        // the failure surfaces here rather than being swallowed.
+        assert!(!err.to_string().is_empty());
+    }
+
+    /// The `expect` substring check in `run_embedded_v1` is a simple
+    /// `String::contains` against the captured buffer. Lock in that
+    /// semantic: a single substring, found anywhere in the combined
+    /// stream, suffices.
+    #[test]
+    fn expect_substring_is_a_plain_contains_check() {
+        let captured = "boot ok\n  deposit successful at slot 1234\n  done\n";
+        assert!(captured.contains("deposit successful"));
+        assert!(!captured.contains("deposit failed"));
+        // Case-sensitive: scenarios SHOULD match the script's actual
+        // output verbatim. If a script prints "Deposit successful"
+        // and a scenario expects "deposit successful", that's a
+        // scenario authoring bug — we want it to surface, not be
+        // silently glossed over.
+        assert!(!captured.contains("Deposit Successful"));
     }
 }
