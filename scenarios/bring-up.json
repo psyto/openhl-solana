@@ -1,7 +1,8 @@
 {
   "name": "bring-up",
   "category": "bring-up",
-  "description": "Bring a Solana perp market up from zero. Walk through every account the on-chain program needs to operate: the Market header (allocate → initialize), the per-market PDA (create-market), and the per-(market, mint) vault PDA (create-vault). End with a deposit to confirm the vault works. This scenario is the minimum needed before any of the trading / liquidation / funding scenarios make sense.",
+  "compare_key": "perp-bring-up",
+  "description": "Bring a Solana perp market up from zero. Walk through every account the on-chain program needs to operate: the Market header (allocate → initialize), the per-market PDA (create-market), and the per-(market, mint) vault PDA (create-vault). End with a deposit to confirm the vault works. This scenario is the minimum needed before any of the trading / liquidation / funding scenarios make sense. Pair with `openhl/bring-up` (same `compare_key`) to see the account-model diff: where EVM has the bridge state implicit in one struct, Solana needs ~4 distinct accounts (raw Market alloc + per-market PDA + per-(market,mint) vault PDA + …) reached through 5 instructions.",
   "headline": "Stand up a fresh perp market on local-validator: 5 instructions, ~50 KCU total.",
   "steps": [
     {
