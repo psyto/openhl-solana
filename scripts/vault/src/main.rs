@@ -25,7 +25,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use openhl_core::{TRADING_VAULT_SEED, VAULT_SHARE_SEED};
+use openhl_core::{TRADING_VAULT_SEED, TRADING_VAULT_TOKEN_SEED, VAULT_SHARE_SEED};
 use openhl_state::{TradingVault, VaultShare};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
@@ -37,7 +37,7 @@ use solana_sdk::{
 };
 use solana_system_interface::program as system_program;
 
-use openhl_core::{SPL_TOKEN_PROGRAM_ID, VAULT_AUTH_SEED, VAULT_SEED};
+use openhl_core::SPL_TOKEN_PROGRAM_ID;
 
 #[derive(Parser, Debug)]
 #[command(name = "vault", version, about)]
@@ -107,6 +107,11 @@ fn main() -> Result<()> {
         &[VAULT_SHARE_SEED, vault_pda.as_ref(), payer.pubkey().as_ref()],
         &program_id,
     );
+    // The vault's own token account; the vault PDA is its authority.
+    let (vault_token_pda, _) = Pubkey::find_program_address(
+        &[TRADING_VAULT_TOKEN_SEED, vault_pda.as_ref()],
+        &program_id,
+    );
 
     let client = RpcClient::new_with_commitment(cli.rpc.clone(), CommitmentConfig::confirmed());
 
@@ -117,6 +122,7 @@ fn main() -> Result<()> {
     println!("manager:    {manager}");
     println!("vault PDA:  {vault_pda}  (bump {vault_bump})");
     println!("share PDA:  {share_pda}  (for payer={})", payer.pubkey());
+    println!("vault token:{vault_token_pda}");
     println!();
 
     let modes = [cli.init, cli.deposit, cli.withdraw, cli.update_nav]
@@ -138,6 +144,8 @@ fn main() -> Result<()> {
                 AccountMeta::new_readonly(mint, false),
                 AccountMeta::new(vault_pda, false),
                 AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new(vault_token_pda, false),
+                AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
             ],
             data: vec![19u8],
         };
@@ -156,11 +164,6 @@ fn main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("--user-token-account required for --deposit"))?
             .parse()
             .context("parse --user-token-account")?;
-        let (vault_token_pda, _) = Pubkey::find_program_address(
-            &[VAULT_SEED, market.as_ref(), mint.as_ref()],
-            &program_id,
-        );
-
         let mut data = Vec::with_capacity(1 + 8);
         data.push(20u8);
         data.extend_from_slice(&amount.to_le_bytes());
@@ -194,15 +197,6 @@ fn main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("--user-token-account required for --withdraw"))?
             .parse()
             .context("parse --user-token-account")?;
-        let (vault_token_pda, _) = Pubkey::find_program_address(
-            &[VAULT_SEED, market.as_ref(), mint.as_ref()],
-            &program_id,
-        );
-        let (vault_auth_pda, _) = Pubkey::find_program_address(
-            &[VAULT_AUTH_SEED, market.as_ref()],
-            &program_id,
-        );
-
         let mut data = Vec::with_capacity(1 + 8);
         data.push(21u8);
         data.extend_from_slice(&shares.to_le_bytes());
@@ -216,7 +210,6 @@ fn main() -> Result<()> {
                 AccountMeta::new_readonly(mint, false),
                 AccountMeta::new(user_token, false),
                 AccountMeta::new(vault_token_pda, false),
-                AccountMeta::new_readonly(vault_auth_pda, false),
                 AccountMeta::new_readonly(SPL_TOKEN_PROGRAM_ID, false),
             ],
             data,

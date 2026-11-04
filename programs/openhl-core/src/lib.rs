@@ -276,6 +276,13 @@ pub const LIQUIDATION_PENALTY_BPS: u64 = 100;
 /// Full seed list: `[TRADING_VAULT_SEED, market.key, manager.key, &[bump]]`.
 pub const TRADING_VAULT_SEED: &[u8] = b"trading_vault";
 
+/// PDA seed prefix for a trading vault's own SPL Token account. Its token
+/// authority is the trading vault PDA, so a vault pays out only what it
+/// holds, and a manager's NAV reaches no other vault's tokens.
+///
+/// Full seed list: `[TRADING_VAULT_TOKEN_SEED, vault.key, &[bump]]`.
+pub const TRADING_VAULT_TOKEN_SEED: &[u8] = b"tvault_token";
+
 /// PDA seed prefix for the per-(vault, owner) share ledger.
 ///
 /// Full seed list: `[VAULT_SHARE_SEED, vault.key, owner.key, &[bump]]`.
@@ -2510,10 +2517,11 @@ fn read_funding_index(funding_ai: &AccountInfo, program_id: &Pubkey) -> Result<i
 }
 
 // =============================================================================
-// SPL Token escrow helpers — used by Position + TradingVault handlers to
-// actually move quote tokens in/out of the per-(market, mint) vault from
-// Chapter 6. Without these, the position/vault accounting would be tracked
-// in u64 fields but no real tokens would move.
+// SPL Token escrow helpers — used by the Position handlers to actually move
+// quote tokens in/out of the per-(market, mint) vault from Chapter 6, and by
+// VaultDeposit (into the trading vault's own account). Without these, the
+// position/vault accounting would be tracked in u64 fields but no real
+// tokens would move.
 // =============================================================================
 
 /// Verify the passed vault_token_account matches the derived PDA at
@@ -2535,6 +2543,26 @@ fn verify_vault_token_account(
     }
     if vault_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
         msg!("vault_token_account not owned by SPL Token");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    Ok(())
+}
+
+/// Verify the passed account is the trading vault's own token account, the
+/// PDA at `[TRADING_VAULT_TOKEN_SEED, vault]`, owned by SPL Token.
+fn verify_trading_vault_token(
+    vault_token_ai: &AccountInfo,
+    vault_key: &Pubkey,
+    program_id: &Pubkey,
+) -> ProgramResult {
+    let (expected, _bump) =
+        Pubkey::find_program_address(&[TRADING_VAULT_TOKEN_SEED, vault_key.as_ref()], program_id);
+    if vault_token_ai.key != &expected {
+        msg!("vault_token is not this vault's token account");
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if vault_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        msg!("vault_token not owned by SPL Token");
         return Err(ProgramError::IncorrectProgramId);
     }
     Ok(())
@@ -3311,6 +3339,10 @@ const VAULT_UPDATE_NAV_PAYLOAD_LEN: usize = 8; // new_total_assets u64
 ///   3. `[]`              mint            — the asset mint (SPL Mint)
 ///   4. `[WRITE]`         vault           — PDA at [b"trading_vault", market, manager]
 ///   5. `[]`              system_program
+///   6. `[WRITE]`         vault_token     — PDA at [b"tvault_token", vault]; created
+///                                          here as an SPL Token account of `mint`
+///                                          whose authority is `vault`
+///   7. `[]`              token_program
 fn process_create_trading_vault(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -3326,6 +3358,8 @@ fn process_create_trading_vault(
     let mint_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let vault_ai = accounts.get(4).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let system_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let vault_token_ai = accounts.get(6).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let token_ai = accounts.get(7).ok_or(ProgramError::NotEnoughAccountKeys)?;
 
     if !payer_ai.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -3343,6 +3377,9 @@ fn process_create_trading_vault(
     if system_ai.key != &system_program::ID {
         return Err(ProgramError::IncorrectProgramId);
     }
+    if token_ai.key != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
 
     let (expected, bump) = Pubkey::find_program_address(
         &[
@@ -3353,6 +3390,12 @@ fn process_create_trading_vault(
         program_id,
     );
     if vault_ai.key != &expected {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let (expected_token, token_bump) =
+        Pubkey::find_program_address(&[TRADING_VAULT_TOKEN_SEED, vault_ai.key.as_ref()], program_id);
+    if vault_token_ai.key != &expected_token {
+        msg!("create_trading_vault: vault_token does not match derived PDA");
         return Err(ProgramError::InvalidSeeds);
     }
 
@@ -3386,6 +3429,36 @@ fn process_create_trading_vault(
     vault.total_shares = 0;
     vault.total_assets = 0;
     vault._reserved = [0u8; 32];
+    drop(data);
+
+    // The vault's own token account, as CreateVault does for a market's:
+    // allocate it owned by SPL Token, then InitializeAccount3 with the
+    // vault PDA as its authority.
+    let rent = Rent::get()?.minimum_balance(TOKEN_ACCOUNT_LEN);
+    let create_ix = system_instruction::create_account(
+        payer_ai.key,
+        vault_token_ai.key,
+        rent,
+        TOKEN_ACCOUNT_LEN as u64,
+        &SPL_TOKEN_PROGRAM_ID,
+    );
+    invoke_signed(
+        &create_ix,
+        &[payer_ai.clone(), vault_token_ai.clone(), system_ai.clone()],
+        &[&[TRADING_VAULT_TOKEN_SEED, vault_ai.key.as_ref(), &[token_bump]]],
+    )?;
+    let mut init_data = Vec::with_capacity(1 + 32);
+    init_data.push(spl_token_ix::INITIALIZE_ACCOUNT_3);
+    init_data.extend_from_slice(vault_ai.key.as_ref());
+    let init_ix = Instruction {
+        program_id: SPL_TOKEN_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*vault_token_ai.key, false),
+            AccountMeta::new_readonly(*mint_ai.key, false),
+        ],
+        data: init_data,
+    };
+    invoke(&init_ix, &[vault_token_ai.clone(), mint_ai.clone(), token_ai.clone()])?;
 
     msg!("trading vault created (bump {})", bump);
     Ok(())
@@ -3401,7 +3474,8 @@ fn process_create_trading_vault(
 ///   4. `[]`              market           — must match vault.market
 ///   5. `[]`              mint             — must match vault.mint
 ///   6. `[WRITE]`         depositor_token  — depositor's SPL Token account (source)
-///   7. `[WRITE]`         vault_token      — per-(market, mint) vault PDA (destination)
+///   7. `[WRITE]`         vault_token      — this vault's token account, PDA at
+///                                           [b"tvault_token", vault] (destination)
 ///   8. `[]`              token_program
 fn process_vault_deposit(
     program_id: &Pubkey,
@@ -3442,7 +3516,7 @@ fn process_vault_deposit(
         msg!("vault_deposit: depositor_token not owned by SPL Token");
         return Err(ProgramError::IncorrectProgramId);
     }
-    verify_vault_token_account(vault_token_ai, market_ai.key, mint_ai.key, program_id)?;
+    verify_trading_vault_token(vault_token_ai, vault_ai.key, program_id)?;
 
     let (expected_share, share_bump) = Pubkey::find_program_address(
         &[VAULT_SHARE_SEED, vault_ai.key.as_ref(), depositor_ai.key.as_ref()],
@@ -3573,9 +3647,9 @@ fn process_vault_deposit(
 ///   3. `[]`       market           — must match vault.market
 ///   4. `[]`       mint             — must match vault.mint
 ///   5. `[WRITE]`  owner_token      — destination of the asset withdrawal
-///   6. `[WRITE]`  vault_token      — per-(market, mint) vault PDA
-///   7. `[]`       vault_authority  — PDA at [b"vault_auth", market]
-///   8. `[]`       token_program
+///   6. `[WRITE]`  vault_token      — this vault's token account, PDA at
+///                                   [b"tvault_token", vault] (source)
+///   7. `[]`       token_program
 fn process_vault_withdraw(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -3596,8 +3670,7 @@ fn process_vault_withdraw(
     let mint_ai = accounts.get(4).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let owner_token_ai = accounts.get(5).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let vault_token_ai = accounts.get(6).ok_or(ProgramError::NotEnoughAccountKeys)?;
-    let vault_authority_ai = accounts.get(7).ok_or(ProgramError::NotEnoughAccountKeys)?;
-    let token_ai = accounts.get(8).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let token_ai = accounts.get(7).ok_or(ProgramError::NotEnoughAccountKeys)?;
 
     if !owner_ai.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -3614,10 +3687,10 @@ fn process_vault_withdraw(
     if owner_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
         return Err(ProgramError::IncorrectProgramId);
     }
-    verify_vault_token_account(vault_token_ai, market_ai.key, mint_ai.key, program_id)?;
-    let vault_auth_bump = verify_vault_authority(vault_authority_ai, market_ai.key, program_id)?;
+    verify_trading_vault_token(vault_token_ai, vault_ai.key, program_id)?;
 
     let assets_to_return: u64;
+    let (vault_market, vault_manager, vault_bump);
     {
         // Compute assets to return: shares_to_burn * total_assets / total_shares.
         let mut vault_data = vault_ai.try_borrow_mut_data()?;
@@ -3635,6 +3708,9 @@ fn process_vault_withdraw(
         if vault.mint != *mint_ai.key.as_ref() {
             return Err(ProgramError::InvalidAccountData);
         }
+        vault_market = vault.market;
+        vault_manager = vault.manager;
+        vault_bump = vault.bump;
 
         // total_shares == 0 was refused above, so the only error left is
         // overflow.
@@ -3652,8 +3728,7 @@ fn process_vault_withdraw(
             return Err(ProgramError::UninitializedAccount);
         }
         // The share must be this vault's: a share of another vault would
-        // otherwise burn against this vault's total_shares and pay out of
-        // the shared per-(market, mint) token account.
+        // otherwise burn against this vault's total_shares and price.
         if share.vault != *vault_ai.key.as_ref() {
             msg!("vault_withdraw: share belongs to another vault");
             return Err(ProgramError::InvalidAccountData);
@@ -3685,17 +3760,40 @@ fn process_vault_withdraw(
         vault.total_assets = vault.total_assets.saturating_sub(assets_to_return);
     }
 
-    // Vault → owner SPL Token Transfer. Vault authority PDA signs via
-    // invoke_signed with [VAULT_AUTH_SEED, market] seeds.
-    spl_token_transfer_vault_signed(
-        vault_token_ai,
-        owner_token_ai,
-        vault_authority_ai,
-        market_ai.key,
-        vault_auth_bump,
-        token_ai,
-        assets_to_return,
-    )?;
+    // Vault token account → owner. The trading vault PDA is the token
+    // account's authority and signs with its own seeds. The vault data
+    // borrow above has ended, so the CPI can take the account. If the
+    // manager reported more NAV than the vault holds, SPL Token refuses
+    // the transfer: the vault cannot pay out tokens it does not have.
+    if assets_to_return > 0 {
+        let mut data = Vec::with_capacity(1 + 8);
+        data.push(spl_token_ix::TRANSFER);
+        data.extend_from_slice(&assets_to_return.to_le_bytes());
+        let ix = Instruction {
+            program_id: SPL_TOKEN_PROGRAM_ID,
+            accounts: vec![
+                AccountMeta::new(*vault_token_ai.key, false),
+                AccountMeta::new(*owner_token_ai.key, false),
+                AccountMeta::new_readonly(*vault_ai.key, true),
+            ],
+            data,
+        };
+        invoke_signed(
+            &ix,
+            &[
+                vault_token_ai.clone(),
+                owner_token_ai.clone(),
+                vault_ai.clone(),
+                token_ai.clone(),
+            ],
+            &[&[
+                TRADING_VAULT_SEED,
+                vault_market.as_ref(),
+                vault_manager.as_ref(),
+                &[vault_bump],
+            ]],
+        )?;
+    }
 
     msg!(
         "vault_withdraw: burned {} shares, returned {} assets",

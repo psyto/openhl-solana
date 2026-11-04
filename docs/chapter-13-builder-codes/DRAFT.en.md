@@ -196,7 +196,7 @@ spl_token_transfer_fee_vault_signed(
 )?;
 ```
 
-Authorization (only the builder can claim their own fees), zero the accumulator, release the borrow, PDA-sign the Transfer. The Transfer helper is structurally identical to §12.4's `spl_token_transfer_vault_signed` — same `invoke_signed` pattern, same `InvalidSeeds` protection — with the per-(quote_mint) `[FEE_VAULT_AUTH_SEED, quote_mint]` seeds instead of per-(market) `[VAULT_AUTH_SEED, market]`. Order matters: zero the accumulator *before* the Transfer so a transfer-failure tx revert restores the accumulator (atomic), and so a successful Transfer cannot be replayed against a still-funded accumulator.
+Authorization (only the builder can claim their own fees), zero the accumulator, release the borrow, PDA-sign the Transfer. The Transfer helper is structurally identical to `spl_token_transfer_vault_signed`, which makes Chapter 11's position payouts (close and liquidate) — same `invoke_signed` pattern, same `InvalidSeeds` protection — with the per-(quote_mint) `[FEE_VAULT_AUTH_SEED, quote_mint]` seeds instead of per-(market) `[VAULT_AUTH_SEED, market]`. Order matters: zero the accumulator *before* the Transfer so a transfer-failure tx revert restores the accumulator (atomic), and so a successful Transfer cannot be replayed against a still-funded accumulator.
 
 A real production claim also typically supports partial withdrawals (`claim --amount N` rather than always-everything), accumulator timeouts (fees idle for >N days are forfeited to the protocol), and per-token claims when the protocol supports multiple quote currencies. None of these change the fundamental shape; they're policy decisions on top.
 

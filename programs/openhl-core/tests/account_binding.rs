@@ -5,8 +5,8 @@
 
 use bytemuck::Zeroable;
 use openhl_core::{
-    process_instruction, INSURANCE_FUND_TOKEN_SEED, SPL_TOKEN_PROGRAM_ID, VAULT_AUTH_SEED,
-    VAULT_SEED,
+    process_instruction, INSURANCE_FUND_TOKEN_SEED, SPL_TOKEN_PROGRAM_ID, TRADING_VAULT_TOKEN_SEED,
+    VAULT_AUTH_SEED, VAULT_SEED,
 };
 use openhl_state::*;
 use solana_program::{
@@ -138,13 +138,8 @@ fn withdraw_accounts(program_id: &Pubkey, share_vault: Pubkey) -> Vec<Acc> {
             token_account(&mint, &owner),
         ),
         acc(
-            pda(&[VAULT_SEED, market.as_ref(), mint.as_ref()], program_id),
+            pda(&[TRADING_VAULT_TOKEN_SEED, vault.as_ref()], program_id),
             SPL_TOKEN_PROGRAM_ID,
-            vec![],
-        ),
-        acc(
-            pda(&[VAULT_AUTH_SEED, market.as_ref()], program_id),
-            Pubkey::default(),
             vec![],
         ),
         acc(SPL_TOKEN_PROGRAM_ID, Pubkey::default(), vec![]),

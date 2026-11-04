@@ -196,7 +196,7 @@ spl_token_transfer_fee_vault_signed(
 )?;
 ```
 
-認可（builder だけが自分の手数料を claim できる）、アキュムレータをゼロ化、借用を解放、PDA 署名 Transfer。Transfer ヘルパは §12.4 の `spl_token_transfer_vault_signed` と構造的に同一 — 同じ `invoke_signed` パターン、同じ `InvalidSeeds` 保護 — 違いは seeds が per-(market) `[VAULT_AUTH_SEED, market]` ではなく per-(quote_mint) `[FEE_VAULT_AUTH_SEED, quote_mint]` という点だけ。順序が重要: Transfer **の前に** アキュムレータをゼロ化することで、(a) Transfer 失敗時の tx revert がアキュムレータを復元（アトミック）、(b) Transfer 成功時はまだ funded なアキュムレータに対するリプレイ攻撃を防ぐ。
+認可（builder だけが自分の手数料を claim できる）、アキュムレータをゼロ化、借用を解放、PDA 署名 Transfer。Transfer ヘルパは、第 11 章のポジションの払い出し(close と liquidate)に使う `spl_token_transfer_vault_signed` と構造的に同一 — 同じ `invoke_signed` パターン、同じ `InvalidSeeds` 保護 — 違いは seeds が per-(market) `[VAULT_AUTH_SEED, market]` ではなく per-(quote_mint) `[FEE_VAULT_AUTH_SEED, quote_mint]` という点だけ。順序が重要: Transfer **の前に** アキュムレータをゼロ化することで、(a) Transfer 失敗時の tx revert がアキュムレータを復元（アトミック）、(b) Transfer 成功時はまだ funded なアキュムレータに対するリプレイ攻撃を防ぐ。
 
 本物の本番 claim は通常、部分引き出し（`claim --amount N`、常に全部ではなく）、蓄積子タイムアウト（>N 日アイドルな手数料はプロトコルに没収）、プロトコルが複数 quote 通貨をサポートするときの per-token claim もサポートする。どれも根本的な形を変えない。上に乗るポリシー判断だ。
 

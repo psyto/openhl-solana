@@ -1,7 +1,7 @@
 # 第12章 — ネイティブ Vault プログラム（プール取引）
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`TradingVault`、`VaultShare`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_trading_vault` 3402–3480 行、`process_vault_deposit` 3494–3655 行、`process_vault_withdraw` 3669–3786 行、`process_vault_update_nav` 3793–3833 行）、[`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs)、[`fuzz/vault/src/main.rs`](../../fuzz/vault/src/main.rs)（§12.7 の solinv ハーネス）。
+> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`TradingVault`、`VaultShare`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_trading_vault` 3346–3465 行、`process_vault_deposit` 3480–3639 行、`process_vault_withdraw` 3653–3804 行、`process_vault_update_nav` 3811–3851 行）、[`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs)、[`fuzz/vault/src/main.rs`](../../fuzz/vault/src/main.rs)（§12.7 の solinv ハーネス）。
 >
 > 部品化に伴い、この章で読むロジックは [`crates/vault/src/lib.rs`](../../crates/vault/src/lib.rs)(`openhl-vault`)に移り、プログラムはそれを呼び出す。以下に引用するコードは分割前の `programs/openhl-core/src/lib.rs` の版で、行番号は追従していない。
 
@@ -18,7 +18,7 @@
 
 trading vault は perp DEX を、ユーザが直接取引する venue から、**基金**もホストする venue に変える概念的プリミティブだ。ポジションを自分で管理したくないユーザは vault に預金できる。vault のマネージャが戦略を走らせる。預金者はリターンを共有する。これは Solana 上のすべての yield vault の構造 — Drift の spot vault、Kamino の leveraged vault、Jupiter の perps vault、その他もろもろ。
 
-本章は vault の会計半分を組み立てる — shares、deposits、withdrawals、NAV 更新。マネージャの取引半分は組み立てない（第 11 章の `OpenPosition` を vault の PDA をポジション所有者として呼ぶ薄いラッパ命令になる）。share 会計が整えば追加は機械的だ。本章は設計を説明し、実装を宿題ピースとして残す。
+本章は vault の会計半分を組み立てる — shares、deposits、withdrawals、NAV 更新。トークンは実際に動く。deposit は預金者の口座から、trading vault 専用のトークン口座へ移す。この口座は `[TRADING_VAULT_TOKEN_SEED, vault]` の PDA で、`CreateTradingVault` が vault と一緒に作る。withdraw は trading vault の PDA 自身が `invoke_signed` で署名して戻す。(この章の最初の版は、第 6 章が作り第 11 章がポジションの証拠金に使う (market, mint) ごとの口座を、市場の全 vault で共有していた。その代償は §12.5 で示す。)マネージャの取引半分は組み立てない（第 11 章の `OpenPosition` を vault の PDA をポジション所有者として呼び、vault の口座から市場の口座へ証拠金を移す薄いラッパ命令になる）。share 会計が整えば追加は機械的だ。本章は設計を説明し、実装を宿題ピースとして残す。
 
 本章が実際に扱うこと:
 
@@ -184,7 +184,7 @@ vault.total_assets = new_total_assets;
 
 `process_vault_deposit` は 4 つのハンドラの中で最も複雑だ、最初の deposit で VaultShare PDA を条件付きで作成し、*かつ*末尾で SPL Token Transfer CPI を走らせるからだ。5 フェーズで分解:
 
-**検証**: ペイロード サイズ、非ゼロ deposit、預金者は signer、vault は正しい所有者 + サイズ、system プログラムは正しい、**token プログラムは SPL Token、預金者のトークン アカウントは SPL Token 所有、vault_token_account は `[VAULT_SEED, market, mint]` で派生される PDA と一致する**。渡される mint と market アカウントは vault に保存されたものと一致しなければならない — 下の借用スコープ内で `vault.mint != mint_ai.key` / `vault.market != market_ai.key` チェックが捕捉する。share PDA 派生は以前と変わらず。
+**検証**: ペイロード サイズ、非ゼロ deposit、預金者は signer、vault は正しい所有者 + サイズ、system プログラムは正しい、**token プログラムは SPL Token、預金者のトークン アカウントは SPL Token 所有、vault_token はこの vault 自身の口座、つまり `[TRADING_VAULT_TOKEN_SEED, vault]` の PDA である**。渡される mint と market アカウントは vault に保存されたものと一致しなければならない — 下の借用スコープ内で `vault.mint != mint_ai.key` / `vault.market != market_ai.key` チェックが捕捉する。share PDA 派生は以前と変わらず。
 
 **vault 状態を読み mint する shares を計算**: vault データを借用、渡された market/mint を vault.market/vault.mint と相互チェック、最初の deposit（1:1）vs 以降（pro-rata）で分岐。
 
@@ -230,7 +230,7 @@ spl_token_transfer_user_signed(
 )?;
 ```
 
-第 11 章と同じヘルパ。預金者が外側トランザクションに署名する。署名は標準の signer 特権延長パターン（第 6 章 §6.2）で SPL Token に流れる。`assets` 単位が `depositor_token` から `vault_token`（(market, mint) ごとの vault PDA — 第 11 章のポジション担保を保持する同じ vault アカウント）へ移る。
+第 11 章と同じヘルパ。預金者が外側トランザクションに署名する。署名は標準の signer 特権延長パターン（第 6 章 §6.2）で SPL Token に流れる。`assets` 単位が `depositor_token` から `vault_token`、つまりこの vault 専用のトークン口座へ移る。中には他の vault の預け入れもポジションの証拠金も入っていない。
 
 **順序が肝心。** CPI は share + 集約更新の*後*に置かれる。転送が失敗（`InsufficientFunds`、アカウント凍結等）すれば、Solana はトランザクション全体をリバートする — share 作成、share フィールド更新、vault 集約インクリメントを含めて。だから失敗したエスクローは預金者に mint された share を残さず、vault 状態変更も残さない。原子性保証が、明示的なロールバックコードなしで自然なエラー処理を正しくする。
 
@@ -240,7 +240,7 @@ spl_token_transfer_user_signed(
 
 ## §12.4  `VaultWithdraw` を歩く
 
-deposit より単純、作成するものがないから — ただし vault からトークンを払い出す、つまり vault-authority PDA で署名される `invoke_signed` CPI が発生する。`process_vault_withdraw`:
+deposit より単純、作成するものがないから — ただし vault からトークンを払い出す、つまり trading vault の PDA で署名される `invoke_signed` CPI が発生する。`process_vault_withdraw`:
 
 **返す assets を計算** — §12.2 で扱った deposit 式の逆。
 
@@ -264,9 +264,7 @@ if share.vault != *vault_ai.key.as_ref() {
 }
 ```
 
-deposit にはこの行は要らない。share の PDA を `[VAULT_SHARE_SEED, vault, depositor]` から導き直すので、別の vault の share は seed の照合で落ちる。withdraw は導き直さない。この章の最初の版はこの比較を書き忘れていた。害がなさそうに見えるが、市場の `TradingVault` はすべて**同じ** (market, mint) ごとのトークン口座から払い出し、vault ごとに share の値段は違う。誰も嘘をつかなくても違う。好調な月のあと vault X の share が 1、vault Y の share が 2 なら、X の share を Y に対して burn した人は、入れた額の 2 倍を Y の預金者の分から受け取る。マネージャが嘘をつけば、さらに悪くなる。再現テストでは、自分の vault を 100,000 トークンで開いて NAV を 1 と申告し、さらに 2 トークン入れて新しい share を 200,000 受け取り、それを別の vault に対して burn した。相手の vault の 200,000 トークン全部(他の預金者の分も含む)を持ち出せた。この穴を見つけたのはレビュアーではなく solinv である。§12.7 では同じやり方で見つけてもらう。
-
-この検査だけで市場が安全になるわけではない。§12.5 で示すとおり、マネージャの NAV は今も全 vault のトークンに届き、マネージャには誰でもなれる。
+deposit にはこの行は要らない。share の PDA を `[VAULT_SHARE_SEED, vault, depositor]` から導き直すので、別の vault の share は seed の照合で落ちる。withdraw は導き直さない。この章の最初の版はこの比較を書き忘れていた。害がなさそうに見えるが、vault ごとに share の値段は違う。誰も嘘をつかなくても違う。好調な月のあと vault X の share が 1、vault Y の share が 2 なら、X の share を Y に対して burn した人は、入れた額の 2 倍を Y のトークン口座、つまり Y の預金者のお金から受け取る。マネージャが嘘をつけば、さらに悪くなる。再現テストでは、自分の vault を 100,000 トークンで開いて NAV を 1 と申告し、さらに 2 トークン入れて新しい share を 200,000 受け取り、それを別の vault に対して burn した。検査がないと、相手の vault の 200,000 トークン全部を持ち出せた。この穴を見つけたのはレビュアーではなく solinv である。§12.7 では同じやり方で見つけてもらう。
 
 **残高十分性チェック**:
 
@@ -292,35 +290,35 @@ share.cost_basis = share.cost_basis.saturating_sub(basis_reduction);
 
 **集約を更新** — `total_shares -= shares_to_burn`、`total_assets -= assets_to_return`。両方とも防御的に `saturating_sub`、事前チェックを考えれば underflow するはずがないが。
 
-**vault から assets を払い出す**、最後のステップ — これが新しいエスクロー CPI:
+**vault から assets を払い出す**、最後のステップ — これがエスクロー CPI:
 
 ```rust
-spl_token_transfer_vault_signed(
-    vault_token_ai,
-    owner_token_ai,
-    vault_authority_ai,
-    market_ai.key,
-    vault_auth_bump,
-    token_ai,
-    assets_to_return,
+let ix = Instruction {
+    program_id: SPL_TOKEN_PROGRAM_ID,
+    accounts: vec![
+        AccountMeta::new(*vault_token_ai.key, false),
+        AccountMeta::new(*owner_token_ai.key, false),
+        AccountMeta::new_readonly(*vault_ai.key, true),
+    ],
+    data, // [TRANSFER][assets_to_return u64 LE]
+};
+// (`if assets_to_return > 0` の中: 払い出しが 0 なら CPI を飛ばす)
+invoke_signed(
+    &ix,
+    &[vault_token_ai.clone(), owner_token_ai.clone(), vault_ai.clone(), token_ai.clone()],
+    &[&[TRADING_VAULT_SEED, vault_market.as_ref(), vault_manager.as_ref(), &[vault_bump]]],
 )?;
 ```
 
-deposit 側との力学的な違いがひとつ、肝心:**authority がユーザではなく PDA**だ。預金者の外側トランザクション署名は SPL Token にとって意味がない、なぜなら debit されるトークン アカウント（`vault_token`）は `vault_authority` 所有 — *プログラム*が制御する PDA だから。だからプログラムが vault_authority に代わって内側 CPI に署名する、`invoke_signed` 経由で:
+deposit 側との力学的な違いがひとつ、肝心:**authority がユーザではなく PDA**だ。預金者の外側トランザクション署名は SPL Token にとって意味がない、なぜなら debit されるトークン アカウント（`vault_token`）が従うのは trading vault の PDA だから。これを整えたのは `CreateTradingVault` である。`vault_token` を `[TRADING_VAULT_TOKEN_SEED, vault]` に作り、vault のアドレスを持ち主として `InitializeAccount3` を実行した。だからプログラムは vault として、vault 自身の seed で内側 CPI に署名する。seed は `[TRADING_VAULT_SEED, market, manager, bump]` で、どれも `CreateTradingVault` が `TradingVault` アカウントに保存したものを読む。
 
-```rust
-let market_key_bytes = market_key.to_bytes();
-let signer_seeds: &[&[u8]] = &[VAULT_AUTH_SEED, market_key_bytes.as_ref(), &[vault_auth_bump]];
-invoke_signed(&ix, &[source, dest, vault_authority, token_program], &[signer_seeds])?;
-```
+細かい点が 2 つある。1 つ目、`vault_market`・`vault_manager`・`vault_bump` は借用スコープの中で写し取り、借用は CPI の前に終わる。vault のアカウントは署名者として SPL Token に渡され、呼び出し側がまだデータを借用しているアカウントの CPI をランタイムは拒否する。2 つ目、vault が署名できるのは自分のトークン口座だけだ。呼び出し側が `vault_token` に別の vault のトークン口座を渡すと、まずプログラムが拒否する(`[TRADING_VAULT_TOKEN_SEED, vault]` の照合)。仮にそれがなくても SPL Token が拒否する。この vault はその口座の authority ではないからだ。
 
-seeds — `[VAULT_AUTH_SEED, market, bump]` — は第 6 章 §6.2 で `create_market` が派生したもの、`process_create_market` が Market アカウントに `vault_auth_bump` として記録したものに正確に一致する。bump は呼び出し側から渡される（ハンドラが market から読み込む）、再計算する代わりに、CU 削減と署名 seeds が記録された派生と正確に一致するためだ。
-
-seeds が `vault_authority_ai.key` に等しいアドレスの有効な PDA を形成しなければ、ランタイムは signed CPI を `ProgramError::InvalidSeeds` で拒否する。だから悪意ある呼び出し側が偽の vault_authority を渡すことはできない — プログラムが署名できる唯一無二の PDA だけが受け入れられる。
+さらに SPL Token は残高を確かめる。`assets_to_return` が `vault_token` の残高より多ければ転送は失敗し、withdraw 全体が戻る。`total_assets` が何と言っていようと、vault は持っていないトークンを払い出せない。
 
 **ここでも順序が肝心。** CPI は最後。トークン転送が失敗（vault_token 凍結、dest クローズ等）すれば、share-burn と集約-デクリメントもリバートする。だから失敗した払い出しは預金者の shares を無傷で残し、vault も変更しない。
 
-> **演習 §12.4.** §12.2 の演習の vault で、預金者 A に全 shares を引き出させる。3 つを前後でダンプせよ: (1) 預金者 A の share アカウント、(2) vault 集約状態、(3) vault トークン アカウント残高。A が受け取るトークンが、預金者 B の主張可能価値が残り shares に対して含意するものと一致する（つまり B の価値が変わっていない）ことを確認せよ。
+> **演習 §12.4.** §12.2 の演習の vault で、預金者 A に全 shares を引き出させる。3 つを前後でダンプせよ: (1) 預金者 A の share アカウント、(2) vault 集約状態、(3) vault トークン アカウント残高。A が受け取るトークンが、預金者 B の主張可能価値が残り shares に対して含意するものと一致する（つまり B の価値が変わっていない）ことを確認せよ。そのあと (3) をもう一度見よ。A は 200 を受け取り、口座には 200 あった。B はまだ 100 を受け取れるはずなのに、口座は空だ。NAV が 100 から 200 になったのはマネージャの申告によるもので、トークンが入ってきたからではない。§12.5 はこの差の話である。
 
 ---
 
@@ -340,7 +338,9 @@ vault.total_assets = new_total_assets;
 
 マネージャは `total_assets` を任意の数値に更新するトランザクションに署名する。この数値がマネージャの実際の取引 PnL を反映していることをオンチェーンで検証する仕組みはない。**預金者はマネージャを信用する**。
 
-このコードベースでは、それより悪い。**市場の全員が、全部のマネージャを**信用している。しかも `CreateTradingVault` を使えば誰でもマネージャになれる。withdraw は (market, mint) ごとのトークン口座から払い出し、その口座には他の vault の預け入れも、全ポジションの証拠金も入っている。vault の払い出しを、その vault が入れた額で止めるものは何もない。自分の vault に 100,000 入れ、NAV を 300,000 と申告して withdraw すると、300,000 が出てくる。`fuzz/vault` のテスト `manager_cannot_withdraw_more_than_its_vault_holds` がそれを示しており、トークン口座は 0 になった。穴が開いたままなので、このテストには `#[ignore]` をつけてある。塞ぐには vault ごとにトークン口座を持たせる必要があり(seed `[VAULT_SEED, vault]`)、vault のトークンを動かすハンドラ全部が変わる。これは 1 行の抜けではなく設計の変更なので、vault の取引の半分(§12.0)と同じく宿題に残す。下の 3 パターンは vault 自身の預金者を守るが、この穴は消さない。
+この章の最初の版は、それより悪かった。**市場の全員が、全部のマネージャを**信用していた。しかも `CreateTradingVault` を使えば誰でもマネージャになれる。withdraw は (market, mint) ごとのトークン口座から払い出し、その口座には他の vault の預け入れも、全ポジションの証拠金も入っていたので、vault の払い出しを、その vault が持っている額で止めるものは何もなかった。自分の vault に 100,000 入れ、NAV を 300,000 と申告して withdraw すると、他人の 200,000 を含む 300,000 が出てきた。抜けていた検査はない。渡したアカウントはどれも正しいものだった。直したのは設計である。今は vault ごとに自分のトークン口座があり(§12.0)、withdraw はそこからしか払わない。`fuzz/vault` のテスト `manager_cannot_withdraw_more_than_its_vault_holds` は同じ手順を今のコードで実行する。300,000 の withdraw は SPL Token で失敗する。vault の口座には 100,000 しかないからだ。もう一方の vault の 200,000 には手がつかない。
+
+だから信用の範囲は上の段落が言うとおりに戻り、それより広くはない。vault の預金者は、その vault のマネージャを信用する。マネージャは今も嘘の NAV を申告でき、それはその vault の預金者どうしの間でお金を動かす(水増しされた NAV で先に引き出した人が、他の人の当てにしていたトークンを持っていく。演習 §12.4 のとおり)。下の 3 パターンはその話である。
 
 本番でこれを硬化する 3 つのパターン:
 
@@ -432,7 +432,7 @@ Vault ライフサイクル:
 
 上の 3 項目は計算を確かめる。アカウントの検査、つまり §12.3 と §12.4 にある、呼び出し側が**どの**アカウントを渡してよいかを決める `if ... { return Err(...) }` の行は、どれも確かめない。§12.4 の `share.vault` の行のように、そういう検査を 1 つ忘れても、書こうと思いつくテストはどれも落ちない。[solinv](https://github.com/psyto/solinv) は、ネイティブのプログラムに対してまさにこれを fuzz する。攻撃者が代わりに渡せるアカウント(他の預金者の share、別の vault、vault が持っていないトークン口座)を教えると、各命令でそのうち 1 つを差し替えて送る(組を宣言すれば、複数を一緒に差し替える)。差し替えた呼び出しが成功して状態が変われば、それが検出である。
 
-`fuzz/vault/` がこの章のためのハーネスである。1 つの市場に vault を 3 つ用意する。A と B が shares を持つ K の vault、A 自身の vault、屑の mint で作った C の vault だ。solinv は、README が誰にでも勧めている入れ方(git の rev)で入れてある。Solana のツールチェーンと Crucible CLI(`cargo install --locked --git https://github.com/asymmetric-research/crucible --tag v0.1.0 crucible-fuzz-cli`)が要る:
+`fuzz/vault/` がこの章のためのハーネスである。1 つの市場に vault を 3 つ用意し、それぞれが自分のトークン口座を持つ。A と B が shares を持つ K の vault、A 自身の vault、屑の mint で作った C の vault だ。solinv は、README が誰にでも勧めている入れ方(git の rev)で入れてある。Solana のツールチェーンと Crucible CLI(`cargo install --locked --git https://github.com/asymmetric-research/crucible --tag v0.1.0 crucible-fuzz-cli`)が要る:
 
 ```bash
 cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
@@ -459,19 +459,19 @@ timeout -s INT 90 crucible run openhl_vault_fuzz invariant_vault \
 > | withdraw: `share.vault == vault` | はい、account-swap、slot 1 |
 > | withdraw: `share.owner == owner` | はい、account-swap、slot 2 |
 > | deposit: share の PDA の導き直し | はい、account-swap、slot 1 |
-> | deposit: `verify_vault_token_account` | はい、account-swap、slot 7 |
+> | deposit: `verify_trading_vault_token` | はい、account-swap、slot 7 |
 > | deposit: `depositor.is_signer` | いいえ |
 > | withdraw: `vault.owner == program_id` | いいえ |
 > | withdraw: `share.owner == program_id` | いいえ |
-> | withdraw: `verify_vault_token_account` | 2 つの slot の組でだけ: account-swap `check_sets`、slot 5 と 6(下を見よ) |
+> | withdraw: `verify_trading_vault_token` | いいえ。下の 2 つの slot の組でも出ない |
 >
-> 先を読む前に、「いいえ」の 3 行がなぜ「いいえ」なのか、最後の行にはなぜ組が要るのかを考えよ。
+> 先を読む前に、「いいえ」の 4 行がなぜ「いいえ」なのかを考えよ。
 >
-> 3 つは、別の仕組みが裏で支えている。これらは攻撃を試しておらず、通り道が見つからなかっただけだ。2 つの所有者チェックは、ランタイム自身が支えている(第 1 章)。withdraw は両方のアカウントに書き込み、プログラムは自分が所有していないアカウントを変えられないので、すり替えたアカウントは次の CPI か命令の最後で落ちる。deposit の署名チェックは SPL Token が支えている(第 6 章)。deposit は預金者の口座からトークンを動かすので、預金者の署名が要る。この 3 つも、早く、分かりやすいエラーで落ちるので、検査として残す価値はある。
+> 4 つとも、別の仕組みが裏で支えている。これらは攻撃を試しておらず、通り道が見つからなかっただけだ。2 つの所有者チェックは、ランタイム自身が支えている(第 1 章)。withdraw は両方のアカウントに書き込み、プログラムは自分が所有していないアカウントを変えられないので、すり替えたアカウントは次の CPI か命令の最後で落ちる。deposit の署名チェックは SPL Token が支えている(第 6 章)。deposit は預金者の口座からトークンを動かすので、預金者の署名が要る。この 3 つも、早く、分かりやすいエラーで落ちるので、検査として残す価値はある。
 >
-> 4 つ目は本物の穴で、fuzzer は見逃す。`vault_authority` の PDA の seed は `[VAULT_AUTH_SEED, market]` なので、この PDA は**どの** mint についても、市場のトークン口座の持ち主になる。`CreateVault`(第 6 章)を使えば誰でも任意の mint の口座を作れ、`CreateTradingVault` を使えば誰でもそこに vault を開ける。検査がないと、C は屑の mint で vault を開き、屑トークンを 300,000 入れて引き出す。その引き出しで、払い出し元に本物の mint のトークン口座を、送り先に C 自身の本物の mint の口座を指定する。C は屑 300,000 を本物 300,000 に換え、口座を空にした。これは**2 つ**のアカウントを同時に変える必要がある。solinv のふつうの account-swap は 1 度に 1 つの slot しか変えないので、最初の表はこの行を「いいえ」とし、害はないと書いていた。攻撃を見つけたのはレビュアーである。今のハーネスはこの組も宣言しており(`check_sets`: C の屑の引き出しで、送り先と払い出し元を本物の mint のものに一緒に差し替える)、数秒で捕まえる。テスト `withdraw_refuses_the_token_account_of_another_mint` でも押さえてある。fuzzer の「いいえ」は、あなたが書いた差し替えでは通り道が見つからなかったという意味でしかない。通り道がないという意味ではない。
+> 4 つ目は SPL Token の authority の照合が支えている。vault は自分としてしか署名せず、各 vault のトークン口座はその vault にしか従わないので、払い出し元に別の vault のトークン口座を指定すると `OwnerMismatch` で落ちる。最初からそうだったわけではない。この章の最初の版では、市場のトークン口座はすべて 1 つの `vault_authority` の PDA(`[VAULT_AUTH_SEED, market]`)に従っており、この行は本物の穴だった。C は屑の mint で vault を開き、屑を 300,000 入れ、払い出し元に本物の mint のトークン口座を、送り先に C 自身の本物の mint の口座を指定して引き出し、屑 300,000 を本物 300,000 に換えた。これは**2 つ**のアカウントを同時に変える必要がある。solinv のふつうの account-swap は 1 度に 1 つの slot しか変えないので、最初の表はこの行を「いいえ」とし、害はないと書いていた。攻撃を見つけたのはレビュアーである。ハーネスは今もこの組を宣言しており(`check_sets`: C の屑の引き出しで、送り先と払い出し元を一緒に差し替える。払い出し元は今は K のトークン口座)、テスト `withdraw_refuses_the_token_account_of_another_vault` でも押さえてある。このテストがわざと K の残高より少ない 100,000 を求めているのには理由がある。K の口座の残高より多い 300,000 を求めると、SPL Token は authority を見る前に残高で拒否する。するとプログラムの照合を消しても出るのは「insufficient funds」で、この行を SPL Token が支えているかどうかは分からない。100,000 なら `OwnerMismatch` が出る。拒否から何かを結論するときは、**どの**拒否なのかを確かめよ。そして fuzzer の「いいえ」は、あなたが書いた差し替えでは通り道が見つからなかったという意味でしかない。通り道がないという意味ではない。
 >
-> このハーネスが扱わないもの: §12.5 のマネージャが申告する NAV。嘘の NAV を申告するマネージャは、自分が渡してよいアカウントしか渡さないので、アカウントを差し替える fuzzer には差し替える物がない。§12.5 の穴は、9 つの検査がすべてそろっていても開いたままである。見つけるには、行を消すのではなく設計を読む必要があった。
+> このハーネスが扱わないもの: §12.5 のマネージャが申告する NAV。嘘の NAV を申告するマネージャは、自分が渡してよいアカウントしか渡さないので、アカウントを差し替える fuzzer には差し替える物がない。市場全体に及ぶ形のこの穴は、9 つの検査がすべてそろっていても開いていた。塞いだのは 1 行ではなく設計の変更(vault ごとのトークン口座)である。残っているもの、つまりマネージャが自分の vault の預金者に嘘をつくことも、fuzzer からは同じく見えない。こういう穴を見つけるには、行を消すのではなく設計を読む必要がある。
 
 ---
 

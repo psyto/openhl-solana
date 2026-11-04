@@ -3,12 +3,13 @@
 //!
 //! Loads the real `openhl_core.so` from `target/deploy/` (`cargo build-sbf
 //! --manifest-path programs/openhl-core/Cargo.toml`). One market holds three
-//! trading vaults: K's, where depositors A and B each hold shares, A's own,
-//! and C's in a junk mint. The specs send A's deposit into K's vault and
-//! A's withdrawal from it, and solinv swaps in B's share account, A's share
-//! account in the other vault, the other vault, or a token account B holds.
-//! A two-slot set swaps C's junk withdrawal onto the real mint's token
-//! account. Any swap that succeeds and changes state is a finding.
+//! trading vaults, each with its own token account: K's, where depositors A
+//! and B each hold shares, A's own, and C's in a junk mint. The specs send
+//! A's deposit into K's vault and A's withdrawal from it, and solinv swaps in
+//! B's share account, A's share account in the other vault, the other vault,
+//! the other vault's token account, or a token account B holds. A two-slot
+//! set points C's junk withdrawal at K's token account. Any swap that
+//! succeeds and changes state is a finding.
 
 use crucible_fuzzer::*;
 use solana_account::Account;
@@ -45,11 +46,9 @@ fn trading_vault(market: &Pubkey, manager: &Pubkey) -> Pubkey {
 fn share(vault: &Pubkey, owner: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"vault_share", vault.as_ref(), owner.as_ref()], &CORE_ID).0
 }
-fn vault_token(market: &Pubkey, mint: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"vault", market.as_ref(), mint.as_ref()], &CORE_ID).0
-}
-fn vault_auth(market: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"vault_auth", market.as_ref()], &CORE_ID).0
+/// A trading vault's own token account.
+fn vault_token(vault: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"tvault_token", vault.as_ref()], &CORE_ID).0
 }
 
 /// An SPL Token mint (82 bytes).
@@ -130,7 +129,7 @@ impl VaultFixture {
             AccountMeta::new_readonly(self.market, false),
             AccountMeta::new_readonly(self.mint, false),
             AccountMeta::new(*ata, false),
-            AccountMeta::new(vault_token(&self.market, &self.mint), false),
+            AccountMeta::new(vault_token(vault), false),
             AccountMeta::new_readonly(token(), false),
         ]
     }
@@ -143,18 +142,33 @@ impl VaultFixture {
             AccountMeta::new_readonly(self.market, false),
             AccountMeta::new_readonly(self.mint, false),
             AccountMeta::new(*ata, false),
-            AccountMeta::new(vault_token(&self.market, &self.mint), false),
-            AccountMeta::new_readonly(vault_auth(&self.market), false),
+            AccountMeta::new(vault_token(vault), false),
             AccountMeta::new_readonly(token(), false),
         ]
     }
 
-    /// `metas` with the mint at `mint_ix` and the market's token account
-    /// at `token_ix` switched to the junk mint's.
-    fn junk_metas(&self, mut metas: Vec<AccountMeta>, mint_ix: usize, token_ix: usize) -> Vec<AccountMeta> {
+    /// `metas` with the mint at `mint_ix` switched to the junk mint.
+    fn junk_metas(&self, mut metas: Vec<AccountMeta>, mint_ix: usize) -> Vec<AccountMeta> {
         metas[mint_ix] = AccountMeta::new_readonly(self.junk, false);
-        metas[token_ix] = AccountMeta::new(vault_token(&self.market, &self.junk), false);
         metas
+    }
+
+    fn create_vault(&mut self, manager: Arc<Keypair>, mint: Pubkey, vault: Pubkey, what: &str) {
+        let ix = Instruction {
+            program_id: CORE_ID,
+            accounts: vec![
+                AccountMeta::new(self.payer.pubkey(), true),
+                AccountMeta::new_readonly(self.market, false),
+                AccountMeta::new_readonly(manager.pubkey(), true),
+                AccountMeta::new_readonly(mint, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(SYSTEM_ID, false),
+                AccountMeta::new(vault_token(&vault), false),
+                AccountMeta::new_readonly(token(), false),
+            ],
+            data: vec![IX_CREATE_TRADING_VAULT],
+        };
+        self.send(ix, &[&*manager], what);
     }
 
     fn deposit(&mut self, vault: Pubkey, who: Arc<Keypair>, ata: Pubkey, what: &str) {
@@ -233,57 +247,29 @@ impl VaultFixture {
         // market account is written directly instead of via CreateMarket.
         f.put(market, CORE_ID, vec![0u8; 8]);
         f.put(mint, token(), mint_data(6));
-        f.put(vault_token(&market, &mint), token(), token_account_data(&mint, &vault_auth(&market), 0));
         let (aa, ba) = (f.a_ata, f.b_ata);
         f.put(aa, token(), token_account_data(&mint, &a.pubkey(), START_BALANCE));
         f.put(ba, token(), token_account_data(&mint, &b.pubkey(), START_BALANCE));
 
         // K's vault and A's vault, both in this market.
-        for (manager, vault) in [(&k, f.vault), (&a, f.a_vault)] {
-            let ix = Instruction {
-                program_id: CORE_ID,
-                accounts: vec![
-                    AccountMeta::new(payer.pubkey(), true),
-                    AccountMeta::new_readonly(market, false),
-                    AccountMeta::new_readonly(manager.pubkey(), true),
-                    AccountMeta::new_readonly(mint, false),
-                    AccountMeta::new(vault, false),
-                    AccountMeta::new_readonly(SYSTEM_ID, false),
-                ],
-                data: vec![IX_CREATE_TRADING_VAULT],
-            };
-            f.send(ix, &[&**manager], "create_trading_vault");
-        }
+        let (v, av) = (f.vault, f.a_vault);
+        f.create_vault(Arc::clone(&k), mint, v, "create K's vault");
+        f.create_vault(Arc::clone(&a), mint, av, "create A's vault");
 
         // A and B hold shares in K's vault; A also in its own.
-        let (v, av) = (f.vault, f.a_vault);
         f.deposit(v, Arc::clone(&a), aa, "deposit A into K's vault");
         f.deposit(v, Arc::clone(&b), ba, "deposit B into K's vault");
         f.deposit(av, Arc::clone(&a), aa, "deposit A into A's vault");
 
-        // C: a junk mint, the market's token account for it (CreateVault,
-        // tag 5, lets anyone create one), a vault in it, and a deposit.
+        // C: a junk mint, a vault in it (anyone may open one), and a deposit.
         let (junk, cv, cj, cr) = (f.junk, f.c_vault, f.c_junk, f.c_real);
         f.put(junk, token(), mint_data(6));
-        f.put(vault_token(&market, &junk), token(), token_account_data(&junk, &vault_auth(&market), 0));
         f.put(cj, token(), token_account_data(&junk, &c.pubkey(), START_BALANCE));
         f.put(cr, token(), token_account_data(&mint, &c.pubkey(), 0));
+        f.create_vault(Arc::clone(&c), junk, cv, "C opens a junk-mint vault");
         let ix = Instruction {
             program_id: CORE_ID,
-            accounts: vec![
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new_readonly(market, false),
-                AccountMeta::new_readonly(c.pubkey(), true),
-                AccountMeta::new_readonly(junk, false),
-                AccountMeta::new(cv, false),
-                AccountMeta::new_readonly(SYSTEM_ID, false),
-            ],
-            data: vec![IX_CREATE_TRADING_VAULT],
-        };
-        f.send(ix, &[&*c], "C opens a junk-mint vault");
-        let ix = Instruction {
-            program_id: CORE_ID,
-            accounts: f.junk_metas(f.deposit_metas(&cv, &c.pubkey(), &cj), 5, 7),
+            accounts: f.junk_metas(f.deposit_metas(&cv, &c.pubkey(), &cj), 5),
             data: amount_data(IX_VAULT_DEPOSIT, 3 * START_DEPOSIT),
         };
         f.send(ix, &[&*c], "C deposits junk");
@@ -348,7 +334,10 @@ impl HasInstructionSet for VaultFixture {
                 vec![],
                 vec![],
                 vec![],
-                vec![self.b_ata],                // "vault" account B holds
+                vec![
+                    vault_token(&self.a_vault),  // A's vault's token account
+                    self.b_ata,                  // "vault" account B holds
+                ],
                 vec![],
             ],
             data_sample: amount_data(IX_VAULT_DEPOSIT, 10),
@@ -366,9 +355,9 @@ impl HasInstructionSet for VaultFixture {
             accounts: self.withdraw_metas(&self.vault, &a, &self.a_ata),
             signer_indices: vec![0],
             optional_signer_indices: vec![],
-            expected_owners: vec![None, c, c, None, None, t, t, None, None],
-            expected_discriminators: vec![None; 9],
-            expected_pda_seeds: vec![None; 9],
+            expected_owners: vec![None, c, c, None, None, t, t, None],
+            expected_discriminators: vec![None; 8],
+            expected_pda_seeds: vec![None; 8],
             creates_indices: vec![],
             swap_alternates: vec![
                 vec![],
@@ -382,8 +371,10 @@ impl HasInstructionSet for VaultFixture {
                 // The destination is not swapped: paying one's own
                 // withdrawal to someone else's account harms no one.
                 vec![],
-                vec![self.b_ata],                    // "vault" account B holds
-                vec![],
+                vec![
+                    vault_token(&self.a_vault),      // A's vault's token account
+                    self.b_ata,                      // "vault" account B holds
+                ],
                 vec![],
             ],
             data_sample: amount_data(IX_VAULT_WITHDRAW, 10),
@@ -399,8 +390,8 @@ impl HasInstructionSet for VaultFixture {
         // its source and destination for the real mint's together.
         let junk_withdraw = InstructionSpec {
             name: "vault_withdraw_junk".into(),
-            accounts: self.junk_metas(self.withdraw_metas(&self.c_vault, &self.c.pubkey(), &self.c_junk), 4, 6),
-            swap_alternates: vec![vec![]; 9],
+            accounts: self.junk_metas(self.withdraw_metas(&self.c_vault, &self.c.pubkey(), &self.c_junk), 4),
+            swap_alternates: vec![vec![]; 8],
             signers: vec![Arc::clone(&self.c)],
             ..withdraw.clone()
         };
@@ -413,9 +404,9 @@ fn invariant_vault(fixture: &mut VaultFixture) {
     solinv_core::invariants::signer_skip::check(fixture);
     solinv_core::invariants::owner_skip::check(fixture);
     solinv_core::invariants::account_swap::check(fixture);
-    // Withdraw junk, paid from the real mint's token account to C's own
+    // Withdraw junk, paid from K's token account (real mint) to C's own
     // real-mint account: two slots that only work together.
-    let real_token = vault_token(&fixture.market, &fixture.mint);
+    let real_token = vault_token(&fixture.vault);
     let sets = [SwapSet { ix: "vault_withdraw_junk".into(), swaps: vec![(5, fixture.c_real), (6, real_token)] }];
     // check_sets skips a set whose spec or accounts are missing without a
     // word, so make sure this one is really there.
@@ -432,12 +423,12 @@ mod tests {
 
     /// A manages its own vault in the same market, so it can mint itself
     /// shares there for almost nothing (report NAV 1, then deposit 2), and
-    /// then burn them against K's vault, whose tokens sit in the same
-    /// per-(market, mint) token account.
+    /// then burn them against K's vault, at K's price, out of K's token
+    /// account.
     #[test]
     fn withdraw_refuses_a_share_from_another_vault() {
         let mut f = VaultFixture::setup();
-        let (a, mint, market) = (Arc::clone(&f.a), f.mint, f.market);
+        let a = Arc::clone(&f.a);
         let (vault, a_vault, a_ata) = (f.vault, f.a_vault, f.a_ata);
 
         let ix = Instruction {
@@ -460,42 +451,41 @@ mod tests {
         let ix = Instruction { program_id: CORE_ID, accounts, data: amount_data(IX_VAULT_WITHDRAW, 2 * START_DEPOSIT) };
         let (ok, out) = f.send_logged(ix, Arc::clone(&a));
         let taken = f.ctx.token_balance(&a_ata) - before;
-        let left = f.ctx.token_balance(&vault_token(&market, &mint));
-        assert!(!ok, "withdraw from K's vault with A's other share succeeded: A took {taken}, {left} left in the token account");
+        let left = f.ctx.token_balance(&vault_token(&vault));
+        assert!(!ok, "withdraw from K's vault with A's other share succeeded: A took {taken}, {left} left in K's token account");
         assert!(out.contains("share belongs to another vault"), "refused for another reason: {out}");
     }
 
-    /// CreateVault (tag 5) lets anyone create the market's token account for
-    /// any mint, and the vault authority PDA is the owner of all of them. So
     /// C opens a vault in a junk mint, deposits junk, and withdraws naming
-    /// the real mint's token account as the source and its own real-mint
-    /// account as the destination. Two accounts change together; the fuzzer
-    /// reaches it only through the `check_sets` pair in `invariant_vault`.
+    /// K's token account (real mint) as the source and its own real-mint
+    /// account as the destination. The program refuses it; without that
+    /// check SPL Token would too, since C's vault is not the authority of
+    /// K's account. The amount stays under K's balance so the transfer
+    /// would reach SPL Token's authority check, not stop at the balance.
+    /// Two accounts change together; the fuzzer reaches it only through the
+    /// `check_sets` pair in `invariant_vault`.
     #[test]
-    fn withdraw_refuses_the_token_account_of_another_mint() {
+    fn withdraw_refuses_the_token_account_of_another_vault() {
         let mut f = VaultFixture::setup();
-        let (market, mint) = (f.market, f.mint);
-        let (c, c_vault, c_real) = (Arc::clone(&f.c), f.c_vault, f.c_real);
+        let (vault, c, c_vault, c_real) = (f.vault, Arc::clone(&f.c), f.c_vault, f.c_real);
         let mut accounts = f.withdraw_metas(&c_vault, &c.pubkey(), &c_real);
         accounts[4] = AccountMeta::new_readonly(f.junk, false);
-        // accounts[6] stays the real mint's token account.
-        let ix = Instruction { program_id: CORE_ID, accounts, data: amount_data(IX_VAULT_WITHDRAW, 3 * START_DEPOSIT) };
+        accounts[6] = AccountMeta::new(vault_token(&vault), false);
+        let ix = Instruction { program_id: CORE_ID, accounts, data: amount_data(IX_VAULT_WITHDRAW, START_DEPOSIT) };
         let (ok, out) = f.send_logged(ix, Arc::clone(&c));
         let taken = f.ctx.token_balance(&c_real);
-        let left = f.ctx.token_balance(&vault_token(&market, &mint));
-        assert!(!ok, "C swapped junk for {taken} real tokens; {left} left in the token account");
-        assert!(out.contains("vault_token_account does not match derived PDA"), "refused for another reason: {out}");
+        let left = f.ctx.token_balance(&vault_token(&vault));
+        assert!(!ok, "C swapped junk for {taken} real tokens; {left} left in K's token account");
+        assert!(out.contains("vault_token is not this vault's token account"), "refused for another reason: {out}");
     }
 
-    /// Not fixed: a vault's manager sets its NAV, and every vault in the
-    /// market pays out of one token account, so a manager who over-reports
-    /// NAV withdraws other vaults' deposits. Closing this needs a token
-    /// account per vault (a design change, not a missing check).
+    /// A vault's manager sets its NAV, so a manager can over-report it. What
+    /// a vault pays out comes from its own token account, so the most the
+    /// manager takes is what that vault holds; K's vault is untouched.
     #[test]
-    #[ignore = "known hole: manager-reported NAV draws on the market's shared token account"]
     fn manager_cannot_withdraw_more_than_its_vault_holds() {
         let mut f = VaultFixture::setup();
-        let (a, mint, market) = (Arc::clone(&f.a), f.mint, f.market);
+        let (a, vault) = (Arc::clone(&f.a), f.vault);
         let (a_vault, a_ata) = (f.a_vault, f.a_ata);
 
         let ix = Instruction {
@@ -510,12 +500,12 @@ mod tests {
             accounts: f.withdraw_metas(&a_vault, &a.pubkey(), &a_ata),
             data: amount_data(IX_VAULT_WITHDRAW, START_DEPOSIT),
         };
-        let ok = f.send_ok(ix, Arc::clone(&a));
+        let (ok, out) = f.send_logged(ix, Arc::clone(&a));
         let taken = f.ctx.token_balance(&a_ata) - before;
-        let left = f.ctx.token_balance(&vault_token(&market, &mint));
-        assert!(
-            !ok || taken <= START_DEPOSIT,
-            "A put {START_DEPOSIT} into its own vault and took {taken} out; {left} left in the token account"
-        );
+        let k_left = f.ctx.token_balance(&vault_token(&vault));
+        assert!(!ok, "A put {START_DEPOSIT} into its own vault and took {taken} out");
+        // SPL Token refuses: the vault's own account holds only 100,000.
+        assert!(out.contains("insufficient funds"), "refused for another reason: {out}");
+        assert_eq!(k_left, 2 * START_DEPOSIT, "K's token account changed");
     }
 }
