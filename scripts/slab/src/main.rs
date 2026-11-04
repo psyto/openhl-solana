@@ -1,7 +1,9 @@
 //! Chapter 15 worked example — drives openhl-core's slab order book.
 //!
 //! Modes (mutually exclusive):
-//!   --create                        → CreateSlab (tag 29)
+//!   --create                        → SystemProgram CreateAccount + CreateSlab
+//!                                     (tag 29) in one tx; the new slab keypair
+//!                                     is written to --slab-keypair
 //!   --place --side bid|ask
 //!           --price <u64>
 //!           --size  <u64>           → SlabPlaceOrder (tag 30)
@@ -17,21 +19,26 @@
 //!        --payer ~/.config/solana/id.json \
 //!        --program <openhl-core program ID> \
 //!        --market <market PDA> \
+//!        [--slab <slab pubkey>] [--slab-keypair ./slab-keypair.json] \
 //!        [--create | --place ... | --match ...]
+//!
+//! The Slab (~82 KB) is too big for the program to create by CPI (10 KiB
+//! limit), so `--create` creates it here as a top-level instruction and
+//! CreateSlab only initializes it. The slab is a keypair account, not a PDA:
+//! later runs find it by `--slab`, or by reading `--slab-keypair`.
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use openhl_core::SLAB_SEED;
 use openhl_state::{side, tree_tag, CritbitTree, Slab, SLAB_NONE_INDEX};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
-    signature::{read_keypair_file, Signer},
+    signature::{read_keypair_file, write_keypair_file, Keypair, Signer},
     transaction::Transaction,
 };
-use solana_system_interface::program as system_program;
+use solana_system_interface::instruction as system_instruction;
 
 #[derive(Parser, Debug)]
 #[command(name = "slab", version, about)]
@@ -47,6 +54,15 @@ struct Cli {
 
     #[arg(long)]
     market: String,
+
+    /// slab account; defaults to the pubkey in --slab-keypair
+    #[arg(long)]
+    slab: Option<String>,
+
+    /// where --create writes the new slab keypair (and where the slab
+    /// pubkey is read from when --slab is not given)
+    #[arg(long, default_value = "./slab-keypair.json")]
+    slab_keypair: String,
 
     #[arg(long)]
     create: bool,
@@ -80,42 +96,76 @@ fn main() -> Result<()> {
     let program_id: Pubkey = cli.program.parse().context("parse --program")?;
     let market: Pubkey = cli.market.parse().context("parse --market")?;
 
-    let (slab_pda, bump) =
-        Pubkey::find_program_address(&[SLAB_SEED, market.as_ref()], &program_id);
-
     let client = RpcClient::new_with_commitment(cli.rpc.clone(), CommitmentConfig::confirmed());
+
+    let modes_set = [cli.create, cli.place, cli.r#match]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    if modes_set > 1 {
+        bail!("--create, --place, --match are mutually exclusive");
+    }
+
+    let slab_keypair_path = expand_tilde(&cli.slab_keypair);
+    let new_slab = if cli.create {
+        if cli.slab.is_some() {
+            bail!("--create makes a new slab; don't pass --slab");
+        }
+        if std::path::Path::new(&slab_keypair_path).exists() {
+            bail!("{slab_keypair_path} already exists; pass another --slab-keypair");
+        }
+        let kp = Keypair::new();
+        write_keypair_file(&kp, &slab_keypair_path)
+            .map_err(|e| anyhow::anyhow!("write slab keypair: {}", e))?;
+        Some(kp)
+    } else {
+        None
+    };
+    let slab_key: Pubkey = match (&new_slab, &cli.slab) {
+        (Some(kp), _) => kp.pubkey(),
+        (None, Some(s)) => s.parse().context("parse --slab")?,
+        (None, None) => read_keypair_file(&slab_keypair_path)
+            .map_err(|e| anyhow::anyhow!("no --slab and can't read {slab_keypair_path}: {}", e))?
+            .pubkey(),
+    };
 
     println!("rpc:        {}", cli.rpc);
     println!("payer/user: {}", payer.pubkey());
     println!("program:    {program_id}");
     println!("market:     {market}");
-    println!("slab PDA:   {slab_pda}  (bump {bump})");
+    println!("slab:       {slab_key}");
     println!();
 
-    let modes_set = [cli.create, cli.place, cli.r#match].iter().filter(|b| **b).count();
-    if modes_set > 1 {
-        bail!("--create, --place, --match are mutually exclusive");
-    }
-
-    if cli.create {
-        let ix = Instruction {
+    if let Some(slab_kp) = &new_slab {
+        let rent = client
+            .get_minimum_balance_for_rent_exemption(Slab::LEN)
+            .context("fetch rent")?;
+        let create_ix = system_instruction::create_account(
+            &payer.pubkey(),
+            &slab_key,
+            rent,
+            Slab::LEN as u64,
+            &program_id,
+        );
+        let init_ix = Instruction {
             program_id,
             accounts: vec![
-                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(slab_key, true),
                 AccountMeta::new_readonly(market, false),
-                AccountMeta::new(slab_pda, false),
-                AccountMeta::new_readonly(system_program::ID, false),
             ],
             data: vec![29u8],
         };
-        send(&client, &payer, ix)?;
+        send(&client, &payer, &[slab_kp], &[create_ix, init_ix])?;
+        println!("slab keypair written to {slab_keypair_path}");
     } else if cli.place {
         let side_byte = match cli.side.as_deref() {
             Some("bid") => side::BID,
             Some("ask") => side::ASK,
             other => bail!("--side must be 'bid' or 'ask', got {:?}", other),
         };
-        let price = cli.price.ok_or_else(|| anyhow::anyhow!("--price required"))?;
+        let price = cli
+            .price
+            .ok_or_else(|| anyhow::anyhow!("--price required"))?;
         let size = cli.size.ok_or_else(|| anyhow::anyhow!("--size required"))?;
         let mut data = Vec::with_capacity(1 + 1 + 8 + 8);
         data.push(30u8);
@@ -126,18 +176,20 @@ fn main() -> Result<()> {
             program_id,
             accounts: vec![
                 AccountMeta::new_readonly(payer.pubkey(), true),
-                AccountMeta::new(slab_pda, false),
+                AccountMeta::new(slab_key, false),
             ],
             data,
         };
-        send(&client, &payer, ix)?;
+        send(&client, &payer, &[], &[ix])?;
     } else if cli.r#match {
         let taker_byte = match cli.taker_side.as_deref() {
             Some("bid") => side::BID,
             Some("ask") => side::ASK,
             other => bail!("--taker-side must be 'bid' or 'ask', got {:?}", other),
         };
-        let price = cli.price.ok_or_else(|| anyhow::anyhow!("--price required"))?;
+        let price = cli
+            .price
+            .ok_or_else(|| anyhow::anyhow!("--price required"))?;
         let size = cli.size.ok_or_else(|| anyhow::anyhow!("--size required"))?;
         let max_fills = cli
             .max_fills
@@ -152,17 +204,17 @@ fn main() -> Result<()> {
             program_id,
             accounts: vec![
                 AccountMeta::new_readonly(payer.pubkey(), true),
-                AccountMeta::new(slab_pda, false),
+                AccountMeta::new(slab_key, false),
             ],
             data,
         };
-        send(&client, &payer, ix)?;
+        send(&client, &payer, &[], &[ix])?;
     }
 
     // Always dump.
     println!();
     println!("current slab state:");
-    match client.get_account(&slab_pda) {
+    match client.get_account(&slab_key) {
         Ok(account) if account.data.len() >= Slab::LEN => {
             let slab: &Slab = bytemuck::from_bytes(&account.data[..Slab::LEN]);
             print_slab(slab);
@@ -177,7 +229,6 @@ fn main() -> Result<()> {
 fn print_slab(slab: &Slab) {
     println!("  next_order_id: {}", slab.next_order_id);
     println!("  active_count:  {}", slab.active_count);
-    println!("  bump:          {}", slab.bump);
     println!("  market:        {}", Pubkey::new_from_array(slab.market));
     println!("  best bid:      {}", describe_best(&slab.bid_tree, true));
     println!("  best ask:      {}", describe_best(&slab.ask_tree, false));
@@ -221,21 +272,26 @@ fn count_leaves(tree: &CritbitTree) -> usize {
 
 fn send(
     client: &RpcClient,
-    payer: &solana_sdk::signature::Keypair,
-    ix: Instruction,
+    payer: &Keypair,
+    extra_signers: &[&Keypair],
+    ixs: &[Instruction],
 ) -> Result<()> {
-    println!("AccountMeta declared:");
-    for (i, m) in ix.accounts.iter().enumerate() {
-        let mode = match (m.is_writable, m.is_signer) {
-            (true, true) => "WRITE + SIGNER",
-            (true, false) => "WRITE",
-            (false, true) => "SIGNER",
-            (false, false) => "READ",
-        };
-        println!("  [{i}] {} {}", m.pubkey, mode);
+    for ix in ixs {
+        println!("AccountMeta declared ({}):", ix.program_id);
+        for (i, m) in ix.accounts.iter().enumerate() {
+            let mode = match (m.is_writable, m.is_signer) {
+                (true, true) => "WRITE + SIGNER",
+                (true, false) => "WRITE",
+                (false, true) => "SIGNER",
+                (false, false) => "READ",
+            };
+            println!("  [{i}] {} {}", m.pubkey, mode);
+        }
     }
     let blockhash = client.get_latest_blockhash().context("fetch blockhash")?;
-    let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[payer], blockhash);
+    let mut signers: Vec<&Keypair> = vec![payer];
+    signers.extend_from_slice(extra_signers);
+    let tx = Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &signers, blockhash);
     let sig = client
         .send_and_confirm_transaction(&tx)
         .context("send transaction")?;

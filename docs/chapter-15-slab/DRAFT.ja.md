@@ -15,7 +15,7 @@ Hyperliquid と Serum / Phoenix の答えは **slab** だ: 価格水準の上で
 
 本章は第 7 章の `CreateOrderBook` / `PlaceOrder` / `Match` に並列な、3 つの新しい命令を出荷する:
 
-1. **`CreateSlab`**（タグ 29）— market ごとの `Slab` PDA を確保し、OrderNode プールの free list と両 critbit 木の free list を初期化する。
+1. **`CreateSlab`**（タグ 29）— クライアントが同じトランザクションで作った `Slab` アカウントを初期化し、OrderNode プールの free list と両 critbit 木の free list を初期化する。
 2. **`SlabPlaceOrder`**（タグ 30）— `PlaceOrder` と同じペイロード。critbit insert を走らせ、プールから OrderNode をアロケートし、その価格水準の FIFO につなげる。
 3. **`SlabMatch`**（タグ 31）— `Match` と同じペイロード（taker side + limit price + size + max_fills cap）。maker 側の best 葉を歩き、その FIFO 先頭に当てて埋め、空になった水準を取り除き、§8.3 のページング cap を適用する。
 
@@ -88,7 +88,7 @@ pub struct Slab {                               // 計 ~82 KiB
 
 **4. 共有 OrderNode プール 1 つ。** `Slab.nodes` は単一配列。両方の木が同じプールから FIFO を引く。代替（side ごとプール）なら同じトータルフットプリントで side ごと OrderNode 容量が倍だが、片側だけの板（片方向の動きで bids ほぼ全部のとき）が片方のプールを枯渇させ他方が空のまま、ということになる。共有することで非対称フローでも slab を使えるように保つ。
 
-**5. アカウントサイズ = ~82 KiB。** 計算: `64 (ヘッダ) + 2 × 8208 (木) + 1024 × 64 (プール) = 82_064` バイト。これは Solana の「10 KiB」CPI realloc ソフト上限を大きく超えるが、Solana の `create_account` CPI はずっと大きい `MAX_PERMITTED_DATA_LENGTH = 10 MiB` で境界される。`CreateSlab` は `system_instruction::create_account` で全体を 1 回で確保する。Rent は market がブートストラップで払う 1 回限りのコスト。
+**5. アカウントサイズ = ~82 KiB。** 計算: `64 (ヘッダ) + 2 × 8208 (木) + 1024 × 64 (プール) = 82_064` バイト。これはプログラムの中からアカウントに与えられる 10 KiB(`MAX_PERMITTED_DATA_INCREASE`)を大きく超える。CPI で出した `create_account` はこの上限に縛られ、`MAX_PERMITTED_DATA_LENGTH = 10 MiB` まで確保できるのはトップレベルの命令だけ。だからプログラムは slab を自分で確保できない。クライアントがトランザクションの 1 つ目の命令で `SystemProgram::CreateAccount`(space `Slab::LEN`、owner は openhl-core)を送り、2 つ目の `CreateSlab` は初期化だけを行う。OpenBook や Phoenix と同じ分け方。このため slab は PDA ではなく keypair のアカウントになる。Rent は作る人がブートストラップで払う 1 回限りのコスト。
 
 > **演習 §15.1.** 構造体レイアウトから正確な `Slab::LEN` を計算せよ（コメントを信用するな）。`bytemuck::bytes_of(&Slab::zeroed()).len()` で検証せよ。次に、`lamports_per_byte_year = 3_480` と `years = 2`（Solana の 2 年 rent 免除）で rent をランポートで計算せよ。それが概ね `CreateSlab` が請求するもの。
 
@@ -339,9 +339,9 @@ fn critbit_remove_leaf(tree: &mut CritbitTree, leaf_idx: u16) -> ProgramResult {
 
 ## §15.6  3 つのハンドラ
 
-`process_create_slab`（タグ 29）はブートストラップ。Market を検証し、`[b"slab", market]` で slab PDA を派生させ、System `create_account` 経由で `Slab::LEN` バイトをアロケートし、識別子 + bump + market を書き、両方の木で `tree_init` と OrderNode プールで `slab_init_pool` を走らせる。Init 歩きは命令の最重部分（~1k プールエントリ + 256 木エントリ × 2 side = ~1.5k イテレーション）; 以後の op は sub-log-N。
+`process_create_slab`（タグ 29）はブートストラップ。アカウントは `slab (WRITE, SIGNER)`、`market`。Market を検証したうえで、slab が署名していない(keypair の持ち主だけが market を決められる)、書き込み可でない、owner が openhl-core でない、ちょうど `Slab::LEN` バイトでない、rent 免除でない、すでに識別子がある(稼働中の板を初期化し直させない)、のどれかなら拒否する。そのあと識別子 + market を書き(PDA ではないので `bump` は 0 のまま)、両方の木で `tree_init` と OrderNode プールで `slab_init_pool` を走らせる。Init 歩きは命令の最重部分（~1k プールエントリ + 256 木エントリ × 2 side = ~1.5k イテレーション）; 以後の op は sub-log-N。
 
-`process_slab_place_order`（タグ 30）は `[side u8][price u64 LE][size u64 LE]` を読む — `PlaceOrder` のペイロードと同一。Slab 識別子を検証し、ユーザの pubkey をコピーし、`slab_insert_order` を呼ぶ。アカウント 2 つ: `user (SIGNER)、slab (WRITE)`。第 7 章のフラット板 `process_place_order` と比較する価値がある: 同じペイロード、+0 アカウント。Slab の追加複雑性は完全にプログラム内にある; on-the-wire 命令形状は不変。これはクライアント側マイグレーションに効く: 既存のトレーディングクライアントはタグバイトとアカウント PDA 派生を変えるだけで `PlaceOrder` を `SlabPlaceOrder` に swap できる。
+`process_slab_place_order`（タグ 30）は `[side u8][price u64 LE][size u64 LE]` を読む — `PlaceOrder` のペイロードと同一。Slab 識別子を検証し、ユーザの pubkey をコピーし、`slab_insert_order` を呼ぶ。アカウント 2 つ: `user (SIGNER)、slab (WRITE)`。第 7 章のフラット板 `process_place_order` と比較する価値がある: 同じペイロード、+0 アカウント。Slab の追加複雑性は完全にプログラム内にある; on-the-wire 命令形状は不変。これはクライアント側マイグレーションに効く: 既存のトレーディングクライアントはタグバイトと渡すアカウントを変えるだけで `PlaceOrder` を `SlabPlaceOrder` に swap できる。
 
 `process_slab_match`（タグ 31）は `[taker_side u8][price u64 LE][size u64 LE][max_fills u8]` を読む — 第 8 章の `Match` と同一。検証、上の fill ループ実行、`fills` + `remaining` をログしてページング cap を可視にする。第 8 章が導入した同じ `max_fills` セマンティクスがここでもそのまま適用される: slab は依然として CU で境界される、はるかに高い実効 N で。
 

@@ -76,10 +76,12 @@ fn place_and_cross(data: &mut [u8], owner: [u8; 32]) -> Result<u64, openhl_slab:
 ```
 
 Call `openhl_slab::init` once on a new slab account. A `Slab` is 82,000 bytes, more than the
-10 KiB an account may be given from inside a program (`create_account` via CPI): create it from
-the client, or grow it with `realloc` over several instructions. The bundled `CreateSlab`
-instruction creates it by CPI and so fails on a current validator; to run the slab
-instructions locally, preload the account (`solana-test-validator --account`).
+10 KiB an account may be given from inside a program (`create_account` via CPI), so create it
+from the client: a top-level `SystemProgram::CreateAccount` (space `Slab::LEN`, owner your
+program) followed in the same transaction by your init instruction. The bundled `CreateSlab`
+works this way (it only initializes, and refuses an account that isn't fresh, owned by the
+program, exactly `Slab::LEN` bytes and signed by the slab keypair); `slab-cli --create` sends
+both instructions.
 
 ## Notes per part
 

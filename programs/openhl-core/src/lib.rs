@@ -132,8 +132,9 @@
 //!                           into the fund and credit the on-chain
 //!                           balance + total_deposits counter.
 //!  29  CreateSlab         — written for Chapter 15 (slab order book).
-//!                           Allocates the per-market Slab PDA and
-//!                           initializes free lists.
+//!                           Initializes a Slab account the client
+//!                           created in the same tx (too big for a
+//!                           CPI create) and its free lists.
 //!  30  SlabPlaceOrder     — also Chapter 15. Critbit-tree insert.
 //!  31  SlabMatch          — also Chapter 15. Crosses against the
 //!                           opposite-side critbit tree with a
@@ -4553,10 +4554,20 @@ const SLAB_MATCH_PAYLOAD_LEN: usize = 1 + 8 + 8 + 1; // side u8 + price u64 + si
 /// Payload: empty.
 ///
 /// Accounts:
-///   0. `[WRITE, SIGNER]` payer
+///   0. `[WRITE, SIGNER]` slab   — a fresh keypair account, already created
+///                                  by the client (see below)
 ///   1. `[]`              market
-///   2. `[WRITE]`         slab           — PDA at [b"slab", market]
-///   3. `[]`              system_program
+///
+/// The Slab is ~82 KB, and an account created by a CPI from a program can be
+/// at most 10 KiB, so the program cannot allocate it. The client does that in
+/// the same transaction, as a top-level instruction before this one:
+/// `SystemProgram::CreateAccount { space: Slab::LEN, owner: <this program> }`
+/// with the slab keypair signing. This handler only initializes it. It is the
+/// same split OpenBook and Phoenix use for their order-book accounts.
+///
+/// The slab must sign here too, so only the holder of the slab keypair can
+/// initialize it and pick its market. A created-but-uninitialized account
+/// cannot be claimed by someone else between two transactions.
 fn process_create_slab(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -4566,45 +4577,48 @@ fn process_create_slab(
         return Err(ProgramError::InvalidInstructionData);
     }
 
-    let payer_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let slab_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
     let market_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
-    let slab_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
-    let system_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
 
-    if !payer_ai.is_signer {
+    if !slab_ai.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    if market_ai.owner != program_id || market_ai.data_len() != Market::LEN {
+    if !slab_ai.is_writable {
+        msg!("create_slab: slab must be writable");
         return Err(ProgramError::InvalidAccountData);
     }
-    if system_ai.key != &system_program::ID {
+    if slab_ai.owner != program_id {
+        msg!("create_slab: slab must be created with this program as owner");
         return Err(ProgramError::IncorrectProgramId);
     }
-
-    let (expected, bump) =
-        Pubkey::find_program_address(&[SLAB_SEED, market_ai.key.as_ref()], program_id);
-    if slab_ai.key != &expected {
-        return Err(ProgramError::InvalidSeeds);
+    if slab_ai.data_len() != Slab::LEN {
+        msg!("create_slab: slab must be exactly {} bytes", Slab::LEN);
+        return Err(ProgramError::InvalidAccountData);
     }
-
-    let rent = Rent::get()?.minimum_balance(Slab::LEN);
-    let create_ix = system_instruction::create_account(
-        payer_ai.key,
-        slab_ai.key,
-        rent,
-        Slab::LEN as u64,
-        program_id,
-    );
-    invoke_signed(
-        &create_ix,
-        &[payer_ai.clone(), slab_ai.clone(), system_ai.clone()],
-        &[&[SLAB_SEED, market_ai.key.as_ref(), &[bump]]],
-    )?;
+    if !Rent::get()?.is_exempt(slab_ai.lamports(), Slab::LEN) {
+        msg!("create_slab: slab is not rent-exempt");
+        return Err(ProgramError::AccountNotRentExempt);
+    }
+    {
+        let market_data = market_ai.try_borrow_data()?;
+        if market_ai.owner != program_id
+            || market_data.len() != Market::LEN
+            || market_data[..8] != MARKET_DISCRIMINATOR
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
 
     let mut data = slab_ai.try_borrow_mut_data()?;
     let slab: &mut Slab = bytemuck::from_bytes_mut(&mut data[..Slab::LEN]);
+    // A fresh account is all zeros; anything else has been initialized
+    // already (only this program can write a program-owned account).
+    if slab.discriminator != [0u8; 8] {
+        msg!("create_slab: slab already initialized");
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
     slab.discriminator = SLAB_DISCRIMINATOR;
-    slab.bump = bump;
+    slab.bump = 0; // keypair account, no PDA bump
     slab._pad0 = [0u8; 7];
     slab.market.copy_from_slice(market_ai.key.as_ref());
     slab.next_order_id = 0;
@@ -4612,7 +4626,7 @@ fn process_create_slab(
     slab._pad1 = [0u8; 2];
     openhl_slab::init(slab);
 
-    msg!("slab created (bump {})", bump);
+    msg!("slab initialized for market {}", market_ai.key);
     Ok(())
 }
 

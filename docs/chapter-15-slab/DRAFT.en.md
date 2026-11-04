@@ -15,7 +15,7 @@ The Hyperliquid and Serum / Phoenix answer is a **slab**: a self-balancing tree 
 
 The chapter ships three new instructions, parallel to Chapter 7's `CreateOrderBook` / `PlaceOrder` / `Match`:
 
-1. **`CreateSlab`** (tag 29) — allocates the per-market `Slab` PDA and initializes the OrderNode pool's free list plus both critbit trees' free lists.
+1. **`CreateSlab`** (tag 29) — initializes a `Slab` account the client created in the same transaction, and the OrderNode pool's free list plus both critbit trees' free lists.
 2. **`SlabPlaceOrder`** (tag 30) — same payload as `PlaceOrder`. Runs the critbit insert, allocates an OrderNode from the pool, threads it onto the price level's FIFO.
 3. **`SlabMatch`** (tag 31) — same payload as `Match` (taker side + limit price + size + max_fills cap). Walks the best leaf on the maker side, fills against its FIFO head, removes drained levels, applies the §8.3 pagination cap.
 
@@ -88,7 +88,7 @@ Five design choices to absorb:
 
 **4. One shared OrderNode pool.** `Slab.nodes` is a single array. Both trees draw FIFOs from the same pool. The alternative (per-side pool) would double the OrderNode capacity per side for the same total footprint, but it would also mean that a one-sided book (e.g., almost all bids during a one-way move) would exhaust one pool while the other sat empty. Sharing keeps the slab usable across asymmetric flow.
 
-**5. Account size = ~82 KiB.** Computed: `64 (header) + 2 × 8208 (trees) + 1024 × 64 (pool) = 82_064` bytes. That's well over Solana's "10 KiB" CPI realloc soft limit, but Solana's `create_account` CPI is bounded by the much larger `MAX_PERMITTED_DATA_LENGTH = 10 MiB`. `CreateSlab` allocates the whole thing in one shot via `system_instruction::create_account`. The rent is a one-time cost the market pays at bootstrap.
+**5. Account size = ~82 KiB.** Computed: `64 (header) + 2 × 8208 (trees) + 1024 × 64 (pool) = 82_064` bytes. That's well over the 10 KiB (`MAX_PERMITTED_DATA_INCREASE`) an account may be given from inside a program: a `create_account` issued by CPI is held to that limit, and only a top-level instruction may allocate up to `MAX_PERMITTED_DATA_LENGTH = 10 MiB`. So the program cannot allocate the slab itself. The client sends `SystemProgram::CreateAccount` (space `Slab::LEN`, owner openhl-core) as the first instruction of the transaction and `CreateSlab` as the second, which only initializes the account — the same split OpenBook and Phoenix use. The slab is therefore a keypair account, not a PDA. The rent is a one-time cost the creator pays at bootstrap.
 
 > **Exercise §15.1.** Compute the exact `Slab::LEN` from the struct layout (don't trust the comment). Verify with `bytemuck::bytes_of(&Slab::zeroed()).len()`. Now compute the rent in lamports at `lamports_per_byte_year = 3_480` and `years = 2` (Solana's two-year rent exemption). That's roughly what `CreateSlab` charges.
 
@@ -339,9 +339,9 @@ The single-leaf root case in step 1 is the only "shape-different" branch. For ev
 
 ## §15.6  The three handlers
 
-`process_create_slab` (tag 29) is the bootstrap. It validates the market, derives the slab PDA at `[b"slab", market]`, allocates `Slab::LEN` bytes via System `create_account`, writes the discriminator + bump + market, and runs `tree_init` on both trees plus `slab_init_pool` on the OrderNode pool. The init walk is the heaviest part of the instruction (~1k pool entries + 256 tree entries × 2 sides = ~1.5k iterations); subsequent ops are sub-log-N.
+`process_create_slab` (tag 29) is the bootstrap. Accounts: `slab (WRITE, SIGNER)`, `market`. It validates the market, then refuses a slab that didn't sign (so only the keypair holder can pick its market), isn't writable, isn't owned by openhl-core, isn't exactly `Slab::LEN` bytes, isn't rent-exempt, or already carries a discriminator (no re-initializing a live book). Then it writes the discriminator + market (`bump` stays 0: there is no PDA), and runs `tree_init` on both trees plus `slab_init_pool` on the OrderNode pool. The init walk is the heaviest part of the instruction (~1k pool entries + 256 tree entries × 2 sides = ~1.5k iterations); subsequent ops are sub-log-N.
 
-`process_slab_place_order` (tag 30) reads `[side u8][price u64 LE][size u64 LE]` — identical to `PlaceOrder`'s payload. Validates the slab discriminator, copies the user's pubkey, calls `slab_insert_order`. Two accounts: `user (SIGNER), slab (WRITE)`. Worth comparing to ch.7's flat-book `process_place_order`: same payload, +0 accounts. The slab's added complexity is entirely inside the program; the on-the-wire instruction shape is unchanged. That matters for client-side migration: existing trading clients can swap `PlaceOrder` for `SlabPlaceOrder` by changing the tag byte and the account PDA derivation.
+`process_slab_place_order` (tag 30) reads `[side u8][price u64 LE][size u64 LE]` — identical to `PlaceOrder`'s payload. Validates the slab discriminator, copies the user's pubkey, calls `slab_insert_order`. Two accounts: `user (SIGNER), slab (WRITE)`. Worth comparing to ch.7's flat-book `process_place_order`: same payload, +0 accounts. The slab's added complexity is entirely inside the program; the on-the-wire instruction shape is unchanged. That matters for client-side migration: existing trading clients can swap `PlaceOrder` for `SlabPlaceOrder` by changing the tag byte and the account they pass.
 
 `process_slab_match` (tag 31) reads `[taker_side u8][price u64 LE][size u64 LE][max_fills u8]` — identical to ch.8's `Match`. Validates, runs the fill loop above, logs `fills` + `remaining` so the pagination cap is visible. The same `max_fills` semantics ch.8 introduced apply here unchanged: the slab is still bounded by CU, just at a much higher effective N.
 
