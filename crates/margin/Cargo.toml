@@ -1,0 +1,11 @@
+[package]
+name = "openhl-margin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Margin and liquidation math for a perp on Solana: equity, initial and maintenance margin, the liquidation penalty split and the insurance-fund draw. no_std."
+
+[dependencies]
+openhl-funding = { path = "../funding" }

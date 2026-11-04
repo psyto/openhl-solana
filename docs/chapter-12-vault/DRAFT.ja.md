@@ -2,6 +2,8 @@
 
 > 状態: ドラフト (v0.1)。
 > 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`TradingVault`、`VaultShare`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_trading_vault` 3402–3480 行、`process_vault_deposit` 3494–3655 行、`process_vault_withdraw` 3669–3786 行、`process_vault_update_nav` 3793–3833 行）、[`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs)。
+>
+> 部品化に伴い、この章で読むロジックは [`crates/vault/src/lib.rs`](../../crates/vault/src/lib.rs)(`openhl-vault`)に移り、プログラムはそれを呼び出す。以下に引用するコードは分割前の `programs/openhl-core/src/lib.rs` の版で、行番号は追従していない。
 
 ---
 

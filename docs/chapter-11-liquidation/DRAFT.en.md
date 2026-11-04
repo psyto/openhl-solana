@@ -2,6 +2,8 @@
 
 > Status: draft (v0.1).
 > Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Position`, `InsuranceFund`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (helpers + `process_open_position`, `process_close_position`, `process_liquidate`, `process_create_insurance_fund`, `process_insurance_fund_deposit`), [`scripts/position/src/main.rs`](../../scripts/position/src/main.rs).
+>
+> Since the parts split, the logic this chapter walks through lives in [`crates/margin/src/lib.rs`](../../crates/margin/src/lib.rs) (`openhl-margin`); the program calls it. The code quoted below is the pre-split version from `programs/openhl-core/src/lib.rs`, and its line numbers are not kept in sync.
 
 ---
 

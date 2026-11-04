@@ -2,6 +2,8 @@
 
 > 状態: ドラフト (v0.1)。
 > 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`FundingState`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_funding_state` 2162–2232 行、`process_update_funding` 2239–2317 行）、[`scripts/funding/src/main.rs`](../../scripts/funding/src/main.rs)。
+>
+> 部品化に伴い、この章で読むロジックは [`crates/funding/src/lib.rs`](../../crates/funding/src/lib.rs)(`openhl-funding`)に移り、プログラムはそれを呼び出す。以下に引用するコードは分割前の `programs/openhl-core/src/lib.rs` の版で、行番号は追従していない。
 
 ---
 

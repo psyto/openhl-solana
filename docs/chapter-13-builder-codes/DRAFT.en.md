@@ -2,6 +2,8 @@
 
 > Status: draft (v0.1).
 > Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`BuilderProfile`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_register_builder`, `process_place_order_with_builder`, `process_claim_builder_fees`, `process_create_fee_vault`), [`scripts/builder/src/main.rs`](../../scripts/builder/src/main.rs).
+>
+> Since the parts split, the logic this chapter walks through lives in [`crates/fees/src/lib.rs`](../../crates/fees/src/lib.rs) (`openhl-fees`); the program calls it. The code quoted below is the pre-split version from `programs/openhl-core/src/lib.rs`, and its line numbers are not kept in sync.
 
 ---
 

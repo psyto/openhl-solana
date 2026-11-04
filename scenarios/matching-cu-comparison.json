@@ -15,7 +15,7 @@
     },
     {
       "explanation": "Repeat the workload against the critbit Slab. Compare its CU output against match-cli's.",
-      "command": "cargo run -p slab",
+      "command": "cargo run -p slab-cli",
       "expect": "compute units consumed"
     },
     {

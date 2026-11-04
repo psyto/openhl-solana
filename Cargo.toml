@@ -2,6 +2,12 @@
 resolver = "2"
 members = [
     "crates/state",
+    "crates/funding",
+    "crates/margin",
+    "crates/fees",
+    "crates/vault",
+    "crates/oracle",
+    "crates/slab",
     "programs/openhl-core",
     "scripts/allocate-market",
     "scripts/bench",

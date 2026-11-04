@@ -1,0 +1,14 @@
+[package]
+name = "openhl-slab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "A zero-copy critbit order book for one Solana account: price-time priority over the openhl-state Slab layout, no allocation. no_std."
+
+[dependencies]
+openhl-state = { path = "../state" }
+
+[dev-dependencies]
+bytemuck = { workspace = true, features = ["extern_crate_alloc"] }

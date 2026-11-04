@@ -1,0 +1,10 @@
+[package]
+name = "openhl-fees"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Protocol fee and builder-code share for a perp on Solana. no_std, no dependencies."
+
+[dependencies]

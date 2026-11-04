@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "openhl-solana on-chain program. Native (no Anchor) — built incrementally across the SolDojo internals track."
+description = "openhl-solana on-chain program: 34 native (no Anchor) instructions wiring the openhl parts (slab, oracle, margin, funding, fees, vault) into a perp DEX. Also the SolDojo internals track's worked example."
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -18,6 +18,15 @@ no-entrypoint = []
 
 [dependencies]
 openhl-state = { path = "../../crates/state" }
+openhl-funding = { path = "../../crates/funding" }
+openhl-margin = { path = "../../crates/margin" }
+openhl-fees = { path = "../../crates/fees" }
+openhl-vault = { path = "../../crates/vault" }
+openhl-oracle = { path = "../../crates/oracle" }
+openhl-slab = { path = "../../crates/slab" }
 solana-program = { workspace = true }
 solana-system-interface = { workspace = true }
+bytemuck = { workspace = true }
+
+[dev-dependencies]
 bytemuck = { workspace = true }

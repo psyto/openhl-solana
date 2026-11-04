@@ -2,6 +2,8 @@
 
 > 状態: ドラフト (v0.1)。
 > 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`BuilderProfile`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_register_builder`、`process_place_order_with_builder`、`process_claim_builder_fees`、`process_create_fee_vault`）、[`scripts/builder/src/main.rs`](../../scripts/builder/src/main.rs)。
+>
+> 部品化に伴い、この章で読むロジックは [`crates/fees/src/lib.rs`](../../crates/fees/src/lib.rs)(`openhl-fees`)に移り、プログラムはそれを呼び出す。以下に引用するコードは分割前の `programs/openhl-core/src/lib.rs` の版で、行番号は追従していない。
 
 ---
 

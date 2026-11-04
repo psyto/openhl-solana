@@ -1,5 +1,5 @@
 [package]
-name = "slab"
+name = "slab-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ authors.workspace = true
 description = "Chapter 15 worked example: drives openhl-core's slab order-book instructions. --create allocates the per-market Slab PDA; --place inserts via critbit; --match crosses the opposite side with a pagination cap; default action dumps the slab summary (active count + best bid/ask)."
 
 [[bin]]
-name = "slab"
+name = "slab-cli"
 path = "src/main.rs"
 
 [dependencies]
