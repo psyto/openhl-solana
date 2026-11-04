@@ -115,6 +115,9 @@ let notional_val = (price as u128) * (size as u128);
 let protocol_fee = (notional_val * (PROTOCOL_FEE_BPS as u128) / 10_000) as u64;
 
 // ... builder profile を読み、share_bps をキャップでクランプ ...
+if profile.fee_mint != *mint_ai.key.as_ref() {
+    return Err(ProgramError::InvalidAccountData); // profile earns fees in another mint
+}
 
 let builder_share = ((protocol_fee as u128) * (share_bps as u128) / 10_000) as u64;
 profile.accumulated_fees = profile.accumulated_fees.checked_add(builder_share)?;
@@ -181,6 +184,9 @@ if max_share > PROTOCOL_BUILDER_SHARE_CAP_BPS {
 if profile.builder != *builder_ai.key.as_ref() {
     return Err(ProgramError::IllegalOwner);
 }
+if profile.fee_mint != *mint_ai.key.as_ref() {
+    return Err(ProgramError::InvalidAccountData); // fees were earned in another mint
+}
 let claimed = profile.accumulated_fees;
 profile.accumulated_fees = 0;
 // ... 借用スコープ終了 ...
@@ -196,7 +202,7 @@ spl_token_transfer_fee_vault_signed(
 )?;
 ```
 
-認可（builder だけが自分の手数料を claim できる）、アキュムレータをゼロ化、借用を解放、PDA 署名 Transfer。Transfer ヘルパは、第 11 章のポジションの払い出し(close と liquidate)に使う `spl_token_transfer_vault_signed` と構造的に同一 — 同じ `invoke_signed` パターン、同じ `InvalidSeeds` 保護 — 違いは seeds が per-(market) `[VAULT_AUTH_SEED, market]` ではなく per-(quote_mint) `[FEE_VAULT_AUTH_SEED, quote_mint]` という点だけ。順序が重要: Transfer **の前に** アキュムレータをゼロ化することで、(a) Transfer 失敗時の tx revert がアキュムレータを復元（アトミック）、(b) Transfer 成功時はまだ funded なアキュムレータに対するリプレイ攻撃を防ぐ。
+認可（builder だけが自分の手数料を、`fee_mint` の vault からだけ claim できる）、アキュムレータをゼロ化、借用を解放、PDA 署名 Transfer。Transfer ヘルパは、第 11 章のポジションの払い出し(close と liquidate)に使う `spl_token_transfer_vault_signed` と構造的に同一 — 同じ `invoke_signed` パターン、同じ `InvalidSeeds` 保護 — 違いは seeds が per-(market) `[VAULT_AUTH_SEED, market]` ではなく per-(quote_mint) `[FEE_VAULT_AUTH_SEED, quote_mint]` という点だけ。順序が重要: Transfer **の前に** アキュムレータをゼロ化することで、(a) Transfer 失敗時の tx revert がアキュムレータを復元（アトミック）、(b) Transfer 成功時はまだ funded なアキュムレータに対するリプレイ攻撃を防ぐ。
 
 本物の本番 claim は通常、部分引き出し（`claim --amount N`、常に全部ではなく）、蓄積子タイムアウト（>N 日アイドルな手数料はプロトコルに没収）、プロトコルが複数 quote 通貨をサポートするときの per-token claim もサポートする。どれも根本的な形を変えない。上に乗るポリシー判断だ。
 
@@ -237,7 +243,10 @@ Builder ライフサイクル:
 
   1) Builder 登録
      RegisterBuilder(max_fee_share_bps=2000)
-     ──► BuilderProfile{ builder, max_share=2000, fees=0, vol=0 }
+     accounts: [payer/builder(S,W), builder_profile(W), system_program(R),
+                mint(R)]
+     ──► BuilderProfile{ builder, max_share=2000, fees=0, vol=0,
+                         fee_mint=mint }
 
 
   2) ユーザが builder 経由で取引

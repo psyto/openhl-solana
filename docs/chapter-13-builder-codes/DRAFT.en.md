@@ -115,6 +115,9 @@ let notional_val = (price as u128) * (size as u128);
 let protocol_fee = (notional_val * (PROTOCOL_FEE_BPS as u128) / 10_000) as u64;
 
 // ... read builder profile, compute share_bps clamped to caps ...
+if profile.fee_mint != *mint_ai.key.as_ref() {
+    return Err(ProgramError::InvalidAccountData); // profile earns fees in another mint
+}
 
 let builder_share = ((protocol_fee as u128) * (share_bps as u128) / 10_000) as u64;
 profile.accumulated_fees = profile.accumulated_fees.checked_add(builder_share)?;
@@ -181,6 +184,9 @@ The clamp is silent — the registration succeeds, just with a reduced share. Lo
 if profile.builder != *builder_ai.key.as_ref() {
     return Err(ProgramError::IllegalOwner);
 }
+if profile.fee_mint != *mint_ai.key.as_ref() {
+    return Err(ProgramError::InvalidAccountData); // fees were earned in another mint
+}
 let claimed = profile.accumulated_fees;
 profile.accumulated_fees = 0;
 // ... borrow scope ends ...
@@ -196,7 +202,7 @@ spl_token_transfer_fee_vault_signed(
 )?;
 ```
 
-Authorization (only the builder can claim their own fees), zero the accumulator, release the borrow, PDA-sign the Transfer. The Transfer helper is structurally identical to `spl_token_transfer_vault_signed`, which makes Chapter 11's position payouts (close and liquidate) — same `invoke_signed` pattern, same `InvalidSeeds` protection — with the per-(quote_mint) `[FEE_VAULT_AUTH_SEED, quote_mint]` seeds instead of per-(market) `[VAULT_AUTH_SEED, market]`. Order matters: zero the accumulator *before* the Transfer so a transfer-failure tx revert restores the accumulator (atomic), and so a successful Transfer cannot be replayed against a still-funded accumulator.
+Authorization (only the builder can claim their own fees, and only from its `fee_mint`'s vault), zero the accumulator, release the borrow, PDA-sign the Transfer. The Transfer helper is structurally identical to `spl_token_transfer_vault_signed`, which makes Chapter 11's position payouts (close and liquidate) — same `invoke_signed` pattern, same `InvalidSeeds` protection — with the per-(quote_mint) `[FEE_VAULT_AUTH_SEED, quote_mint]` seeds instead of per-(market) `[VAULT_AUTH_SEED, market]`. Order matters: zero the accumulator *before* the Transfer so a transfer-failure tx revert restores the accumulator (atomic), and so a successful Transfer cannot be replayed against a still-funded accumulator.
 
 A real production claim also typically supports partial withdrawals (`claim --amount N` rather than always-everything), accumulator timeouts (fees idle for >N days are forfeited to the protocol), and per-token claims when the protocol supports multiple quote currencies. None of these change the fundamental shape; they're policy decisions on top.
 
@@ -237,7 +243,10 @@ Builder lifecycle:
 
   1) Builder registers
      RegisterBuilder(max_fee_share_bps=2000)
-     ──► BuilderProfile{ builder, max_share=2000, fees=0, vol=0 }
+     accounts: [payer/builder(S,W), builder_profile(W), system_program(R),
+                mint(R)]
+     ──► BuilderProfile{ builder, max_share=2000, fees=0, vol=0,
+                         fee_mint=mint }
 
 
   2) User trades through builder
