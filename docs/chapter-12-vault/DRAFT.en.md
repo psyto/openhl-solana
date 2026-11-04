@@ -1,7 +1,7 @@
 # Chapter 12 — Native Vault Program (Pooled Trading)
 
 > Status: draft (v0.1).
-> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`TradingVault`, `VaultShare`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_trading_vault` 3402–3480, `process_vault_deposit` 3494–3655, `process_vault_withdraw` 3669–3786, `process_vault_update_nav` 3793–3833), [`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs).
+> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`TradingVault`, `VaultShare`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_trading_vault` 3402–3480, `process_vault_deposit` 3494–3655, `process_vault_withdraw` 3669–3786, `process_vault_update_nav` 3793–3833), [`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs), [`fuzz/vault/src/main.rs`](../../fuzz/vault/src/main.rs) (the solinv harness for §12.7).
 
 ---
 
@@ -255,6 +255,17 @@ if share.owner != *owner_ai.key.as_ref() {
 
 Only the share's recorded owner may burn it. This is a *per-share* authorization, not vault-wide — different from the manager check in UpdateNAV. There is no "vault admin can liquidate any share" path in this design (which a real production vault might add for compliance reasons).
 
+**Binding the share to this vault**, just before the owner check:
+
+```rust
+if share.vault != *vault_ai.key.as_ref() {
+    msg!("vault_withdraw: share belongs to another vault");
+    return Err(ProgramError::InvalidAccountData);
+}
+```
+
+Deposit never needed this line: it re-derives the share PDA from `[VAULT_SHARE_SEED, vault, depositor]`, so a share of another vault fails the seed check. Withdraw does not re-derive it, and the first version of this chapter left the comparison out. It looked harmless, but every `TradingVault` in a market pays out of the *same* per-(market, mint) token account. So anyone can open their own vault in the market, report its NAV as 1, deposit 2 tokens for 200,000 shares, and burn those shares against someone else's vault. In the test that reproduces it, that took all 200,000 tokens of the other vault, other depositors' included. solinv found the gap, not a reviewer; §12.7 has you find it the same way.
+
 **Sufficient-balance check** at lines 3748–3755:
 
 ```rust
@@ -326,6 +337,8 @@ vault.total_assets = new_total_assets;
 ```
 
 The manager signs a transaction that updates `total_assets` to whatever number they choose. There is no on-chain verification that this number reflects the manager's actual trading PnL. **The depositors trust the manager.**
+
+In this codebase it is worse than that: *everyone in the market* trusts *every* manager. Withdrawals pay out of the per-(market, mint) token account, which also holds every other vault's deposits and every position's collateral. Nothing caps a vault's payout at what that vault put in. A manager who deposits 100,000 into their own vault, reports NAV 300,000 and withdraws gets 300,000 out. The test `manager_cannot_withdraw_more_than_its_vault_holds` in `fuzz/vault` shows it: it drained the token account to 0. It is marked `#[ignore]` because the hole is open. Closing it takes one token account per vault (seeds `[VAULT_SEED, vault]`), which changes every handler that moves the vault's tokens. That is a design change, not a missing line, and is left as homework, like §13.5's production escrow. The three patterns below protect a vault's own depositors. They do not remove this one.
 
 Three patterns to harden this in production:
 
@@ -412,6 +425,47 @@ Singleton-write reassertion (Ch.5 redux):
 1. **NAV preservation across deposits.** Start with empty vault. Have A deposit 100. Have B deposit 100 immediately (no UpdateNAV between). The vault should have `total_shares = 200, total_assets = 200`, and A's and B's per-share NAV must both equal 1.0. Now have C deposit 100. Same per-share NAV: 1.0.
 2. **NAV update changes everyone's value uniformly.** From the above state, run `vault --update-nav --total-assets 600` (3× value). A's `claimable_assets = A.shares × total_assets / total_shares = 100 × 600 / 300 = 200`. B and C the same. All three depositors share the 3× gain proportionally.
 3. **Withdrawal at non-1:1 NAV.** From the above (each depositor has 100 shares worth 200 assets each), have A withdraw all 100 shares. They receive 200 assets. The vault now has `total_shares = 200, total_assets = 400`. B and C each still own 100 shares (50% of vault), worth 200 assets each — unchanged by A's exit.
+
+### Now let a tool look for the check you forgot
+
+Three exercises check the arithmetic. None of them checks the account checks: the `if ... { return Err(...) }` lines in §12.3 and §12.4 that decide *which* accounts a caller may pass. Forgetting one of those fails no test you would think to write, as §12.4's `share.vault` line shows. [solinv](https://github.com/psyto/solinv) fuzzes a native program for exactly this. You tell it which accounts an attacker could pass instead (another depositor's share, another vault, a token account the vault doesn't hold), and it sends each instruction with one of them swapped in. If a swapped call succeeds and changes state, that is a finding.
+
+`fuzz/vault/` is that harness for this chapter. It sets up one market with two vaults: K's, where A and B hold shares, and A's own. It installs solinv the way its README tells anyone to, by git rev. You need the Solana toolchain and the Crucible CLI (`cargo install --locked --git https://github.com/asymmetric-research/crucible --tag v0.1.0 crucible-fuzz-cli`):
+
+```bash
+cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
+cd fuzz/vault
+cargo build --release --features invariant_vault
+cargo test --release --features invariant_vault        # the attack from §12.4, refused
+timeout -s INT 90 crucible run openhl_vault_fuzz invariant_vault \
+    --binary-in target/release/invariant_test --timeout 90
+```
+
+On the program as it is, no `[FUZZ_FINDING]` line appears. (Crucible checks `--timeout` only every 1000 iterations, hence the outer `timeout`. On macOS it is `gtimeout` from coreutils.)
+
+> **Exercise §12.7.** Delete the `share.vault` check from `process_vault_withdraw`, rebuild the program (the first command), and run the fuzzer again. Within a few seconds you should see:
+>
+> ```
+> [FUZZ_FINDING] [account-swap:…] ix vault_withdraw succeeded with account 1 swapped from <K's vault> to <A's vault> (different context, same shape)
+> ```
+>
+> `cargo test` fails too, and its message tells you how much A took. Put the check back. Then delete the others one at a time and predict the result before you run it. Here is what we measured, 60 seconds each:
+>
+> | Check deleted | Caught? |
+> |---|---|
+> | withdraw: `owner.is_signer` | yes, signer-skip, slot 0 |
+> | withdraw: `share.vault == vault` | yes, account-swap, slot 1 |
+> | withdraw: `share.owner == owner` | yes, account-swap, slot 2 |
+> | deposit: the share PDA re-derivation | yes, account-swap, slots 1 and 7 |
+> | deposit: `verify_vault_token_account` | yes, account-swap, slot 7 |
+> | deposit: `depositor.is_signer` | no |
+> | withdraw: `vault.owner == program_id` | no |
+> | withdraw: `share.owner == program_id` | no |
+> | withdraw: `verify_vault_token_account` | no |
+>
+> Before reading on, work out why the last four come back "no". Here is our reading. We did not try to exploit them; we only found no way through. The two owner checks are backed by the runtime itself (Chapter 1): withdraw writes both accounts, and a program cannot change an account it does not own, so a substituted account fails at the end of the instruction anyway. The two remaining checks are backed by SPL Token (Chapter 6): a deposit moves tokens out of the depositor's account, which needs the depositor's signature, and a withdraw debits `vault_token` under the `vault_authority` PDA, which is the authority of no other token account. They are still worth keeping, because they fail earlier and with a clearer error. But deleting them does not open a hole.
+>
+> What the harness does not cover: §12.5's manager-reported NAV. A manager who reports a false NAV passes only accounts they are entitled to pass, so a fuzzer that swaps accounts has nothing to swap. The hole §12.5 describes stays open with all nine checks in place. Finding it took reading the design, not deleting lines.
 
 ---
 

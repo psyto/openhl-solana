@@ -1,7 +1,7 @@
 # 第12章 — ネイティブ Vault プログラム（プール取引）
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`TradingVault`、`VaultShare`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_trading_vault` 3402–3480 行、`process_vault_deposit` 3494–3655 行、`process_vault_withdraw` 3669–3786 行、`process_vault_update_nav` 3793–3833 行）、[`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs)。
+> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`TradingVault`、`VaultShare`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_trading_vault` 3402–3480 行、`process_vault_deposit` 3494–3655 行、`process_vault_withdraw` 3669–3786 行、`process_vault_update_nav` 3793–3833 行）、[`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs)、[`fuzz/vault/src/main.rs`](../../fuzz/vault/src/main.rs)(§12.7 の solinv ハーネス)。
 
 ---
 
@@ -253,6 +253,17 @@ if share.owner != *owner_ai.key.as_ref() {
 
 share の記録された所有者だけが burn できる。これは share **単位**の認可で、vault 全体ではない — UpdateNAV のマネージャ チェックと異なる。この設計には「vault 管理者が任意の share を強制清算できる」経路はない（本物の本番 vault はコンプライアンス上の理由で追加するかもしれない）。
 
+**share をこの vault に結びつける**（所有者チェックの直前）:
+
+```rust
+if share.vault != *vault_ai.key.as_ref() {
+    msg!("vault_withdraw: share belongs to another vault");
+    return Err(ProgramError::InvalidAccountData);
+}
+```
+
+deposit にはこの行は要らない。share の PDA を `[VAULT_SHARE_SEED, vault, depositor]` から導き直すので、別の vault の share は seed の照合で落ちる。withdraw は導き直さない。この章の最初の版はこの比較を書き忘れていた。害がなさそうに見えるが、市場の `TradingVault` はすべて**同じ** (market, mint) ごとのトークン口座から払い出す。だから誰でも、市場に自分の vault を開いて NAV を 1 と申告し、2 トークン入れて 200,000 shares を受け取り、その shares を他人の vault に対して burn できる。再現テストでは、相手の vault の 200,000 トークン全部(他の預金者の分も含む)を持ち出せた。この穴を見つけたのはレビュアーではなく solinv である。§12.7 では同じやり方で見つけてもらう。
+
 **残高十分性チェック**:
 
 ```rust
@@ -324,6 +335,8 @@ vault.total_assets = new_total_assets;
 ```
 
 マネージャは `total_assets` を任意の数値に更新するトランザクションに署名する。この数値がマネージャの実際の取引 PnL を反映していることをオンチェーンで検証する仕組みはない。**預金者はマネージャを信用する**。
+
+このコードベースでは、それより悪い。**市場の全員が、全部のマネージャを**信用している。withdraw は (market, mint) ごとのトークン口座から払い出し、その口座には他の vault の預け入れも、全ポジションの証拠金も入っている。vault の払い出しを、その vault が入れた額で止めるものは何もない。自分の vault に 100,000 入れ、NAV を 300,000 と申告して withdraw すると、300,000 が出てくる。`fuzz/vault` のテスト `manager_cannot_withdraw_more_than_its_vault_holds` がそれを示しており、トークン口座は 0 になった。穴が開いたままなので、このテストには `#[ignore]` をつけてある。塞ぐには vault ごとにトークン口座を持たせる必要があり(seed `[VAULT_SEED, vault]`)、vault のトークンを動かすハンドラ全部が変わる。これは 1 行の抜けではなく設計の変更なので、§13.5 の本番 escrow と同じく宿題に残す。下の 3 パターンは vault 自身の預金者を守るが、この穴は消さない。
 
 本番でこれを硬化する 3 つのパターン:
 
@@ -410,6 +423,47 @@ Vault ライフサイクル:
 1. **deposit を通じての NAV 保存。** 空の vault から始めよ。A に 100 deposit させる。即座に B に 100 deposit させる（間に UpdateNAV なし）。vault は `total_shares = 200, total_assets = 200` のはず、A と B の share あたり NAV は両方とも 1.0 でなければならない。次に C に 100 deposit させる。同じ share あたり NAV: 1.0。
 2. **NAV 更新が全員の価値を一律に変える。** 上の状態から `vault --update-nav --total-assets 600`（3× 価値）を走らせる。A の `claimable_assets = A.shares × total_assets / total_shares = 100 × 600 / 300 = 200`。B と C も同じ。3 預金者全員が 3× ゲインを比例的に共有する。
 3. **非 1:1 NAV での withdrawal。** 上から（各預金者が各々 200 assets 価値の 100 shares を持つ）、A に全 100 shares を withdraw させる。200 assets を受け取る。vault は今 `total_shares = 200, total_assets = 400`。B と C はそれぞれまだ 100 shares 所有（vault の 50%）、各々 200 assets 価値 — A の退出で不変。
+
+### 書き忘れた検査を道具に探させる
+
+上の 3 項目は計算を確かめる。アカウントの検査、つまり §12.3 と §12.4 にある、呼び出し側が**どの**アカウントを渡してよいかを決める `if ... { return Err(...) }` の行は、どれも確かめない。§12.4 の `share.vault` の行のように、そういう検査を 1 つ忘れても、書こうと思いつくテストはどれも落ちない。[solinv](https://github.com/psyto/solinv) は、ネイティブのプログラムに対してまさにこれを fuzz する。攻撃者が代わりに渡せるアカウント(他の預金者の share、別の vault、vault が持っていないトークン口座)を教えると、各命令でそのうち 1 つを差し替えて送る。差し替えた呼び出しが成功して状態が変われば、それが検出である。
+
+`fuzz/vault/` がこの章のためのハーネスである。1 つの市場に vault を 2 つ用意する。A と B が shares を持つ K の vault と、A 自身の vault だ。solinv は、README が誰にでも勧めている入れ方(git の rev)で入れてある。Solana のツールチェーンと Crucible CLI(`cargo install --locked --git https://github.com/asymmetric-research/crucible --tag v0.1.0 crucible-fuzz-cli`)が要る:
+
+```bash
+cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
+cd fuzz/vault
+cargo build --release --features invariant_vault
+cargo test --release --features invariant_vault        # §12.4 の攻撃が拒否される
+timeout -s INT 90 crucible run openhl_vault_fuzz invariant_vault \
+    --binary-in target/release/invariant_test --timeout 90
+```
+
+今のプログラムでは `[FUZZ_FINDING]` の行は出ない。(Crucible は `--timeout` を 1000 回に 1 度しか見ないので、外側に `timeout` をつけている。macOS では coreutils の `gtimeout`。)
+
+> **演習 §12.7.** `process_vault_withdraw` から `share.vault` の検査を消し、プログラムを作り直して(最初のコマンド)、fuzzer をもう一度走らせよ。数秒で次が出るはずだ:
+>
+> ```
+> [FUZZ_FINDING] [account-swap:…] ix vault_withdraw succeeded with account 1 swapped from <K's vault> to <A's vault> (different context, same shape)
+> ```
+>
+> `cargo test` も落ち、A がいくら持ち出したかが出る。検査を戻したら、ほかの検査も 1 つずつ消し、走らせる前に結果を予想せよ。私たちが各 60 秒で測った結果:
+>
+> | 消した検査 | 捕まったか |
+> |---|---|
+> | withdraw: `owner.is_signer` | はい、signer-skip、slot 0 |
+> | withdraw: `share.vault == vault` | はい、account-swap、slot 1 |
+> | withdraw: `share.owner == owner` | はい、account-swap、slot 2 |
+> | deposit: share の PDA の導き直し | はい、account-swap、slot 1 と 7 |
+> | deposit: `verify_vault_token_account` | はい、account-swap、slot 7 |
+> | deposit: `depositor.is_signer` | いいえ |
+> | withdraw: `vault.owner == program_id` | いいえ |
+> | withdraw: `share.owner == program_id` | いいえ |
+> | withdraw: `verify_vault_token_account` | いいえ |
+>
+> 先を読む前に、最後の 4 つが「いいえ」になる理由を考えよ。以下は私たちの読みである。攻撃を試してはおらず、通り道が見つからなかっただけだ。2 つの所有者チェックは、ランタイム自身が裏で支えている(第 1 章)。withdraw は両方のアカウントに書き込み、プログラムは自分が所有していないアカウントを変えられないので、すり替えたアカウントはどのみち命令の最後で落ちる。残りの 2 つは SPL Token が支えている(第 6 章)。deposit は預金者の口座からトークンを動かすので預金者の署名が要り、withdraw は `vault_authority` の PDA の権限で `vault_token` から引き落とすが、この PDA は他のどのトークン口座の権限者でもない。早く、分かりやすいエラーで落ちるので、検査として残す価値はある。ただ、消しても穴は開かない。
+>
+> このハーネスが扱わないもの: §12.5 のマネージャが申告する NAV。嘘の NAV を申告するマネージャは、自分が渡してよいアカウントしか渡さないので、アカウントを差し替える fuzzer には差し替える物がない。§12.5 の穴は、9 つの検査がすべてそろっていても開いたままである。見つけるには、行を消すのではなく設計を読む必要があった。
 
 ---
 

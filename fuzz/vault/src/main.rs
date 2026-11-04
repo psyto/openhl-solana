@@ -283,7 +283,7 @@ impl HasInstructionSet for VaultFixture {
             creates_indices: vec![],
             swap_alternates: vec![
                 vec![],
-                vec![self.a_vault],              // A's vault, K's vault's share account
+                vec![self.a_vault],              // A's vault, with the share of K's
                 vec![share(&self.vault, &b)],   // credit B's shares
                 vec![],
                 vec![],
@@ -385,5 +385,37 @@ mod tests {
         let taken = f.ctx.token_balance(&a_ata) - before;
         let left = f.ctx.token_balance(&vault_token(&market, &mint));
         assert!(!ok, "withdraw from K's vault with A's other share succeeded: A took {taken}, {left} left in the token account");
+    }
+
+    /// Not fixed: a vault's manager sets its NAV, and every vault in the
+    /// market pays out of one token account, so a manager who over-reports
+    /// NAV withdraws other vaults' deposits. Closing this needs a token
+    /// account per vault (a design change, not a missing check).
+    #[test]
+    #[ignore = "known hole: manager-reported NAV draws on the market's shared token account"]
+    fn manager_cannot_withdraw_more_than_its_vault_holds() {
+        let mut f = VaultFixture::setup();
+        let (a, mint, market) = (Arc::clone(&f.a), f.mint, f.market);
+        let (a_vault, a_ata) = (f.a_vault, f.a_ata);
+
+        let ix = Instruction {
+            program_id: CORE_ID,
+            accounts: vec![AccountMeta::new_readonly(a.pubkey(), true), AccountMeta::new(a_vault, false)],
+            data: amount_data(IX_VAULT_UPDATE_NAV, 3 * START_DEPOSIT),
+        };
+        f.send(ix, &[&*a], "A reports its own vault's NAV at 3x what it holds");
+        let before = f.ctx.token_balance(&a_ata);
+        let ix = Instruction {
+            program_id: CORE_ID,
+            accounts: f.withdraw_metas(&a_vault, &a.pubkey(), &a_ata),
+            data: amount_data(IX_VAULT_WITHDRAW, START_DEPOSIT),
+        };
+        let ok = f.send_ok(ix, Arc::clone(&a));
+        let taken = f.ctx.token_balance(&a_ata) - before;
+        let left = f.ctx.token_balance(&vault_token(&market, &mint));
+        assert!(
+            !ok || taken <= START_DEPOSIT,
+            "A put {START_DEPOSIT} into its own vault and took {taken} out; {left} left in the token account"
+        );
     }
 }
