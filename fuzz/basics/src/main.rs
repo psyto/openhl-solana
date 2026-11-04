@@ -392,7 +392,7 @@ impl HasInstructionSet for BasicsFixture {
 #[invariant_test]
 fn invariant_ch3(fixture: &mut BasicsFixture) {
     solinv_core::invariants::signer_skip::check(fixture);
-    solinv_core::invariants::pda_forge::check(fixture);
+    solinv_core::invariants::account_swap::check(fixture);
 }
 
 /// §3.7's exercise: a market made by `Initialize` at an address that is

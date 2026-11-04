@@ -238,7 +238,7 @@ on-chain signature: ...
 
 (Measured on `solana-test-validator` 4.1.2. Syscall prices change between releases; an earlier draft of this chapter, on an older toolchain, measured 87,412 CU for the same call. Run it yourself and use your numbers.)
 
-Three numbers to focus on. The CU remaining after entry (199,128) tells you the fixed cost of program startup: instruction-data decode, dispatcher, the first log line — about 870 CU in this build. Phase A burned (199,128 − 198,536) = 592 CU, but most of that is the `msg!` and the `sol_log_compute_units` call themselves: with `--heap-bytes 0` the same phase costs 527, so allocating 1 KiB costs about 65 CU. Phase B burned (198,536 − 164,984) = 33,552 CU for 50 sha256 rounds of 1 KiB input — about 671 CU per round.
+Three numbers to focus on. The CU remaining after entry (199,128) tells you the fixed cost of program startup: instruction-data decode, dispatcher, the first log line — about 870 CU in this build. Phase A burned (199,128 − 198,536) = 592 CU, but most of that is the `msg!` and the `sol_log_compute_units` call themselves: with `--heap-bytes 0` the same phase costs 527, so allocating 1 KiB costs about 65 CU. Phase B burned (198,536 − 164,984) = 33,552 CU for 50 sha256 rounds of 1 KiB input — about 671 CU per round, counting the log call at the end of the phase.
 
 From here you can extrapolate, and then check. 100 rounds: we measured 68,047 CU. 290 rounds: 193,447. 300 rounds: over the default 200K limit. Run it without `--cu-limit` and you will see `ComputationalBudgetExceeded`. Add `--cu-limit 400000` and it succeeds again, at 200,197 CU.
 
