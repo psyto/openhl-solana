@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Chapter 15 worked example: drives openhl-core's slab order-book instructions. --create allocates the per-market Slab PDA; --place inserts via critbit; --match crosses the opposite side with a pagination cap; default action dumps the slab summary (active count + best bid/ask)."
+description = "Chapter 15 worked example: drives openhl-core's slab order-book instructions. --create creates a Slab keypair account and initializes it for a market in one transaction; --place inserts via critbit; --match crosses the opposite side with a pagination cap; default action dumps the slab summary (active count + best bid/ask)."
 
 [[bin]]
 name = "slab-cli"

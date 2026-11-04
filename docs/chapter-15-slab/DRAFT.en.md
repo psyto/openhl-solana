@@ -88,7 +88,7 @@ Five design choices to absorb:
 
 **4. One shared OrderNode pool.** `Slab.nodes` is a single array. Both trees draw FIFOs from the same pool. The alternative (per-side pool) would double the OrderNode capacity per side for the same total footprint, but it would also mean that a one-sided book (e.g., almost all bids during a one-way move) would exhaust one pool while the other sat empty. Sharing keeps the slab usable across asymmetric flow.
 
-**5. Account size = ~82 KiB.** Computed: `64 (header) + 2 × 8208 (trees) + 1024 × 64 (pool) = 82_064` bytes. That's well over the 10 KiB (`MAX_PERMITTED_DATA_INCREASE`) an account may be given from inside a program: a `create_account` issued by CPI is held to that limit, and only a top-level instruction may allocate up to `MAX_PERMITTED_DATA_LENGTH = 10 MiB`. So the program cannot allocate the slab itself. The client sends `SystemProgram::CreateAccount` (space `Slab::LEN`, owner openhl-core) as the first instruction of the transaction and `CreateSlab` as the second, which only initializes the account — the same split OpenBook and Phoenix use. The slab is therefore a keypair account, not a PDA. The rent is a one-time cost the creator pays at bootstrap.
+**5. Account size = ~82 KiB.** Computed: `64 (header) + 2 × 8208 (trees) + 1024 × 64 (pool) = 82_064` bytes. That's well over the 10 KiB (`MAX_PERMITTED_DATA_INCREASE`) an account may be given from inside a program: a `create_account` issued by CPI is held to that limit, and only a top-level instruction may allocate up to `MAX_PERMITTED_DATA_LENGTH = 10 MiB`. So the program cannot allocate the slab itself. The client sends `SystemProgram::CreateAccount` (space `Slab::LEN`, owner openhl-core) as the first instruction of the transaction and `CreateSlab` as the second, which only initializes the account — the same split OpenBook and Phoenix use. The slab is therefore a keypair account, not a PDA. One consequence: a market can have any number of slabs, and `SlabPlaceOrder` / `SlabMatch` take no market account and don't check `slab.market`. The slab has no settlement path, so today this only decides which book a client reads; a production program would record the official slab's address in market state and check it. The rent is a one-time cost the creator pays at bootstrap.
 
 > **Exercise §15.1.** Compute the exact `Slab::LEN` from the struct layout (don't trust the comment). Verify with `bytemuck::bytes_of(&Slab::zeroed()).len()`. Now compute the rent in lamports at `lamports_per_byte_year = 3_480` and `years = 2` (Solana's two-year rent exemption). That's roughly what `CreateSlab` charges.
 
@@ -132,7 +132,7 @@ fn pool_free_node(slab: &mut Slab, idx: u16) {
 
 Three details worth flagging.
 
-**The init walks the array once.** It costs `O(N)` at bootstrap (~1k iterations). That cost is paid in `CreateSlab` which runs at most once per market. Every subsequent op is O(log N) or O(1).
+**The init walks the array once.** It costs `O(N)` at bootstrap (~1k iterations). That cost is paid in `CreateSlab`, which runs once per slab. Every subsequent op is O(log N) or O(1).
 
 **Free fields stay zeroed.** When a node is freed, we don't just push it on the list — we also clear `size`, `order_id`, and `owner`. The cost is small (a few stores), and it means a stale `owner` field can't leak into a future allocation by mistake. This matters because we're reusing the same memory for many orders' lifetimes.
 

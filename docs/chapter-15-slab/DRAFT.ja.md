@@ -88,7 +88,7 @@ pub struct Slab {                               // 計 ~82 KiB
 
 **4. 共有 OrderNode プール 1 つ。** `Slab.nodes` は単一配列。両方の木が同じプールから FIFO を引く。代替（side ごとプール）なら同じトータルフットプリントで side ごと OrderNode 容量が倍だが、片側だけの板（片方向の動きで bids ほぼ全部のとき）が片方のプールを枯渇させ他方が空のまま、ということになる。共有することで非対称フローでも slab を使えるように保つ。
 
-**5. アカウントサイズ = ~82 KiB。** 計算: `64 (ヘッダ) + 2 × 8208 (木) + 1024 × 64 (プール) = 82_064` バイト。これはプログラムの中からアカウントに与えられる 10 KiB(`MAX_PERMITTED_DATA_INCREASE`)を大きく超える。CPI で出した `create_account` はこの上限に縛られ、`MAX_PERMITTED_DATA_LENGTH = 10 MiB` まで確保できるのはトップレベルの命令だけ。だからプログラムは slab を自分で確保できない。クライアントがトランザクションの 1 つ目の命令で `SystemProgram::CreateAccount`(space `Slab::LEN`、owner は openhl-core)を送り、2 つ目の `CreateSlab` は初期化だけを行う。OpenBook や Phoenix と同じ分け方。このため slab は PDA ではなく keypair のアカウントになる。Rent は作る人がブートストラップで払う 1 回限りのコスト。
+**5. アカウントサイズ = ~82 KiB。** 計算: `64 (ヘッダ) + 2 × 8208 (木) + 1024 × 64 (プール) = 82_064` バイト。これはプログラムの中からアカウントに与えられる 10 KiB(`MAX_PERMITTED_DATA_INCREASE`)を大きく超える。CPI で出した `create_account` はこの上限に縛られ、`MAX_PERMITTED_DATA_LENGTH = 10 MiB` まで確保できるのはトップレベルの命令だけ。だからプログラムは slab を自分で確保できない。クライアントがトランザクションの 1 つ目の命令で `SystemProgram::CreateAccount`(space `Slab::LEN`、owner は openhl-core)を送り、2 つ目の `CreateSlab` は初期化だけを行う。OpenBook や Phoenix と同じ分け方。このため slab は PDA ではなく keypair のアカウントになる。その結果、1 つの market に slab をいくつでも作れ、`SlabPlaceOrder` と `SlabMatch` は market を受け取らず `slab.market` も確かめない。slab には決済の経路がないので、今は「クライアントがどの板を読むか」だけの問題だが、本番では market の状態に公式の slab のアドレスを記録して照合する。Rent は作る人がブートストラップで払う 1 回限りのコスト。
 
 > **演習 §15.1.** 構造体レイアウトから正確な `Slab::LEN` を計算せよ（コメントを信用するな）。`bytemuck::bytes_of(&Slab::zeroed()).len()` で検証せよ。次に、`lamports_per_byte_year = 3_480` と `years = 2`（Solana の 2 年 rent 免除）で rent をランポートで計算せよ。それが概ね `CreateSlab` が請求するもの。
 
@@ -132,7 +132,7 @@ fn pool_free_node(slab: &mut Slab, idx: u16) {
 
 3 つフラグすべき細部。
 
-**Init は配列を 1 度歩く。** ブートストラップで `O(N)`（~1k イテレーション）。そのコストは market ごとに最大 1 回走る `CreateSlab` で払う。以後すべての op は O(log N) か O(1)。
+**Init は配列を 1 度歩く。** ブートストラップで `O(N)`（~1k イテレーション）。そのコストは slab ごとに 1 回走る `CreateSlab` で払う。以後すべての op は O(log N) か O(1)。
 
 **Free 時にフィールドをゼロに保つ。** Node を free する際、リストに push するだけでなく `size`、`order_id`、`owner` をクリアする。コストは小さい（数個のストア）が、古い `owner` フィールドが将来のアロケーションに誤って漏れることを防げる。同じメモリを多くのオーダ寿命で再利用するから重要。
 

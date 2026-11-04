@@ -114,10 +114,9 @@ fn main() -> Result<()> {
         if std::path::Path::new(&slab_keypair_path).exists() {
             bail!("{slab_keypair_path} already exists; pass another --slab-keypair");
         }
-        let kp = Keypair::new();
-        write_keypair_file(&kp, &slab_keypair_path)
-            .map_err(|e| anyhow::anyhow!("write slab keypair: {}", e))?;
-        Some(kp)
+        // Written only after the create transaction confirms, so a failed
+        // --create leaves nothing behind and can simply be retried.
+        Some(Keypair::new())
     } else {
         None
     };
@@ -155,7 +154,10 @@ fn main() -> Result<()> {
             ],
             data: vec![29u8],
         };
-        send(&client, &payer, &[slab_kp], &[create_ix, init_ix])?;
+        send(&client, &payer, &[slab_kp], &[create_ix, init_ix])
+            .context("create slab (no keypair file written; rerun --create)")?;
+        write_keypair_file(slab_kp, &slab_keypair_path)
+            .map_err(|e| anyhow::anyhow!("slab {slab_key} created, but writing {slab_keypair_path} failed: {}", e))?;
         println!("slab keypair written to {slab_keypair_path}");
     } else if cli.place {
         let side_byte = match cli.side.as_deref() {
