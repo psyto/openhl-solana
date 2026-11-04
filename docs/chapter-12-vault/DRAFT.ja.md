@@ -430,7 +430,7 @@ Vault ライフサイクル:
 
 上の 3 項目は計算を確かめる。アカウントの検査、つまり §12.3 と §12.4 にある、呼び出し側が**どの**アカウントを渡してよいかを決める `if ... { return Err(...) }` の行は、どれも確かめない。§12.4 の `share.vault` の行のように、そういう検査を 1 つ忘れても、書こうと思いつくテストはどれも落ちない。[solinv](https://github.com/psyto/solinv) は、ネイティブのプログラムに対してまさにこれを fuzz する。攻撃者が代わりに渡せるアカウント(他の預金者の share、別の vault、vault が持っていないトークン口座)を教えると、各命令でそのうち 1 つを差し替えて送る。差し替えた呼び出しが成功して状態が変われば、それが検出である。
 
-`fuzz/vault/` がこの章のためのハーネスである。1 つの市場に vault を 2 つ用意する。A と B が shares を持つ K の vault と、A 自身の vault だ。solinv は、README が誰にでも勧めている入れ方(git の rev)で入れてある。Solana のツールチェーンと Crucible CLI(`cargo install --locked --git https://github.com/asymmetric-research/crucible --tag v0.1.0 crucible-fuzz-cli`)が要る:
+`fuzz/vault/` がこの章のためのハーネスである。1 つの市場に vault を 3 つ用意する。A と B が shares を持つ K の vault、A 自身の vault、屑の mint で作った C の vault だ。solinv は、README が誰にでも勧めている入れ方(git の rev)で入れてある。Solana のツールチェーンと Crucible CLI(`cargo install --locked --git https://github.com/asymmetric-research/crucible --tag v0.1.0 crucible-fuzz-cli`)が要る:
 
 ```bash
 cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
@@ -461,13 +461,13 @@ timeout -s INT 90 crucible run openhl_vault_fuzz invariant_vault \
 > | deposit: `depositor.is_signer` | いいえ |
 > | withdraw: `vault.owner == program_id` | いいえ |
 > | withdraw: `share.owner == program_id` | いいえ |
-> | withdraw: `verify_vault_token_account` | **いいえ、ただし穴がある**(下を見よ) |
+> | withdraw: `verify_vault_token_account` | 2 つの slot の組でだけ: account-swap `check_sets`、slot 5 と 6(下を見よ) |
 >
-> 先を読む前に、最後の 4 つが「いいえ」になる理由を考えよ。4 つは同じではない。
+> 先を読む前に、「いいえ」の 3 行がなぜ「いいえ」なのか、最後の行にはなぜ組が要るのかを考えよ。
 >
 > 3 つは、別の仕組みが裏で支えている。これらは攻撃を試しておらず、通り道が見つからなかっただけだ。2 つの所有者チェックは、ランタイム自身が支えている(第 1 章)。withdraw は両方のアカウントに書き込み、プログラムは自分が所有していないアカウントを変えられないので、すり替えたアカウントは次の CPI か命令の最後で落ちる。deposit の署名チェックは SPL Token が支えている(第 6 章)。deposit は預金者の口座からトークンを動かすので、預金者の署名が要る。この 3 つも、早く、分かりやすいエラーで落ちるので、検査として残す価値はある。
 >
-> 4 つ目は本物の穴で、fuzzer は見逃す。`vault_authority` の PDA の seed は `[VAULT_AUTH_SEED, market]` なので、この PDA は**どの** mint についても、市場のトークン口座の持ち主になる。`CreateVault`(第 6 章)を使えば誰でも任意の mint の口座を作れ、`CreateTradingVault` を使えば誰でもそこに vault を開ける。検査がないと、C は屑の mint で vault を開き、屑トークンを 300,000 入れて引き出す。その引き出しで、払い出し元に本物の mint のトークン口座を、送り先に C 自身の本物の mint の口座を指定する。C は屑 300,000 を本物 300,000 に換え、口座を空にした。これは**2 つ**のアカウントを同時に変える必要があり、solinv の account-swap は 1 度に 1 つの slot しか変えない。テスト `withdraw_refuses_the_token_account_of_another_mint` がこれを押さえている。fuzzer の「いいえ」は、通り道が見つからなかったという意味でしかない。通り道がないという意味ではない。
+> 4 つ目は本物の穴で、fuzzer は見逃す。`vault_authority` の PDA の seed は `[VAULT_AUTH_SEED, market]` なので、この PDA は**どの** mint についても、市場のトークン口座の持ち主になる。`CreateVault`(第 6 章)を使えば誰でも任意の mint の口座を作れ、`CreateTradingVault` を使えば誰でもそこに vault を開ける。検査がないと、C は屑の mint で vault を開き、屑トークンを 300,000 入れて引き出す。その引き出しで、払い出し元に本物の mint のトークン口座を、送り先に C 自身の本物の mint の口座を指定する。C は屑 300,000 を本物 300,000 に換え、口座を空にした。これは**2 つ**のアカウントを同時に変える必要がある。solinv のふつうの account-swap は 1 度に 1 つの slot しか変えないので、最初の表はこの行を「いいえ」とし、害はないと書いていた。攻撃を見つけたのはレビュアーである。今のハーネスはこの組も宣言しており(`check_sets`: C の屑の引き出しで、送り先と払い出し元を本物の mint のものに一緒に差し替える)、数秒で捕まえる。テスト `withdraw_refuses_the_token_account_of_another_mint` でも押さえてある。fuzzer の「いいえ」は、あなたが書いた差し替えでは通り道が見つからなかったという意味でしかない。通り道がないという意味ではない。
 >
 > このハーネスが扱わないもの: §12.5 のマネージャが申告する NAV。嘘の NAV を申告するマネージャは、自分が渡してよいアカウントしか渡さないので、アカウントを差し替える fuzzer には差し替える物がない。§12.5 の穴は、9 つの検査がすべてそろっていても開いたままである。見つけるには、行を消すのではなく設計を読む必要があった。
 

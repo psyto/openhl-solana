@@ -13,8 +13,8 @@ crucible-fuzzer = { git = "https://github.com/asymmetric-research/crucible", tag
 crucible-test-context = { git = "https://github.com/asymmetric-research/crucible", tag = "v0.1.0" }
 
 # solinv, installed the way its README tells anyone else to.
-solinv-fuzz = { git = "https://github.com/psyto/solinv", rev = "4a800dc3fb1cb91cff8254aafb30cef7b71f732c" }
-solinv-core = { git = "https://github.com/psyto/solinv", rev = "4a800dc3fb1cb91cff8254aafb30cef7b71f732c" }
+solinv-fuzz = { git = "https://github.com/psyto/solinv", rev = "8bcb011bd5d3ace5748d291a823c30ae018fc79e" }
+solinv-core = { git = "https://github.com/psyto/solinv", rev = "8bcb011bd5d3ace5748d291a823c30ae018fc79e" }
 
 solana-account = "3"
 solana-keypair = "3"

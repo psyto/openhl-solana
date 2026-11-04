@@ -1,7 +1,8 @@
 # Fuzzes the Chapter 12 trading vault's deposit and withdraw with solinv on every pull
 # request that touches the program, its crates or the harness:
-# signer-skip, owner-skip, and account-swap (B's share, A's other vault
-# and its share, a token account the vault does not hold).
+# signer-skip, owner-skip, account-swap (B's share, A's other vault
+# and its share, a token account the vault does not hold) and a two-slot
+# set (the token account of another mint).
 # Fails on any finding. See docs/chapter-12-vault §12.7.
 name: fuzz vault
 

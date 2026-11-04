@@ -432,7 +432,7 @@ Singleton-write reassertion (Ch.5 redux):
 
 Three exercises check the arithmetic. None of them checks the account checks: the `if ... { return Err(...) }` lines in §12.3 and §12.4 that decide *which* accounts a caller may pass. Forgetting one of those fails no test you would think to write, as §12.4's `share.vault` line shows. [solinv](https://github.com/psyto/solinv) fuzzes a native program for exactly this. You tell it which accounts an attacker could pass instead (another depositor's share, another vault, a token account the vault doesn't hold), and it sends each instruction with one of them swapped in. If a swapped call succeeds and changes state, that is a finding.
 
-`fuzz/vault/` is that harness for this chapter. It sets up one market with two vaults: K's, where A and B hold shares, and A's own. It installs solinv the way its README tells anyone to, by git rev. You need the Solana toolchain and the Crucible CLI (`cargo install --locked --git https://github.com/asymmetric-research/crucible --tag v0.1.0 crucible-fuzz-cli`):
+`fuzz/vault/` is that harness for this chapter. It sets up one market with three vaults: K's, where A and B hold shares, A's own, and C's in a junk mint. It installs solinv the way its README tells anyone to, by git rev. You need the Solana toolchain and the Crucible CLI (`cargo install --locked --git https://github.com/asymmetric-research/crucible --tag v0.1.0 crucible-fuzz-cli`):
 
 ```bash
 cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
@@ -463,13 +463,13 @@ On the program as it is, no `[FUZZ_FINDING]` line appears. (Crucible checks `--t
 > | deposit: `depositor.is_signer` | no |
 > | withdraw: `vault.owner == program_id` | no |
 > | withdraw: `share.owner == program_id` | no |
-> | withdraw: `verify_vault_token_account` | **no, but it is a hole** — see below |
+> | withdraw: `verify_vault_token_account` | only with a two-slot set: account-swap `check_sets`, slots 5 and 6 — see below |
 >
-> Before reading on, work out why the last four come back "no". They are not alike.
+> Before reading on, work out why the three "no" rows come back "no", and why the last row needs a set.
 >
 > Three of them are backed by something else. We did not try to exploit these, we only found no way through. The two owner checks are backed by the runtime itself (Chapter 1): withdraw writes both accounts, and a program cannot change an account it does not own, so a substituted account fails at the next CPI or at the end of the instruction. The deposit signer check is backed by SPL Token (Chapter 6): deposit moves tokens out of the depositor's account, which needs the depositor's signature. These three are still worth keeping, because they fail earlier and with a clearer error.
 >
-> The fourth is a real hole, and the fuzzer misses it. The `vault_authority` PDA has seeds `[VAULT_AUTH_SEED, market]`, so it owns the market's token account for *every* mint. `CreateVault` (Chapter 6) lets anyone create one for any mint, and `CreateTradingVault` lets anyone open a vault in it. Without the check, C opens a vault in a junk mint, deposits 300,000 junk tokens, and withdraws them. The withdrawal names the real mint's token account as the source and C's own real-mint account as the destination. C swapped 300,000 junk for 300,000 real and emptied the account. That takes *two* accounts changed together, and solinv's account-swap changes one slot at a time. The test `withdraw_refuses_the_token_account_of_another_mint` covers it. A "no" from a fuzzer means only that it did not find a way through. It does not mean there is none.
+> The fourth is a real hole, and the fuzzer misses it. The `vault_authority` PDA has seeds `[VAULT_AUTH_SEED, market]`, so it owns the market's token account for *every* mint. `CreateVault` (Chapter 6) lets anyone create one for any mint, and `CreateTradingVault` lets anyone open a vault in it. Without the check, C opens a vault in a junk mint, deposits 300,000 junk tokens, and withdraws them. The withdrawal names the real mint's token account as the source and C's own real-mint account as the destination. C swapped 300,000 junk for 300,000 real and emptied the account. That takes *two* accounts changed together. solinv's plain account-swap changes one slot at a time, and our first table listed this row as "no" and called it harmless; a reviewer found the attack. The harness now also declares the pair (`check_sets`: C's junk withdrawal, with the destination and the source swapped for the real mint's together), which catches it in seconds, and the test `withdraw_refuses_the_token_account_of_another_mint` pins it. A "no" from a fuzzer means only that the swaps you described found no way through. It does not mean there is none.
 >
 > What the harness does not cover: §12.5's manager-reported NAV. A manager who reports a false NAV passes only accounts they are entitled to pass, so a fuzzer that swaps accounts has nothing to swap. The hole §12.5 describes stays open with all nine checks in place. Finding it took reading the design, not deleting lines.
 

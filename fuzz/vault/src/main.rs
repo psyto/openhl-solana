@@ -2,12 +2,13 @@
 //! `VaultWithdraw`.
 //!
 //! Loads the real `openhl_core.so` from `target/deploy/` (`cargo build-sbf
-//! --manifest-path programs/openhl-core/Cargo.toml`). One market holds two
-//! trading vaults: K's, where depositors A and B each hold shares, and A's
-//! own. The specs send A's deposit into K's vault and A's withdrawal from
-//! it, and solinv swaps in B's share account, A's share account in the
-//! other vault, the other vault, or a token account A holds; any swap that
-//! succeeds and changes state is a finding.
+//! --manifest-path programs/openhl-core/Cargo.toml`). One market holds three
+//! trading vaults: K's, where depositors A and B each hold shares, A's own,
+//! and C's in a junk mint. The specs send A's deposit into K's vault and
+//! A's withdrawal from it, and solinv swaps in B's share account, A's share
+//! account in the other vault, the other vault, or a token account B holds.
+//! A two-slot set swaps C's junk withdrawal onto the real mint's token
+//! account. Any swap that succeeds and changes state is a finding.
 
 use crucible_fuzzer::*;
 use solana_account::Account;
@@ -18,6 +19,7 @@ use solana_signer::Signer;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use solinv_core::invariants::account_swap::SwapSet;
 use solinv_fuzz::{HasContext, HasInstructionSet, InstructionSpec};
 
 const CORE_SO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/deploy/openhl_core.so");
@@ -89,6 +91,12 @@ struct VaultFixture {
     a_vault: Pubkey,
     a_ata: Pubkey,
     b_ata: Pubkey,
+    /// C's vault in a junk mint, in the same market.
+    c: Arc<Keypair>,
+    junk: Pubkey,
+    c_vault: Pubkey,
+    c_junk: Pubkey,
+    c_real: Pubkey,
 }
 
 impl VaultFixture {
@@ -141,6 +149,14 @@ impl VaultFixture {
         ]
     }
 
+    /// `metas` with the mint at `mint_ix` and the market's token account
+    /// at `token_ix` switched to the junk mint's.
+    fn junk_metas(&self, mut metas: Vec<AccountMeta>, mint_ix: usize, token_ix: usize) -> Vec<AccountMeta> {
+        metas[mint_ix] = AccountMeta::new_readonly(self.junk, false);
+        metas[token_ix] = AccountMeta::new(vault_token(&self.market, &self.junk), false);
+        metas
+    }
+
     fn deposit(&mut self, vault: Pubkey, who: Arc<Keypair>, ata: Pubkey, what: &str) {
         let ix = Instruction {
             program_id: CORE_ID,
@@ -183,7 +199,8 @@ impl VaultFixture {
         let a = Arc::new(Keypair::new());
         let b = Arc::new(Keypair::new());
         let k = Arc::new(Keypair::new());
-        for kp in [&payer, &a, &b, &k] {
+        let c = Arc::new(Keypair::new());
+        for kp in [&payer, &a, &b, &k, &c] {
             ctx.create_account()
                 .pubkey(kp.pubkey())
                 .lamports(10_000_000_000)
@@ -205,6 +222,11 @@ impl VaultFixture {
             a_vault: trading_vault(&market, &a.pubkey()),
             a_ata: Keypair::new().pubkey(),
             b_ata: Keypair::new().pubkey(),
+            c: Arc::clone(&c),
+            junk: Keypair::new().pubkey(),
+            c_vault: trading_vault(&market, &c.pubkey()),
+            c_junk: Keypair::new().pubkey(),
+            c_real: Keypair::new().pubkey(),
         };
 
         // The vault handlers read only the market's key and owner, so the
@@ -238,6 +260,33 @@ impl VaultFixture {
         f.deposit(v, Arc::clone(&a), aa, "deposit A into K's vault");
         f.deposit(v, Arc::clone(&b), ba, "deposit B into K's vault");
         f.deposit(av, Arc::clone(&a), aa, "deposit A into A's vault");
+
+        // C: a junk mint, the market's token account for it (CreateVault,
+        // tag 5, lets anyone create one), a vault in it, and a deposit.
+        let (junk, cv, cj, cr) = (f.junk, f.c_vault, f.c_junk, f.c_real);
+        f.put(junk, token(), mint_data(6));
+        f.put(vault_token(&market, &junk), token(), token_account_data(&junk, &vault_auth(&market), 0));
+        f.put(cj, token(), token_account_data(&junk, &c.pubkey(), START_BALANCE));
+        f.put(cr, token(), token_account_data(&mint, &c.pubkey(), 0));
+        let ix = Instruction {
+            program_id: CORE_ID,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new_readonly(c.pubkey(), true),
+                AccountMeta::new_readonly(junk, false),
+                AccountMeta::new(cv, false),
+                AccountMeta::new_readonly(SYSTEM_ID, false),
+            ],
+            data: vec![IX_CREATE_TRADING_VAULT],
+        };
+        f.send(ix, &[&*c], "C opens a junk-mint vault");
+        let ix = Instruction {
+            program_id: CORE_ID,
+            accounts: f.junk_metas(f.deposit_metas(&cv, &c.pubkey(), &cj), 5, 7),
+            data: amount_data(IX_VAULT_DEPOSIT, 3 * START_DEPOSIT),
+        };
+        f.send(ix, &[&*c], "C deposits junk");
         f
     }
 
@@ -346,7 +395,16 @@ impl HasInstructionSet for VaultFixture {
             bump_seed_check: None,
             guards: vec![],
         };
-        vec![deposit, withdraw]
+        // C's own withdrawal from its junk vault; check_sets below swaps
+        // its source and destination for the real mint's together.
+        let junk_withdraw = InstructionSpec {
+            name: "vault_withdraw_junk".into(),
+            accounts: self.junk_metas(self.withdraw_metas(&self.c_vault, &self.c.pubkey(), &self.c_junk), 4, 6),
+            swap_alternates: vec![vec![]; 9],
+            signers: vec![Arc::clone(&self.c)],
+            ..withdraw.clone()
+        };
+        vec![deposit, withdraw, junk_withdraw]
     }
 }
 
@@ -355,6 +413,11 @@ fn invariant_vault(fixture: &mut VaultFixture) {
     solinv_core::invariants::signer_skip::check(fixture);
     solinv_core::invariants::owner_skip::check(fixture);
     solinv_core::invariants::account_swap::check(fixture);
+    // Withdraw junk, paid from the real mint's token account to C's own
+    // real-mint account: two slots that only work together.
+    let real_token = vault_token(&fixture.market, &fixture.mint);
+    let sets = [SwapSet { ix: "vault_withdraw_junk".into(), swaps: vec![(5, fixture.c_real), (6, real_token)] }];
+    solinv_core::invariants::account_swap::check_sets(fixture, &sets);
 }
 
 #[cfg(test)]
@@ -402,45 +465,15 @@ mod tests {
     /// any mint, and the vault authority PDA is the owner of all of them. So
     /// C opens a vault in a junk mint, deposits junk, and withdraws naming
     /// the real mint's token account as the source and its own real-mint
-    /// account as the destination. Two accounts change together, which
-    /// solinv's one-slot account-swap does not try.
+    /// account as the destination. Two accounts change together; the fuzzer
+    /// reaches it only through the `check_sets` pair in `invariant_vault`.
     #[test]
     fn withdraw_refuses_the_token_account_of_another_mint() {
         let mut f = VaultFixture::setup();
         let (market, mint) = (f.market, f.mint);
-        let c = Arc::new(Keypair::new());
-        f.ctx.create_account().pubkey(c.pubkey()).lamports(10_000_000_000).owner(SYSTEM_ID).create().unwrap();
-        let junk = Keypair::new().pubkey();
-        let (c_junk, c_real) = (Keypair::new().pubkey(), Keypair::new().pubkey());
-        f.put(junk, token(), mint_data(6));
-        // What CreateVault would create for the junk mint.
-        f.put(vault_token(&market, &junk), token(), token_account_data(&junk, &vault_auth(&market), 0));
-        f.put(c_junk, token(), token_account_data(&junk, &c.pubkey(), 3 * START_DEPOSIT));
-        f.put(c_real, token(), token_account_data(&mint, &c.pubkey(), 0));
-
-        let c_vault = trading_vault(&market, &c.pubkey());
-        let payer = f.payer.pubkey();
-        let ix = Instruction {
-            program_id: CORE_ID,
-            accounts: vec![
-                AccountMeta::new(payer, true),
-                AccountMeta::new_readonly(market, false),
-                AccountMeta::new_readonly(c.pubkey(), true),
-                AccountMeta::new_readonly(junk, false),
-                AccountMeta::new(c_vault, false),
-                AccountMeta::new_readonly(SYSTEM_ID, false),
-            ],
-            data: vec![IX_CREATE_TRADING_VAULT],
-        };
-        f.send(ix, &[&*c], "C opens a junk-mint vault");
-        let mut accounts = f.deposit_metas(&c_vault, &c.pubkey(), &c_junk);
-        accounts[5] = AccountMeta::new_readonly(junk, false);
-        accounts[7] = AccountMeta::new(vault_token(&market, &junk), false);
-        let ix = Instruction { program_id: CORE_ID, accounts, data: amount_data(IX_VAULT_DEPOSIT, 3 * START_DEPOSIT) };
-        f.send(ix, &[&*c], "C deposits junk");
-
+        let (c, c_vault, c_real) = (Arc::clone(&f.c), f.c_vault, f.c_real);
         let mut accounts = f.withdraw_metas(&c_vault, &c.pubkey(), &c_real);
-        accounts[4] = AccountMeta::new_readonly(junk, false);
+        accounts[4] = AccountMeta::new_readonly(f.junk, false);
         // accounts[6] stays the real mint's token account.
         let ix = Instruction { program_id: CORE_ID, accounts, data: amount_data(IX_VAULT_WITHDRAW, 3 * START_DEPOSIT) };
         let (ok, out) = f.send_logged(ix, Arc::clone(&c));

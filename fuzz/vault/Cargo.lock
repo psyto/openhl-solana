@@ -4775,7 +4775,7 @@ dependencies = [
 [[package]]
 name = "solinv-core"
 version = "0.0.1"
-source = "git+https://github.com/psyto/solinv?rev=4a800dc3fb1cb91cff8254aafb30cef7b71f732c#4a800dc3fb1cb91cff8254aafb30cef7b71f732c"
+source = "git+https://github.com/psyto/solinv?rev=8bcb011bd5d3ace5748d291a823c30ae018fc79e#8bcb011bd5d3ace5748d291a823c30ae018fc79e"
 dependencies = [
  "anyhow",
  "crucible-test-context",
@@ -4793,7 +4793,7 @@ dependencies = [
 [[package]]
 name = "solinv-disclose"
 version = "0.0.1"
-source = "git+https://github.com/psyto/solinv?rev=4a800dc3fb1cb91cff8254aafb30cef7b71f732c#4a800dc3fb1cb91cff8254aafb30cef7b71f732c"
+source = "git+https://github.com/psyto/solinv?rev=8bcb011bd5d3ace5748d291a823c30ae018fc79e#8bcb011bd5d3ace5748d291a823c30ae018fc79e"
 dependencies = [
  "anyhow",
  "serde",
@@ -4804,7 +4804,7 @@ dependencies = [
 [[package]]
 name = "solinv-fuzz"
 version = "0.0.1"
-source = "git+https://github.com/psyto/solinv?rev=4a800dc3fb1cb91cff8254aafb30cef7b71f732c#4a800dc3fb1cb91cff8254aafb30cef7b71f732c"
+source = "git+https://github.com/psyto/solinv?rev=8bcb011bd5d3ace5748d291a823c30ae018fc79e#8bcb011bd5d3ace5748d291a823c30ae018fc79e"
 dependencies = [
  "anchor-lang",
  "anyhow",
@@ -4819,6 +4819,20 @@ dependencies = [
  "solana-pubkey 3.0.0",
  "solana-signer",
  "solinv-disclose",
+ "solinv-static",
+]
+
+[[package]]
+name = "solinv-static"
+version = "0.0.1"
+source = "git+https://github.com/psyto/solinv?rev=8bcb011bd5d3ace5748d291a823c30ae018fc79e#8bcb011bd5d3ace5748d291a823c30ae018fc79e"
+dependencies = [
+ "anyhow",
+ "heck 0.5.0",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
