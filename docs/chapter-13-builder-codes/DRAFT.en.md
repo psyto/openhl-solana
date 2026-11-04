@@ -46,11 +46,11 @@ pub struct BuilderProfile {
     pub max_fee_share_bps: u64,     // self-cap, clamped at register-time
     pub accumulated_fees: u64,      // claim target
     pub total_volume: u64,          // stat: base size routed through this builder
-    pub _reserved: [u8; 32],
+    pub fee_mint: [u8; 32],         // quote mint of the first credit; fees are claimed only in it
 }
 ```
 
-104 bytes. The four meaningful fields:
+104 bytes. Four of the fields carry the design (`fee_mint` is covered under the constraints below):
 
 **`builder`** is the pubkey of the frontend / aggregator. Used as the only seed in the PDA derivation: `[BUILDER_PROFILE_SEED, builder.key]`. This means every Solana pubkey has at most one builder profile, derivable by anyone who knows the pubkey. The profile is owned by openhl-core (so only this program can mutate `accumulated_fees`), but anyone can *read* the public-facing fields (`builder`, `total_volume`) to verify a builder's claimed routing volume.
 
@@ -63,7 +63,7 @@ pub struct BuilderProfile {
 Two design constraints worth noting:
 
 - **One profile per builder.** The PDA derivation makes the (builder pubkey) → (profile pubkey) mapping bijective. A builder cannot have two profiles with different fee splits per market; if they want to A/B test fee splits they use two different builder wallets.
-- **Fee accumulation in quote units.** `accumulated_fees` is denominated in whatever quote currency the protocol fee is taken in. With multiple quote currencies (USDC and USDT, say) the design would need per-(builder, mint) profiles, not just per-builder. We deliberately keep it single-quote here since the rest of the program is also single-quote.
+- **Fee accumulation in quote units.** `accumulated_fees` is denominated in whatever quote currency the protocol fee is taken in. With multiple quote currencies (USDC and USDT, say) the design would need per-(builder, mint) profiles, not just per-builder. We deliberately keep it single-quote here since the rest of the program is also single-quote — and the program enforces it: anyone can create a market with any quote mint, so the first credit pins `fee_mint`, a `PlaceOrderWithBuilder` on a market quoted in another mint is refused, and `ClaimBuilderFees` pays only from `fee_mint`'s fee vault. Without that pin, fees earned on a market quoted in a worthless mint could be claimed, unit for unit, from the USDC fee vault (`tests/builder_fee_mint.rs`).
 
 > **Exercise §13.1.** A frontend registers with `max_fee_share_bps = 3000`. Three trades route through them: notional 1000, 2500, 700. With `PROTOCOL_FEE_BPS = 10` (0.1%), what is the total `accumulated_fees` after all three trades?
 

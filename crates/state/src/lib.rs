@@ -409,7 +409,7 @@ pub const BUILDER_PROFILE_DISCRIMINATOR: [u8; 8] = *b"BUILDER\0";
 ///   48 | 0x30  max_fee_share_bps     u64       — self-cap on share-of-fee
 ///   56 | 0x38  accumulated_fees      u64       — fees earned, awaiting claim
 ///   64 | 0x40  total_volume          u64       — base volume routed through this builder
-///   72 | 0x48  _reserved             [u8; 32]
+///   72 | 0x48  fee_mint              [u8; 32]  — quote mint the fees are in; zero until the first credit
 ///  104                                          — total size
 /// ```
 #[repr(C)]
@@ -422,7 +422,7 @@ pub struct BuilderProfile {
     pub max_fee_share_bps: u64,
     pub accumulated_fees: u64,
     pub total_volume: u64,
-    pub _reserved: [u8; 32],
+    pub fee_mint: [u8; 32],
 }
 
 impl BuilderProfile {

@@ -46,11 +46,11 @@ pub struct BuilderProfile {
     pub max_fee_share_bps: u64,     // 自己キャップ、登録時にクランプ
     pub accumulated_fees: u64,      // claim 対象
     pub total_volume: u64,          // 統計: この builder 経由でルートされた base size
-    pub _reserved: [u8; 32],
+    pub fee_mint: [u8; 32],         // quote mint of the first credit; fees are claimed only in it
 }
 ```
 
-104 バイト。意味のあるフィールド 4 つ:
+104 バイト。設計を担うフィールド 4 つ(`fee_mint` は下の制約で扱う):
 
 **`builder`** はフロントエンド / アグリゲータの pubkey。PDA 派生での唯一のシードに使う: `[BUILDER_PROFILE_SEED, builder.key]`。これですべての Solana pubkey は高々 1 つの builder profile を持ち、pubkey を知っている誰もが派生できる。Profile は openhl-core 所有（本プログラムだけが `accumulated_fees` を変更できる）だが、誰でも公開フィールド（`builder`、`total_volume`）を**読み**、builder の主張するルーティング量を検証できる。
 
@@ -63,7 +63,7 @@ pub struct BuilderProfile {
 注目すべき設計制約 2 つ:
 
 - **Builder あたり 1 profile。** PDA 派生が (builder pubkey) → (profile pubkey) マッピングを全単射にする。Builder は market ごとに異なる手数料分割の 2 profile を持てない。A/B テストしたいなら 2 つの異なる builder ウォレットを使う。
-- **Quote 単位での手数料蓄積。** `accumulated_fees` はプロトコル手数料が取られる quote 通貨で計上される。複数 quote 通貨（USDC と USDT）なら、設計は (builder, mint) ごとの profile が必要、builder ごとだけではなく。ここは意図的に単一 quote に保つ、プログラムの残りも単一 quote なので。
+- **Quote 単位での手数料蓄積。** `accumulated_fees` はプロトコル手数料が取られる quote 通貨で計上される。複数 quote 通貨（USDC と USDT）なら、設計は (builder, mint) ごとの profile が必要、builder ごとだけではなく。ここは意図的に単一 quote に保つ、プログラムの残りも単一 quote なので。プログラムはこれを強制する。誰でも任意の quote mint で market を作れるので、最初の credit で `fee_mint` を固定し、別の mint で quote された market での `PlaceOrderWithBuilder` は拒否し、`ClaimBuilderFees` は `fee_mint` の fee vault からしか払わない。この固定がないと、価値のない mint で quote された market で稼いだ手数料を、同じ数量だけ USDC の fee vault から claim できてしまう(`tests/builder_fee_mint.rs`)。
 
 > **演習 §13.1.** あるフロントエンドが `max_fee_share_bps = 3000` で登録する。3 つの取引が経由する: notional 1000、2500、700。`PROTOCOL_FEE_BPS = 10`（0.1%）で、3 取引すべての後の `accumulated_fees` 合計は?
 

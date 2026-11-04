@@ -3939,7 +3939,7 @@ fn process_register_builder(
     profile.max_fee_share_bps = max_share;
     profile.accumulated_fees = 0;
     profile.total_volume = 0;
-    profile._reserved = [0u8; 32];
+    profile.fee_mint = [0u8; 32];
 
     msg!(
         "register_builder: registered {} with max_fee_share_bps={}",
@@ -4067,6 +4067,16 @@ fn process_place_order_with_builder(
             bytemuck::from_bytes_mut(&mut profile_data[..BuilderProfile::LEN]);
         if profile.discriminator != BUILDER_PROFILE_DISCRIMINATOR {
             return Err(ProgramError::UninitializedAccount);
+        }
+        // accumulated_fees is a bare number of quote units, and anyone can
+        // create a market with any quote mint. Pin the profile to the mint
+        // of its first credit so fees earned in one mint can't be claimed
+        // from another mint's fee vault.
+        if profile.fee_mint == [0u8; 32] {
+            profile.fee_mint.copy_from_slice(mint_ai.key.as_ref());
+        } else if profile.fee_mint != *mint_ai.key.as_ref() {
+            msg!("place_order_with_builder: builder profile earns fees in another mint");
+            return Err(ProgramError::InvalidAccountData);
         }
         // Defensive: registered profile shouldn't exceed cap, but the
         // cap could have been lowered since the builder registered.
@@ -4210,6 +4220,10 @@ fn process_claim_builder_fees(
         if profile.builder != *builder_ai.key.as_ref() {
             msg!("claim_builder_fees: caller is not the registered builder");
             return Err(ProgramError::IllegalOwner);
+        }
+        if profile.accumulated_fees > 0 && profile.fee_mint != *mint_ai.key.as_ref() {
+            msg!("claim_builder_fees: fees were earned in another mint");
+            return Err(ProgramError::InvalidAccountData);
         }
 
         claimed = profile.accumulated_fees;
