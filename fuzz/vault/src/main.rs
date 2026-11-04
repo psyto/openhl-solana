@@ -417,6 +417,10 @@ fn invariant_vault(fixture: &mut VaultFixture) {
     // real-mint account: two slots that only work together.
     let real_token = vault_token(&fixture.market, &fixture.mint);
     let sets = [SwapSet { ix: "vault_withdraw_junk".into(), swaps: vec![(5, fixture.c_real), (6, real_token)] }];
+    // check_sets skips a set whose spec or accounts are missing without a
+    // word, so make sure this one is really there.
+    assert!(fixture.instructions().iter().any(|s| s.name == sets[0].ix), "no spec named {}", sets[0].ix);
+    assert!(fixture.ctx.account_exists(&fixture.c_real) && fixture.ctx.account_exists(&real_token), "set's accounts missing");
     solinv_core::invariants::account_swap::check_sets(fixture, &sets);
 }
 
