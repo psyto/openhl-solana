@@ -1,0 +1,89 @@
+# Fuzzes the Chapter 3 and 6 handlers (CreateMarket, CreateVault, Deposit)
+# with solinv on every pull request that touches the program, its crates or
+# the harness: signer-skip, owner-skip and account-swap. Fails on any
+# finding. invariant_ch4 (a cu-dos cap Bench is meant to exceed) and
+# invariant_ch3_reader (reports on the current program; §6.6 asks whether
+# that is a hole) are exercises, not run here. See docs/chapter-03-pdas §3.7
+# and docs/chapter-06-cpi §6.6.
+name: fuzz basics
+
+on:
+  pull_request:
+    paths:
+      - programs/openhl-core/**
+      - crates/**
+      - fuzz/basics/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/fuzz-basics.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [invariant_ch3, invariant_ch6]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.local/share/solana
+            ~/.cache/solana
+          key: fuzz-tools-${{ runner.os }}-agave-4.1.2-crucible-v0.1.0
+
+      - name: Install the Solana toolchain
+        run: |
+          if [ ! -x ~/.local/share/solana/install/active_release/bin/cargo-build-sbf ]; then
+            sh -c "$(curl -sSfL https://release.anza.xyz/v4.1.2/install)"
+          fi
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Install the Crucible CLI
+        run: |
+          command -v crucible || cargo install --locked \
+            --git https://github.com/asymmetric-research/crucible --tag v0.1.0 crucible-fuzz-cli
+
+      - name: Build the programs
+        run: cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
+
+      - name: Build the harness
+        working-directory: fuzz/basics
+        run: cargo build --release --features ${{ matrix.feature }}
+
+      - name: Test the harness
+        working-directory: fuzz/basics
+        run: cargo test --release --features ${{ matrix.feature }}
+
+      - name: Fuzz for 3 minutes
+        working-directory: fuzz/basics
+        run: |
+          # crucible checks --timeout only every 1000 iterations, which is
+          # many minutes at this harness's speed on ubuntu-latest
+          # (asymmetric-research/crucible#25), so stop it from outside.
+          set +e
+          timeout -s INT -k 30 180 crucible run openhl_basics_fuzz ${{ matrix.feature }} \
+            --binary-in target/release/invariant_test --timeout 180 > fuzz.log 2>&1
+          rc=$?
+          set -e
+          tail -5 fuzz.log
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 130 ] && [ "$rc" -ne 137 ]; then
+            echo "crucible exited $rc"; exit 1
+          fi
+          # crucible exits 0 even when it reports a finding.
+          if grep -q '^\[FUZZ_FINDING\] \[' fuzz.log; then
+            grep '^\[FUZZ_FINDING\] \[' fuzz.log | sort -u | head -20
+            exit 1
+          fi
+          grep FUZZ_PULSE fuzz.log | tail -1

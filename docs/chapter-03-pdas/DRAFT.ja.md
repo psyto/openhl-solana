@@ -1,7 +1,7 @@
 # 第3章 — PDA を原理から組み立てる
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_market` ハンドラ）、[`scripts/create-market/src/main.rs`](../../scripts/create-market/src/main.rs)。
+> 教材コード: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_market` ハンドラ）、[`scripts/create-market/src/main.rs`](../../scripts/create-market/src/main.rs)、[`fuzz/basics/src/main.rs`](../../fuzz/basics/src/main.rs)（§3.7 の solinv ハーネス）。
 > 検証対象バージョン: solana-pubkey 2.4.0、solana-cpi 2.2.1、solana-system-interface 1.0.0、solana-program 2.3.0。
 
 ---
@@ -315,6 +315,37 @@ send_and_confirm_tx           ─────►       lamports, space, program_
 1. **決定論的アドレス。** `create-market` を実行し、表示された `market PDA` を控える。オンチェーンアカウントを削除する（または新しい `solana-test-validator` を使う）。同じ `--base-mint`、`--quote-mint`、`--program` で再実行する。表示されるアドレスはバイトレベルで同一のはずだ。次に `--base-mint` と `--quote-mint` の順序を入れ替えて実行する。アドレスは変わるはずだ — シードの順序は派生の一部だ。
 2. **bump が保存されている。** `create-market` を実行した後、16 進ダンプはオフセット 9（`bump` フィールド）に非ゼロのバイトを示すはずだ。クライアントは自分が派生した bump と、プログラムが書き込んだ bump の両方を表示する。両者は一致しなければならない。[`scripts/create-market/src/main.rs:163`](../../scripts/create-market/src/main.rs#L163) で確認せよ。
 3. **秘密鍵不要。** `solana account <market_pda>` で `Owner` がプログラム ID であることを確認せよ。`~/.config/solana/` 内に対応するエントリはなく、どこにも鍵ペアファイルはない — このアドレスには秘密鍵がない。これが PDA を永続的にする仕組みだ。盗もうにも盗む鍵が存在しない。
+
+
+### 検査を道具に試させる
+
+`process_create_market` には自前の検査が 3 つある。payer が署名したこと、slot 2 が System プログラムであること、market が PDA であること。それぞれを消したら何が起きるかは、[solinv](https://github.com/psyto/solinv) で確かめられる。solinv はネイティブのプログラムを fuzz する。各命令について、どのアカウントが署名するか、攻撃者が代わりに何を渡せるかを書くと、署名者のフラグを外したり、アカウントを 1 つ差し替えたりして命令を送る。呼び出しが通って状態が変われば、それが検出である。
+
+[`fuzz/basics/`](../../fuzz/basics) が第 3・4・6 章のためのハーネスである。`CreateMarket` で市場を 1 つ用意し、solinv は README が誰にでも勧めている入れ方(git の rev)で入れてある。Solana のツールチェーンと Crucible CLI(`cargo install --locked --git https://github.com/asymmetric-research/crucible --tag v0.1.0 crucible-fuzz-cli`)が要る:
+
+```bash
+cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
+cd fuzz/basics
+cargo build --release --features invariant_ch3
+timeout -s INT 60 crucible run openhl_basics_fuzz invariant_ch3 \
+    --binary-in target/release/invariant_test --timeout 45
+```
+
+今のプログラムでは `[FUZZ_FINDING]` の行は出ない。(Crucible は `--timeout` を 1000 回に 1 度しか見ないので、外側に `timeout` をつけている。macOS では coreutils の `gtimeout`。)`CreateMarket` の仕様は、payer の署名フラグを外し、PDA ではない market のアドレスを渡し、System の場所に SPL Token を渡す。
+
+> **演習 §3.7.** 3 つの検査を 1 つずつ消し、プログラムを作り直して fuzzer を走らせよ。走らせる前に結果を予想すること。私たちが各 45 秒で測った結果:
+>
+> | 消した検査 | 捕まったか | 代わりに呼び出しを拒否したもの |
+> |---|---|---|
+> | `payer_ai.is_signer` | いいえ | ランタイム: `Cross-program invocation with unauthorized signer or writable account` |
+> | `system_ai.key == system_program::ID` | いいえ | ランタイム: `An account required by the instruction is missing` |
+> | `market_ai.key == expected_pda` | いいえ | ランタイム: `Cross-program invocation with unauthorized signer or writable account` |
+>
+> 先を読む前に、各行の理由を考えよ。
+>
+> 3 つとも、CPI のところでランタイムが支えている。payer: `create_account` は payer の lamports を動かすので System は payer の署名を求め、プログラムは自分が受け取った署名しか渡せない(この署名の規則は第 6 章 §6.2 で扱う)。System プログラム: ハンドラが組む命令には `system_program::ID` そのものが書いてあるので、呼び出し側が slot 2 に何を入れても、ランタイムは本物の System プログラムのアカウントを必要とし、それがない。PDA: `invoke_signed` が署名するのは seed が導くアドレスだけなので(§3.3)、別のアドレスは自分で署名しなければならない。
+>
+> これは §3.3 の要点を外から見たものだ。PDA を**作る**ときは、ランタイムが seed を確かめてくれる。それでも 3 つの検査は残す。早く、何がおかしいかを言って落ちるからだ。誰も代わりにやってくれない PDA の検査は**読む**ときにある。後の命令に既存の市場が渡され、それを信じてよいかを決めなければならないときだ。第 6 章 §6.6 では、同じハーネスでそれを探す。
 
 ---
 

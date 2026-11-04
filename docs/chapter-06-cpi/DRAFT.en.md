@@ -1,7 +1,7 @@
 # Chapter 6 — CPI Internals via Vault Deposits
 
 > Status: draft (v0.1).
-> Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_vault` at lines 888–997, `process_deposit` at lines 1004–1072), [`scripts/create-vault/src/main.rs`](../../scripts/create-vault/src/main.rs), [`scripts/deposit/src/main.rs`](../../scripts/deposit/src/main.rs).
+> Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_vault` at lines 888–997, `process_deposit` at lines 1004–1072), [`scripts/create-vault/src/main.rs`](../../scripts/create-vault/src/main.rs), [`scripts/deposit/src/main.rs`](../../scripts/deposit/src/main.rs), [`fuzz/basics/src/main.rs`](../../fuzz/basics/src/main.rs) (the solinv harness for §6.6).
 > Tested against: solana-cpi 2.2.1, solana-program 2.3.0, SPL Token program (TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA).
 
 ---
@@ -258,6 +258,51 @@ openhl-core CPI map:
 1. **`invoke` is `invoke_signed` with no seeds.** Open `solana-cpi-2.2.1/src/lib.rs:137` and read the three-line body. Internalize that the only difference between the two is "did we pass PDA seeds." Everything else is the same syscall.
 2. **AccountInfo for the callee program.** In both CPIs in CreateVault, the `accounts` slice passed to `invoke[_signed]` includes the callee program's AccountInfo — `system_ai` for CPI 1, `token_ai` for CPI 2. Omitting them is one of the most common early-Solana mistakes; the runtime returns a confusing `AccountNotFound`-flavored error. Verify by reading [`lib.rs:962, 993`](../../programs/openhl-core/src/lib.rs#L962).
 3. **User signs once, used by SPL Token.** Run `deposit` against your validator. The user keypair signs the outer transaction; SPL Token receives a `Transfer` instruction with `is_signer = true` on the user; the transfer commits. There is no second signature anywhere. One signature, propagated.
+
+
+### Now let a tool try the checks
+
+`CreateVault` has seven checks and `Deposit` four. Chapter 3 §3.7 ran [solinv](https://github.com/psyto/solinv) on `CreateMarket`, and every deleted check was backed by the runtime. These two handlers make CPIs to a second program, so there are more places a check can be backed, and one where it is not. The same harness, [`fuzz/basics/`](../../fuzz/basics), has specs for both: the payer's or user's signer flag cleared, and each slot swapped for something an attacker could pass (a "market" this program does not own, a token account as the "mint", a vault address that is not the PDA, the caller as the vault's authority, the wrong program in each program slot, B's token account as A's source). Set up as in Chapter 3 §3.7, then:
+
+```bash
+cd fuzz/basics
+cargo build --release --features invariant_ch6
+cargo test --release --features invariant_ch6      # A cannot spend B's tokens
+timeout -s INT 60 crucible run openhl_basics_fuzz invariant_ch6 \
+    --binary-in target/release/invariant_test --timeout 45
+```
+
+On the program as it is, no `[FUZZ_FINDING]` line appears.
+
+> **Exercise §6.6.** Delete each check in turn, rebuild, run, and predict first. Here is what we measured, 45 seconds each. The last column is what refused the swapped call instead, read from its logs:
+>
+> | Check deleted | Caught? | What refused the call instead |
+> |---|---|---|
+> | CreateVault: `payer_ai.is_signer` | no | the runtime: unauthorized signer |
+> | CreateVault: `market_ai.owner == program_id` | no | our vault PDA check |
+> | CreateVault: `mint_ai.owner == SPL Token` | no | our vault PDA check |
+> | CreateVault: `system_ai.key == System` | no | the runtime: an account required by the instruction is missing |
+> | CreateVault: `token_ai.key == SPL Token` | no | the runtime: an account required by the instruction is missing |
+> | CreateVault: `vault_ai.key == expected_vault` | no | the runtime: unauthorized signer |
+> | CreateVault: `vault_auth_ai.key == expected_auth` | **yes**, account-swap, slot 4 | — |
+> | Deposit: `user_ai.is_signer` | no | the runtime: unauthorized signer |
+> | Deposit: `user_token_ai.owner == SPL Token` | no | the runtime: instruction modified data of an account it does not own |
+> | Deposit: `vault_token_ai.owner == SPL Token` | no | the runtime: instruction modified data of an account it does not own |
+> | Deposit: `token_ai.key == SPL Token` | no | the runtime: an account required by the instruction is missing |
+>
+> Before reading on, find the one row where nothing else stands behind the check.
+>
+> Most rows are §6.2 and §6.1 again. A program can pass on only the signatures it was given, so a missing payer or user signature fails at the CPI (§6.2). The handler builds each inner instruction with the callee's ID written in (`SPL_TOKEN_PROGRAM_ID`, `system_program::ID`), so a wrong program in the slot does not redirect the CPI; the runtime just cannot find the real callee's account (§6.1). `create_account` on an address that is not the PDA needs that address's own signature. A token account owned by some other program, with the same bytes inside, gets past SPL Token, which runs the `Transfer`; then the runtime refuses it, because SPL Token changed an account it does not own (Chapter 1). B's real token account is refused by SPL Token itself, because A is not its authority (`owner does not match`, which the test pins).
+>
+> Two rows are backed by our own code, and only because of how the fuzzer swaps. The vault PDA is derived from the market and the mint, so swapping either one alone makes slot 3 the wrong address. Swap them together with the accounts derived from them, a set (`account_swap::check_sets`; Chapter 12 §12.7 uses one too), and the rows split: with the mint owner check gone, SPL Token still refuses a token account as a mint (`Invalid Mint`). With the market owner check gone, the call went through and created a token account for a "market" that was someone's token account. That check is doing real work.
+>
+> The **yes** row is the one to remember. `vault_authority` is never created; it is only an address, which `InitializeAccount3` writes into the new token account as its owner. Nothing about the CPI depends on it being the PDA, so if the program does not check it, the caller can name themselves, and from then on every deposit into that market's vault is the caller's to move. No runtime rule can catch this, because to the runtime the address is just data.
+>
+> Two more to try. First, add `self.b_ata` to `Deposit`'s slot 2 alternates in `fuzz/basics/src/main.rs` (the destination) and run again: it is reported on every execution, since A can deposit into any token account. Is that a hole? Here it is not. `Deposit` records nothing, so A paying into B's account is a gift. Chapters 11 and 12 add the bookkeeping that makes the destination matter, and bind it. A finding is a call the program allowed; whether it matters is a question about what the program promised.
+>
+> Second, the read-time question from Chapter 3. `CreateVault` checks the market's owner, not its address. Chapter 2's `Initialize` can still make a `Market` in any account the caller creates, so a pair can have a second market that is not at its PDA. Build with `--features invariant_ch3_reader` and run: that harness makes such a market and has `CreateVault` read it (three slots swapped together: the market and the two addresses derived from it). It is reported on the current program, and the test `create_vault_accepts_a_market_not_at_its_pda` shows it directly. Is *that* a hole? Work it out before reading on.
+>
+> What the PDA promised was one address per `(base, quote)`. Almost nothing in the program relies on that. Every account keyed to a market (its token accounts and their authority, the book, oracle, funding state, positions, trading vaults, insurance fund) is seeded by the market's own address, so a second market is a separate island, and `CreateMarket` lets anyone choose a market's authority anyway. The exception is Chapter 13's fee vault: one per quote mint, shared by every market. Whether a second market can take more out of it than its users paid in is a question for Chapter 13. A client that finds "the" market by deriving its PDA is fine; a client that believes any account shaped like a market is not. If the program wanted to enforce one market per pair, `CreateVault` would re-derive the address from the market's own `base_mint`, `quote_mint` and stored `bump` (Chapter 3's "bump stored"). We tried it: with that check added, the set was refused (`InvalidSeeds`) and the fuzzer found nothing in 45 seconds.
 
 ---
 

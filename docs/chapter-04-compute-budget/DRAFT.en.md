@@ -1,7 +1,7 @@
 # Chapter 4 — Compute Budget and Heap Discipline
 
 > Status: draft (v0.1).
-> Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_bench` at lines 355–402), [`scripts/bench/src/main.rs`](../../scripts/bench/src/main.rs).
+> Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_bench` at lines 689–735), [`scripts/bench/src/main.rs`](../../scripts/bench/src/main.rs), [`fuzz/basics/src/main.rs`](../../fuzz/basics/src/main.rs) (the solinv harness for §4.7).
 > Tested against: solana-program 2.3.0, solana-program-entrypoint 2.3.0, solana-compute-budget-interface 2.2.2.
 
 ---
@@ -219,26 +219,28 @@ A typical run looks like:
 bench --rounds 50 --heap-bytes 1024
 
 simulation:
-  units_consumed: 87412
+  units_consumed: 35029
   err:            (none)
 
 program logs:
   Program <openhl-core ID> invoke [1]
   Program log: bench: start (rounds=50, heap_bytes=1024)
-  Program consumption: 199772 units remaining
+  Program consumption: 199128 units remaining
   Program log: bench: after heap alloc (1024 bytes)
-  Program consumption: 199639 units remaining
+  Program consumption: 198536 units remaining
   Program log: bench: after 50 hash rounds
-  Program consumption: 112433 units remaining
-  Program <openhl-core ID> consumed 87412 of 200000 compute units
+  Program consumption: 164984 units remaining
+  Program <openhl-core ID> consumed 35029 of 200000 compute units
   Program <openhl-core ID> success
 
 on-chain signature: ...
 ```
 
-Three numbers to focus on. The CU remaining after entry (199,772) tells you the fixed cost of program startup: instruction-data decode, dispatcher, logging — about 230 CU in this build. Phase A burned (199,772 − 199,639) = 133 CU to allocate 1 KiB. Phase B burned (199,639 − 112,433) = 87,206 CU for 50 sha256 rounds of 1 KiB input — about 1,744 CU per round.
+(Measured on `solana-test-validator` 4.1.2. Syscall prices change between releases; an earlier draft of this chapter, on an older toolchain, measured 87,412 CU for the same call. Run it yourself and use your numbers.)
 
-From here you can extrapolate. 100 rounds: ~175K CU. 120 rounds: ~209K CU — over the default 200K limit. Run it without `--cu-limit` and you will see `ProgramFailedToComplete` with `ComputationalBudgetExceeded`. Add `--cu-limit 400000` and it succeeds again.
+Three numbers to focus on. The CU remaining after entry (199,128) tells you the fixed cost of program startup: instruction-data decode, dispatcher, the first log line — about 870 CU in this build. Phase A burned (199,128 − 198,536) = 592 CU, but most of that is the `msg!` and the `sol_log_compute_units` call themselves: with `--heap-bytes 0` the same phase costs 527, so allocating 1 KiB costs about 65 CU. Phase B burned (198,536 − 164,984) = 33,552 CU for 50 sha256 rounds of 1 KiB input — about 671 CU per round.
+
+From here you can extrapolate, and then check. 100 rounds: we measured 68,047 CU. 290 rounds: 193,447. 300 rounds: over the default 200K limit. Run it without `--cu-limit` and you will see `ComputationalBudgetExceeded`. Add `--cu-limit 400000` and it succeeds again, at 200,197 CU.
 
 This is the whole point: measure once, predict, then either fit your work into the budget or explicitly raise the ceiling. Guessing is for projects that have not yet shipped under load.
 
@@ -290,9 +292,34 @@ Inside one tx:
 
 ### Three things to verify yourself
 
-1. **Default ceiling is real.** Run `bench --rounds 150 --heap-bytes 1024` without `--cu-limit`. It should fail with `ComputationalBudgetExceeded`. The simulation `units_consumed` will show a number greater than 200,000 — but the runtime stops counting once you exceed the limit, so the number may be capped.
+1. **Default ceiling is real.** Run `bench --rounds 300 --heap-bytes 1024` without `--cu-limit`. It should fail with `ComputationalBudgetExceeded`. The simulation `units_consumed` will show a number greater than 200,000 — but the runtime stops counting once you exceed the limit, so the number may be capped.
 2. **Heap ceiling is real.** Run `bench --rounds 0 --heap-bytes 65536`. The bump allocator at [`solana-program-entrypoint-2.3.0/src/lib.rs:342`](#) returns null; Rust's alloc-error handler aborts the program. The error you see is not `ComputationalBudgetExceeded` but a memory abort.
 3. **Compute-budget instruction must be in the same tx.** Modify `bench` to send the `ComputeBudgetInstruction` in a *separate* transaction from the bench instruction. The next bench tx still gets only the default 200,000. The compute-budget instruction's effect is scoped to its own transaction only — it does not persist across.
+
+
+### Now let a tool look for the expensive call
+
+You measured `bench` by choosing its arguments. A caller who wants your instruction to be expensive chooses them too. [solinv](https://github.com/psyto/solinv)'s cu-dos check asks the question from their side: you declare how many CU an instruction may use, the fuzzer varies the arguments, and any call that succeeds above your cap is a finding. [`fuzz/basics/`](../../fuzz/basics) is the harness for Chapters 3, 4 and 6; its `Bench` spec has a cap of 50,000 CU (`BENCH_CU_CAP`), and the fuzzer tries `rounds` below 2,000 and `heap_bytes` below 4,096. Set up as in Chapter 3 §3.7, then:
+
+```bash
+cd fuzz/basics
+cargo build --release --features invariant_ch4
+cargo test --release --features invariant_ch4      # CU grows with rounds
+timeout -s INT 60 crucible run openhl_basics_fuzz invariant_ch4 \
+    --binary-in target/release/invariant_test --timeout 45
+```
+
+> **Exercise §4.7.** Run it. Within seconds you should see lines like
+>
+> ```
+> [FUZZ_FINDING] [cu-dos:…] ix bench consumed 186571 CU (cap 50000)
+> ```
+>
+> That is expected: `bench` exists to let the caller pick the cost. Now set `BENCH_CU_CAP` to 200,000 (the default limit) and run again. We saw no finding in 45 seconds. Why is that not a fix?
+>
+> Because cu-dos can see only calls that succeed, and every call above 200,000 already fails in the runtime. With the cap at the runtime's limit, the question "can a caller make this cost more than I planned?" turns into "can a caller make this cost more than is possible?", which is always no. The cap is your number, the CU you planned for this instruction, not the runtime's.
+>
+> In `bench` that cost is the point. In an instruction other people depend on it is a bug: a matcher whose cost grows with the number of orders it walks can be pushed past the limit by whoever places the orders, and then nobody's match goes through. Chapter 8 builds that matcher.
 
 ---
 

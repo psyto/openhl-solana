@@ -1,7 +1,7 @@
 # Chapter 3 — PDAs from First Principles
 
 > Status: draft (v0.1).
-> Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (the `process_create_market` handler), [`scripts/create-market/src/main.rs`](../../scripts/create-market/src/main.rs).
+> Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (the `process_create_market` handler), [`scripts/create-market/src/main.rs`](../../scripts/create-market/src/main.rs), [`fuzz/basics/src/main.rs`](../../fuzz/basics/src/main.rs) (the solinv harness for §3.7).
 > Tested against: solana-pubkey 2.4.0, solana-cpi 2.2.1, solana-system-interface 1.0.0, solana-program 2.3.0.
 
 ---
@@ -315,6 +315,37 @@ send_and_confirm_tx           ─────►       lamports, space, program_
 1. **Deterministic address.** Run `create-market`, note the printed `market PDA`. Delete the on-chain account (or use a fresh `solana-test-validator`), re-run with the same `--base-mint`, `--quote-mint`, `--program`. The address printed should be byte-identical. Then change the order of `--base-mint` and `--quote-mint`. The address should change — seed order is part of the derivation.
 2. **Bump stored.** After running `create-market`, the hex dump should show a non-zero byte at offset 9 (the `bump` field). The client prints both the bump it derived and the bump the program wrote — they must match. Confirm with [`scripts/create-market/src/main.rs:163`](../../scripts/create-market/src/main.rs#L163).
 3. **No private key needed.** Use `solana account <market_pda>` and confirm `Owner` is your program ID. There is no corresponding entry in `~/.config/solana/`, no keypair file anywhere — the address has no private key. This is what makes the PDA permanent: even if someone wanted to compromise it, there's no key to steal.
+
+
+### Now let a tool try the checks
+
+`process_create_market` has three checks of its own: the payer signed, slot 2 is the System program, and the market is the PDA. [solinv](https://github.com/psyto/solinv) can tell you what happens when each one is gone. It fuzzes a native program: you describe each instruction (which accounts sign, which an attacker could pass instead), and it sends the instruction with a signer flag cleared or one account swapped. If a call goes through and changes state, that is a finding.
+
+[`fuzz/basics/`](../../fuzz/basics) is the harness for Chapters 3, 4 and 6. It sets up one market with `CreateMarket` and installs solinv the way its README tells anyone to, by git rev. You need the Solana toolchain and the Crucible CLI (`cargo install --locked --git https://github.com/asymmetric-research/crucible --tag v0.1.0 crucible-fuzz-cli`):
+
+```bash
+cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
+cd fuzz/basics
+cargo build --release --features invariant_ch3
+timeout -s INT 60 crucible run openhl_basics_fuzz invariant_ch3 \
+    --binary-in target/release/invariant_test --timeout 45
+```
+
+On the program as it is, no `[FUZZ_FINDING]` line appears. (Crucible checks `--timeout` only every 1000 iterations, hence the outer `timeout`; on macOS it is `gtimeout` from coreutils.) The `CreateMarket` spec clears the payer's signer flag, passes a market address that is not the PDA, and passes SPL Token where System belongs.
+
+> **Exercise §3.7.** Delete each of the three checks in turn, rebuild the program, run the fuzzer, and predict the result first. Here is what we measured, 45 seconds each:
+>
+> | Check deleted | Caught? | What refused the call instead |
+> |---|---|---|
+> | `payer_ai.is_signer` | no | the runtime: `Cross-program invocation with unauthorized signer or writable account` |
+> | `system_ai.key == system_program::ID` | no | the runtime: `An account required by the instruction is missing` |
+> | `market_ai.key == expected_pda` | no | the runtime: `Cross-program invocation with unauthorized signer or writable account` |
+>
+> Work out each row before reading on.
+>
+> All three are backed by the runtime, at the CPI. The payer: `create_account` moves the payer's lamports, so System needs the payer's signature, and a program can pass on only signatures it was given (Chapter 6 §6.2 covers this signer privilege rule). The System program: the instruction the handler builds names `system_program::ID` itself, so whatever the caller put in slot 2, the runtime still needs the real System program's account, and it is not there. The PDA: `invoke_signed` signs for the address the seeds derive (§3.3), so a different address would have to sign for itself.
+>
+> That is §3.3's point, seen from the outside: when you create a PDA, the runtime checks the seeds for you. Keep the three checks anyway, because they fail earlier and say what is wrong. The PDA check that no one does for you is at *read* time, when a later instruction is handed a market that already exists and has to decide whether to believe it. Chapter 6 §6.6 has you look for that with the same harness.
 
 ---
 
