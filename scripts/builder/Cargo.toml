@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Chapter 13 worked example: drives openhl-core's builder-code instructions. --register binds a builder; --place-with-builder routes an order through a builder's profile; --claim withdraws accumulated fees."
+description = "Chapter 13 worked example: drives openhl-core's builder-code instructions. --register binds a builder and its fee mint; --place-with-builder routes an order through a builder's profile; --claim withdraws accumulated fees."
 
 [[bin]]
 name = "builder"

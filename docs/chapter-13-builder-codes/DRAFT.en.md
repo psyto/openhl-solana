@@ -46,7 +46,7 @@ pub struct BuilderProfile {
     pub max_fee_share_bps: u64,     // self-cap, clamped at register-time
     pub accumulated_fees: u64,      // claim target
     pub total_volume: u64,          // stat: base size routed through this builder
-    pub fee_mint: [u8; 32],         // quote mint of the first credit; fees are claimed only in it
+    pub fee_mint: [u8; 32],         // set at registration; fees are earned and claimed only in it
 }
 ```
 
@@ -63,7 +63,7 @@ pub struct BuilderProfile {
 Two design constraints worth noting:
 
 - **One profile per builder.** The PDA derivation makes the (builder pubkey) → (profile pubkey) mapping bijective. A builder cannot have two profiles with different fee splits per market; if they want to A/B test fee splits they use two different builder wallets.
-- **Fee accumulation in quote units.** `accumulated_fees` is denominated in whatever quote currency the protocol fee is taken in. With multiple quote currencies (USDC and USDT, say) the design would need per-(builder, mint) profiles, not just per-builder. We deliberately keep it single-quote here since the rest of the program is also single-quote — and the program enforces it: anyone can create a market with any quote mint, so the first credit pins `fee_mint`, a `PlaceOrderWithBuilder` on a market quoted in another mint is refused, and `ClaimBuilderFees` pays only from `fee_mint`'s fee vault. Without that pin, fees earned on a market quoted in a worthless mint could be claimed, unit for unit, from the USDC fee vault (`tests/builder_fee_mint.rs`).
+- **Fee accumulation in quote units.** `accumulated_fees` is denominated in whatever quote currency the protocol fee is taken in. With multiple quote currencies (USDC and USDT, say) the design would need per-(builder, mint) profiles, not just per-builder. We deliberately keep it single-quote here since the rest of the program is also single-quote — and the program enforces it: anyone can create a market with any quote mint, so the builder names its `fee_mint` in `RegisterBuilder` (account 3, the builder signs), a `PlaceOrderWithBuilder` on a market quoted in another mint is refused, and `ClaimBuilderFees` pays only from `fee_mint`'s fee vault. Fixing it at registration rather than at the first credit matters: `PlaceOrderWithBuilder` is signed by the trader, not the builder, so a first-credit pin would let anyone pin someone else's profile to a junk mint. Without that pin, fees earned on a market quoted in a worthless mint could be claimed, unit for unit, from the USDC fee vault (`tests/builder_fee_mint.rs`).
 
 > **Exercise §13.1.** A frontend registers with `max_fee_share_bps = 3000`. Three trades route through them: notional 1000, 2500, 700. With `PROTOCOL_FEE_BPS = 10` (0.1%), what is the total `accumulated_fees` after all three trades?
 
@@ -286,9 +286,9 @@ Two-cap safety:
 
 Prerequisites: bootstrap the fee vault for the quote mint (`builder --create-fee-vault --mint <quote_mint>`) and ensure your trader has a funded quote-token account before any place-order variant; otherwise the fee Transfer reverts.
 
-1. **The cap stacks correctly.** Register a builder with `--max-share-bps 9999`. The handler should log the clamp, and the dump should show `max_fee_share_bps = 5000` (our `PROTOCOL_BUILDER_SHARE_CAP_BPS`). Now route a trade through them — the builder's share should be exactly 50% of the protocol fee.
+1. **The cap stacks correctly.** Register a builder with `--max-share-bps 9999 --mint <quote_mint>`. The handler should log the clamp, and the dump should show `max_fee_share_bps = 5000` (our `PROTOCOL_BUILDER_SHARE_CAP_BPS`). Now route a trade through them — the builder's share should be exactly 50% of the protocol fee.
 2. **Atomicity holds under failure.** Use a simulated failure: try `PlaceOrderWithBuilder` with a stale oracle (so the order placement will fail). The simulation should fail with `oracle stale` *and* the builder profile's `accumulated_fees` should be unchanged, the fee vault's balance should be unchanged, and the trader's quote-token account should be unchanged after the failed sim (the entire transaction reverts). The split doesn't happen unless the trade does.
-3. **Volume accrues per trade.** Place 5 orders through the same builder with sizes 10, 20, 30, 40, 50. The `total_volume` should be exactly 150 (10+20+30+40+50). If `accumulated_fees` doesn't add up to `(notional_total × PROTOCOL_FEE_BPS × share_bps / 10000 / 10000)`, there's an off-by-one in the math — chase it down. Then run `--claim --builder-token-account <pubkey>`; the builder's quote-token account balance should grow by exactly `accumulated_fees`, and the dump should show `accumulated_fees = 0`.
+3. **Volume accrues per trade.** Place 5 orders through the same builder with sizes 10, 20, 30, 40, 50. The `total_volume` should be exactly 150 (10+20+30+40+50). If `accumulated_fees` doesn't add up to `(notional_total × PROTOCOL_FEE_BPS × share_bps / 10000 / 10000)`, there's an off-by-one in the math — chase it down. Then run `--claim --mint <fee_mint> --builder-token-account <pubkey>` (the dump prints `fee_mint`); the builder's quote-token account balance should grow by exactly `accumulated_fees`, and the dump should show `accumulated_fees = 0`.
 
 ---
 

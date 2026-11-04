@@ -46,7 +46,7 @@ pub struct BuilderProfile {
     pub max_fee_share_bps: u64,     // 自己キャップ、登録時にクランプ
     pub accumulated_fees: u64,      // claim 対象
     pub total_volume: u64,          // 統計: この builder 経由でルートされた base size
-    pub fee_mint: [u8; 32],         // quote mint of the first credit; fees are claimed only in it
+    pub fee_mint: [u8; 32],         // set at registration; fees are earned and claimed only in it
 }
 ```
 
@@ -63,7 +63,7 @@ pub struct BuilderProfile {
 注目すべき設計制約 2 つ:
 
 - **Builder あたり 1 profile。** PDA 派生が (builder pubkey) → (profile pubkey) マッピングを全単射にする。Builder は market ごとに異なる手数料分割の 2 profile を持てない。A/B テストしたいなら 2 つの異なる builder ウォレットを使う。
-- **Quote 単位での手数料蓄積。** `accumulated_fees` はプロトコル手数料が取られる quote 通貨で計上される。複数 quote 通貨（USDC と USDT）なら、設計は (builder, mint) ごとの profile が必要、builder ごとだけではなく。ここは意図的に単一 quote に保つ、プログラムの残りも単一 quote なので。プログラムはこれを強制する。誰でも任意の quote mint で market を作れるので、最初の credit で `fee_mint` を固定し、別の mint で quote された market での `PlaceOrderWithBuilder` は拒否し、`ClaimBuilderFees` は `fee_mint` の fee vault からしか払わない。この固定がないと、価値のない mint で quote された market で稼いだ手数料を、同じ数量だけ USDC の fee vault から claim できてしまう(`tests/builder_fee_mint.rs`)。
+- **Quote 単位での手数料蓄積。** `accumulated_fees` はプロトコル手数料が取られる quote 通貨で計上される。複数 quote 通貨（USDC と USDT）なら、設計は (builder, mint) ごとの profile が必要、builder ごとだけではなく。ここは意図的に単一 quote に保つ、プログラムの残りも単一 quote なので。プログラムはこれを強制する。誰でも任意の quote mint で market を作れるので、builder が `RegisterBuilder`(アカウント 3、builder が署名)で `fee_mint` を決め、別の mint で quote された market での `PlaceOrderWithBuilder` は拒否し、`ClaimBuilderFees` は `fee_mint` の fee vault からしか払わない。この固定がないと、価値のない mint で quote された market で稼いだ手数料を、同じ数量だけ USDC の fee vault から claim できてしまう(`tests/builder_fee_mint.rs`)。最初の credit ではなく登録時に決めるのは、`PlaceOrderWithBuilder` に署名するのはトレーダーで builder ではないからだ。最初の credit で固定すると、誰でも他人の profile を価値のない mint に固定できてしまう。
 
 > **演習 §13.1.** あるフロントエンドが `max_fee_share_bps = 3000` で登録する。3 つの取引が経由する: notional 1000、2500、700。`PROTOCOL_FEE_BPS = 10`（0.1%）で、3 取引すべての後の `accumulated_fees` 合計は?
 
@@ -286,9 +286,9 @@ Builder ライフサイクル:
 
 前提: quote mint の fee vault をブートストラップ（`builder --create-fee-vault --mint <quote_mint>`）し、トレーダが funded な quote-token アカウントを持つことを確認すること。さもなくば手数料 Transfer が revert する。
 
-1. **キャップが正しく積み重なる。** `--max-share-bps 9999` で builder を登録する。ハンドラはクランプをログし、ダンプは `max_fee_share_bps = 5000`（本書の `PROTOCOL_BUILDER_SHARE_CAP_BPS`）を示すはずだ。次に取引をその builder 経由でルートする — builder のシェアはちょうどプロトコル手数料の 50% のはずだ。
+1. **キャップが正しく積み重なる。** `--max-share-bps 9999 --mint <quote_mint>` で builder を登録する。ハンドラはクランプをログし、ダンプは `max_fee_share_bps = 5000`（本書の `PROTOCOL_BUILDER_SHARE_CAP_BPS`）を示すはずだ。次に取引をその builder 経由でルートする — builder のシェアはちょうどプロトコル手数料の 50% のはずだ。
 2. **失敗下でアトミシティが保たれる。** シミュレートされた失敗を使う: stale なオラクルで `PlaceOrderWithBuilder` を試す（注文配置が失敗する）。シミュレーションは `oracle stale` で失敗し、**かつ**失敗 sim 後、builder profile の `accumulated_fees` は不変、fee vault の残高は不変、トレーダの quote-token アカウントも不変のはずだ（トランザクション全体が revert するので）。取引が起きない限り分割は起きない。
-3. **取引ごとに volume が蓄積する。** 同じ builder 経由で 5 つの注文をサイズ 10、20、30、40、50 で配置する。`total_volume` はちょうど 150 （10+20+30+40+50）のはずだ。`accumulated_fees` が `(notional_total × PROTOCOL_FEE_BPS × share_bps / 10000 / 10000)` に加算されないなら、数学に off-by-one がある — それを追いかけよ。その後 `--claim --builder-token-account <pubkey>` を走らせる。Builder の quote-token アカウント残高は `accumulated_fees` ぶんちょうど増え、ダンプは `accumulated_fees = 0` を示すはずだ。
+3. **取引ごとに volume が蓄積する。** 同じ builder 経由で 5 つの注文をサイズ 10、20、30、40、50 で配置する。`total_volume` はちょうど 150 （10+20+30+40+50）のはずだ。`accumulated_fees` が `(notional_total × PROTOCOL_FEE_BPS × share_bps / 10000 / 10000)` に加算されないなら、数学に off-by-one がある — それを追いかけよ。その後 `--claim --mint <fee_mint> --builder-token-account <pubkey>` を走らせる(ダンプが `fee_mint` を表示する)。Builder の quote-token アカウント残高は `accumulated_fees` ぶんちょうど増え、ダンプは `accumulated_fees = 0` を示すはずだ。
 
 ---
 

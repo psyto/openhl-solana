@@ -118,6 +118,7 @@ behaves on Solana against an EVM perp by running scenarios rather than reading c
 
 - Not Anchor. Every program uses `entrypoint!`, `AccountInfo`, and manual deserialization. Anchor is the abstraction this engine deliberately avoids — partly so byte layouts are pinned, partly so CU costs are inspectable without an abstraction tax.
 - Not production. No mainnet deployment, no fee capture, no governance, no keeper infra. The `match` instruction deliberately omits settlement transfers from the hot path; the mock oracle is open-auth; the `Stats` singleton is included as a parallelism counter-example, not a recommendation.
+- No upgrade path for old state. The program isn't deployed anywhere, and account layouts and instruction account lists change without migrations — for example the per-vault trading-vault token account, `BuilderProfile.fee_mint` with `RegisterBuilder`'s new mint account, and OpenPosition's quote-mint check. Deploy a fresh program; don't upgrade one that holds state created by an older version (old trading vaults, builder profiles without a fee mint, or positions opened in another mint would be stranded or unchecked).
 - Not a Solana tutorial. The depth-and-learning surface for Solana internals lives on SolDojo; this repo is product-facing. SolDojo imports some of this code as worked examples, but the curriculum framing is theirs — see [Curriculum companion](#curriculum-companion-separate-audience) for the boundary.
 
 ### Design choices worth noting

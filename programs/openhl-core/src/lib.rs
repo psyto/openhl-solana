@@ -3880,6 +3880,8 @@ const CLAIM_BUILDER_FEES_PAYLOAD_LEN: usize = 0;
 ///   0. `[WRITE, SIGNER]` payer        — also implicitly the builder
 ///   1. `[WRITE]`         builder_profile — PDA at [b"builder", payer]
 ///   2. `[]`              system_program
+///   3. `[]`              mint            — quote mint the builder's fees are earned
+///                                          and claimed in (fixed for the profile)
 fn process_register_builder(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -3901,11 +3903,16 @@ fn process_register_builder(
     let payer_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
     let profile_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let system_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let mint_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
 
     if !payer_ai.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
     if system_ai.key != &system_program::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if mint_ai.owner != &SPL_TOKEN_PROGRAM_ID {
+        msg!("register_builder: mint not owned by SPL Token");
         return Err(ProgramError::IncorrectProgramId);
     }
 
@@ -3939,7 +3946,7 @@ fn process_register_builder(
     profile.max_fee_share_bps = max_share;
     profile.accumulated_fees = 0;
     profile.total_volume = 0;
-    profile.fee_mint = [0u8; 32];
+    profile.fee_mint.copy_from_slice(mint_ai.key.as_ref());
 
     msg!(
         "register_builder: registered {} with max_fee_share_bps={}",
@@ -4069,12 +4076,10 @@ fn process_place_order_with_builder(
             return Err(ProgramError::UninitializedAccount);
         }
         // accumulated_fees is a bare number of quote units, and anyone can
-        // create a market with any quote mint. Pin the profile to the mint
-        // of its first credit so fees earned in one mint can't be claimed
-        // from another mint's fee vault.
-        if profile.fee_mint == [0u8; 32] {
-            profile.fee_mint.copy_from_slice(mint_ai.key.as_ref());
-        } else if profile.fee_mint != *mint_ai.key.as_ref() {
+        // create a market with any quote mint. The builder fixed its fee
+        // mint at registration; credit only orders quoted in it, so fees
+        // earned in one mint can't be claimed from another mint's vault.
+        if profile.fee_mint != *mint_ai.key.as_ref() {
             msg!("place_order_with_builder: builder profile earns fees in another mint");
             return Err(ProgramError::InvalidAccountData);
         }
@@ -4221,7 +4226,7 @@ fn process_claim_builder_fees(
             msg!("claim_builder_fees: caller is not the registered builder");
             return Err(ProgramError::IllegalOwner);
         }
-        if profile.accumulated_fees > 0 && profile.fee_mint != *mint_ai.key.as_ref() {
+        if profile.fee_mint != *mint_ai.key.as_ref() {
             msg!("claim_builder_fees: fees were earned in another mint");
             return Err(ProgramError::InvalidAccountData);
         }

@@ -7,8 +7,11 @@
 //!                                               quote_mint. Run once per
 //!                                               cluster before any
 //!                                               place-order variant.
-//!   --register --max-share-bps <u64>          → RegisterBuilder (tag 23)
-//!                                               (registers --payer as builder)
+//!   --register --max-share-bps <u64>
+//!              --mint <pubkey>                → RegisterBuilder (tag 23)
+//!                                               (registers --payer as builder;
+//!                                               fees are earned and claimed
+//!                                               only in --mint)
 //!   --place-with-builder --builder <pubkey>
 //!                        --market <pubkey>
 //!                        --mint <pubkey>
@@ -80,8 +83,8 @@ struct Cli {
     #[arg(long)]
     claim: bool,
 
-    /// Quote mint. Required for --create-fee-vault, --place-with-builder,
-    /// --claim.
+    /// Quote mint. Required for --create-fee-vault, --register (the
+    /// builder's fee mint), --place-with-builder, --claim.
     #[arg(long)]
     mint: Option<String>,
 
@@ -158,6 +161,7 @@ fn main() -> Result<()> {
         send(&client, &payer, ix)?;
     } else if cli.register {
         let max = cli.max_share_bps.unwrap();
+        let mint = require_mint(&cli)?;
         let mut data = Vec::with_capacity(1 + 8);
         data.push(23u8);
         data.extend_from_slice(&max.to_le_bytes());
@@ -167,6 +171,7 @@ fn main() -> Result<()> {
                 AccountMeta::new(payer.pubkey(), true),
                 AccountMeta::new(profile_pda, false),
                 AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(mint, false),
             ],
             data,
         };
@@ -263,6 +268,7 @@ fn main() -> Result<()> {
             println!("  max_fee_share_bps:  {}", profile.max_fee_share_bps);
             println!("  accumulated_fees:   {}", profile.accumulated_fees);
             println!("  total_volume:       {}", profile.total_volume);
+            println!("  fee_mint:           {}", Pubkey::new_from_array(profile.fee_mint));
         }
         _ => println!("  (profile does not exist yet)"),
     }

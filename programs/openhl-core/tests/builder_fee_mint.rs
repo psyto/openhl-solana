@@ -1,23 +1,23 @@
 //! Builder fees are a bare number of quote units and anyone can create a
-//! market with any quote mint, so a profile is pinned to the mint of its
-//! first credit: fees earned in a worthless mint can't be claimed from
-//! another mint's fee vault. Each case runs the real handler natively
-//! (CPIs and the clock are stubbed).
+//! market with any quote mint, so a builder fixes its fee mint when it
+//! registers: only orders quoted in that mint credit the profile, and fees
+//! are claimed only from that mint's fee vault. Each case runs the real
+//! handler natively (CPIs, the clock and rent are stubbed).
 
 use bytemuck::Zeroable;
 use openhl_core::{
-    process_instruction, BOOK_SEED, FEE_VAULT_AUTH_SEED, FEE_VAULT_SEED, ORACLE_SEED,
-    SPL_TOKEN_PROGRAM_ID,
+    process_instruction, BOOK_SEED, BUILDER_PROFILE_SEED, FEE_VAULT_AUTH_SEED, FEE_VAULT_SEED,
+    ORACLE_SEED, SPL_TOKEN_PROGRAM_ID,
 };
 use openhl_state::*;
 use solana_program::{
     account_info::AccountInfo, clock::Clock, entrypoint::ProgramResult, instruction::Instruction,
-    program_error::ProgramError, program_stubs, pubkey::Pubkey,
+    program_error::ProgramError, program_stubs, pubkey::Pubkey, rent::Rent, system_program,
 };
 
 const NOW_SLOT: u64 = 1_000;
 
-/// Clock at NOW_SLOT; every CPI succeeds.
+/// Clock at NOW_SLOT, default rent; every CPI succeeds.
 struct Stubs;
 impl program_stubs::SyscallStubs for Stubs {
     fn sol_get_clock_sysvar(&self, var_addr: *mut u8) -> u64 {
@@ -26,6 +26,10 @@ impl program_stubs::SyscallStubs for Stubs {
             ..Clock::default()
         };
         unsafe { *(var_addr as *mut Clock) = clock };
+        0
+    }
+    fn sol_get_rent_sysvar(&self, var_addr: *mut u8) -> u64 {
+        unsafe { *(var_addr as *mut Rent) = Rent::default() };
         0
     }
     fn sol_invoke_signed(
@@ -169,25 +173,61 @@ fn place(p: BuilderProfile, quote: &Pubkey) -> (ProgramResult, BuilderProfile) {
     (r, after)
 }
 
-#[test]
-fn first_credit_pins_the_profile_to_its_mint() {
-    stubs();
-    let builder = Pubkey::new_unique();
-    let junk = Pubkey::new_unique();
-    let (r, after) = place(profile(&builder, 0, None), &junk);
-    assert_eq!(r, Ok(()));
-    assert!(after.accumulated_fees > 0);
-    assert_eq!(after.fee_mint, junk.to_bytes());
-
-    // A later order on a market quoted in another mint is refused.
-    let (r, _) = place(after, &Pubkey::new_unique());
-    assert_eq!(r, Err(ProgramError::InvalidAccountData));
-    // Same mint keeps accruing.
-    assert_eq!(place(after, &junk).0, Ok(()));
+/// RegisterBuilder (tag 23) with `fee_mint`; returns the new profile.
+fn register(builder: &Pubkey, fee_mint: &Pubkey) -> (ProgramResult, BuilderProfile) {
+    let program_id = Pubkey::new_unique();
+    let pid = &program_id;
+    let mut accs = vec![
+        signer(*builder),
+        acc(
+            pda(&[BUILDER_PROFILE_SEED, builder.as_ref()], pid),
+            *pid,
+            vec![0u8; BuilderProfile::LEN],
+        ),
+        acc(system_program::ID, Pubkey::default(), vec![]),
+        acc(*fee_mint, SPL_TOKEN_PROGRAM_ID, vec![]),
+    ];
+    let mut ix = vec![23u8];
+    ix.extend_from_slice(&3000u64.to_le_bytes());
+    let r = run(pid, &mut accs, &ix);
+    let after = *bytemuck::from_bytes::<BuilderProfile>(&accs[1].data);
+    (r, after)
 }
 
 #[test]
-fn fees_are_claimed_only_from_the_mint_they_were_earned_in() {
+fn registration_fixes_the_fee_mint() {
+    stubs();
+    let builder = Pubkey::new_unique();
+    let usdc = Pubkey::new_unique();
+    let (r, p) = register(&builder, &usdc);
+    assert_eq!(r, Ok(()));
+    assert_eq!(p.fee_mint, usdc.to_bytes());
+}
+
+#[test]
+fn only_orders_quoted_in_the_fee_mint_credit_the_profile() {
+    stubs();
+    let builder = Pubkey::new_unique();
+    let usdc = Pubkey::new_unique();
+    let (r, after) = place(profile(&builder, 0, Some(&usdc)), &usdc);
+    assert_eq!(r, Ok(()));
+    assert!(after.accumulated_fees > 0);
+    // A market quoted in another (say, worthless) mint is refused, so
+    // nobody can credit the profile in it, or pin it to it.
+    assert_eq!(
+        place(profile(&builder, 0, Some(&usdc)), &Pubkey::new_unique()).0,
+        Err(ProgramError::InvalidAccountData)
+    );
+    // A profile with no fee mint takes no credit.
+    let junk = Pubkey::new_unique();
+    assert_eq!(
+        place(profile(&builder, 0, None), &junk).0,
+        Err(ProgramError::InvalidAccountData)
+    );
+}
+
+#[test]
+fn fees_are_claimed_only_from_the_fee_mint() {
     stubs();
     let builder = Pubkey::new_unique();
     let junk = Pubkey::new_unique();
@@ -195,6 +235,12 @@ fn fees_are_claimed_only_from_the_mint_they_were_earned_in() {
     assert_eq!(claim(profile(&builder, 500, Some(&junk)), &junk), Ok(()));
     assert_eq!(
         claim(profile(&builder, 500, Some(&junk)), &usdc),
+        Err(ProgramError::InvalidAccountData)
+    );
+    // A profile with no fee mint (or a balance from before the fee mint
+    // existed) can't be claimed from any vault.
+    assert_eq!(
+        claim(profile(&builder, 500, None), &usdc),
         Err(ProgramError::InvalidAccountData)
     );
 }
