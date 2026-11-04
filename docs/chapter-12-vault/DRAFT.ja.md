@@ -1,7 +1,7 @@
 # 第12章 — ネイティブ Vault プログラム（プール取引）
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`TradingVault`、`VaultShare`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_trading_vault` 3402–3480 行、`process_vault_deposit` 3494–3655 行、`process_vault_withdraw` 3669–3786 行、`process_vault_update_nav` 3793–3833 行）、[`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs)、[`fuzz/vault/src/main.rs`](../../fuzz/vault/src/main.rs)(§12.7 の solinv ハーネス)。
+> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`TradingVault`、`VaultShare`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_trading_vault` 3402–3480 行、`process_vault_deposit` 3494–3655 行、`process_vault_withdraw` 3669–3793 行、`process_vault_update_nav` 3800–3840 行）、[`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs)、[`fuzz/vault/src/main.rs`](../../fuzz/vault/src/main.rs)（§12.7 の solinv ハーネス）。
 
 ---
 
@@ -159,7 +159,7 @@ new_NAV_per_share = (total_assets - shares_burned × total_assets / total_shares
 
 withdrawal も不変条件を保つ。
 
-**NAV 更新。** `lib.rs:3823–3824` の `process_vault_update_nav` から:
+**NAV 更新。** `lib.rs:3830–3831` の `process_vault_update_nav` から:
 
 ```rust
 let prev = vault.total_assets;
@@ -262,7 +262,9 @@ if share.vault != *vault_ai.key.as_ref() {
 }
 ```
 
-deposit にはこの行は要らない。share の PDA を `[VAULT_SHARE_SEED, vault, depositor]` から導き直すので、別の vault の share は seed の照合で落ちる。withdraw は導き直さない。この章の最初の版はこの比較を書き忘れていた。害がなさそうに見えるが、市場の `TradingVault` はすべて**同じ** (market, mint) ごとのトークン口座から払い出す。だから誰でも、市場に自分の vault を開いて NAV を 1 と申告し、2 トークン入れて 200,000 shares を受け取り、その shares を他人の vault に対して burn できる。再現テストでは、相手の vault の 200,000 トークン全部(他の預金者の分も含む)を持ち出せた。この穴を見つけたのはレビュアーではなく solinv である。§12.7 では同じやり方で見つけてもらう。
+deposit にはこの行は要らない。share の PDA を `[VAULT_SHARE_SEED, vault, depositor]` から導き直すので、別の vault の share は seed の照合で落ちる。withdraw は導き直さない。この章の最初の版はこの比較を書き忘れていた。害がなさそうに見えるが、市場の `TradingVault` はすべて**同じ** (market, mint) ごとのトークン口座から払い出し、vault ごとに share の値段は違う。誰も嘘をつかなくても違う。好調な月のあと vault X の share が 1、vault Y の share が 2 なら、X の share を Y に対して burn した人は、入れた額の 2 倍を Y の預金者の分から受け取る。マネージャが嘘をつけば、さらに悪くなる。再現テストでは、自分の vault を 100,000 トークンで開いて NAV を 1 と申告し、さらに 2 トークン入れて新しい share を 200,000 受け取り、それを別の vault に対して burn した。相手の vault の 200,000 トークン全部(他の預金者の分も含む)を持ち出せた。この穴を見つけたのはレビュアーではなく solinv である。§12.7 では同じやり方で見つけてもらう。
+
+この検査だけで市場が安全になるわけではない。§12.5 で示すとおり、マネージャの NAV は今も全 vault のトークンに届き、マネージャには誰でもなれる。
 
 **残高十分性チェック**:
 
@@ -322,7 +324,7 @@ seeds が `vault_authority_ai.key` に等しいアドレスの有効な PDA を�
 
 ## §12.5  マネージャ信用問題 — `VaultUpdateNAV`
 
-3793–3833 行の `process_vault_update_nav` は短いが、ここに vault モデル全体の信用前提が住む:
+3800–3840 行の `process_vault_update_nav` は短いが、ここに vault モデル全体の信用前提が住む:
 
 ```rust
 if vault.manager != *manager_ai.key.as_ref() {
@@ -336,7 +338,7 @@ vault.total_assets = new_total_assets;
 
 マネージャは `total_assets` を任意の数値に更新するトランザクションに署名する。この数値がマネージャの実際の取引 PnL を反映していることをオンチェーンで検証する仕組みはない。**預金者はマネージャを信用する**。
 
-このコードベースでは、それより悪い。**市場の全員が、全部のマネージャを**信用している。withdraw は (market, mint) ごとのトークン口座から払い出し、その口座には他の vault の預け入れも、全ポジションの証拠金も入っている。vault の払い出しを、その vault が入れた額で止めるものは何もない。自分の vault に 100,000 入れ、NAV を 300,000 と申告して withdraw すると、300,000 が出てくる。`fuzz/vault` のテスト `manager_cannot_withdraw_more_than_its_vault_holds` がそれを示しており、トークン口座は 0 になった。穴が開いたままなので、このテストには `#[ignore]` をつけてある。塞ぐには vault ごとにトークン口座を持たせる必要があり(seed `[VAULT_SEED, vault]`)、vault のトークンを動かすハンドラ全部が変わる。これは 1 行の抜けではなく設計の変更なので、§13.5 の本番 escrow と同じく宿題に残す。下の 3 パターンは vault 自身の預金者を守るが、この穴は消さない。
+このコードベースでは、それより悪い。**市場の全員が、全部のマネージャを**信用している。しかも `CreateTradingVault` を使えば誰でもマネージャになれる。withdraw は (market, mint) ごとのトークン口座から払い出し、その口座には他の vault の預け入れも、全ポジションの証拠金も入っている。vault の払い出しを、その vault が入れた額で止めるものは何もない。自分の vault に 100,000 入れ、NAV を 300,000 と申告して withdraw すると、300,000 が出てくる。`fuzz/vault` のテスト `manager_cannot_withdraw_more_than_its_vault_holds` がそれを示しており、トークン口座は 0 になった。穴が開いたままなので、このテストには `#[ignore]` をつけてある。塞ぐには vault ごとにトークン口座を持たせる必要があり(seed `[VAULT_SEED, vault]`)、vault のトークンを動かすハンドラ全部が変わる。これは 1 行の抜けではなく設計の変更なので、vault の取引の半分(§12.0)と同じく宿題に残す。下の 3 パターンは vault 自身の預金者を守るが、この穴は消さない。
 
 本番でこれを硬化する 3 つのパターン:
 
@@ -454,14 +456,18 @@ timeout -s INT 90 crucible run openhl_vault_fuzz invariant_vault \
 > | withdraw: `owner.is_signer` | はい、signer-skip、slot 0 |
 > | withdraw: `share.vault == vault` | はい、account-swap、slot 1 |
 > | withdraw: `share.owner == owner` | はい、account-swap、slot 2 |
-> | deposit: share の PDA の導き直し | はい、account-swap、slot 1 と 7 |
+> | deposit: share の PDA の導き直し | はい、account-swap、slot 1 |
 > | deposit: `verify_vault_token_account` | はい、account-swap、slot 7 |
 > | deposit: `depositor.is_signer` | いいえ |
 > | withdraw: `vault.owner == program_id` | いいえ |
 > | withdraw: `share.owner == program_id` | いいえ |
-> | withdraw: `verify_vault_token_account` | いいえ |
+> | withdraw: `verify_vault_token_account` | **いいえ、ただし穴がある**(下を見よ) |
 >
-> 先を読む前に、最後の 4 つが「いいえ」になる理由を考えよ。以下は私たちの読みである。攻撃を試してはおらず、通り道が見つからなかっただけだ。2 つの所有者チェックは、ランタイム自身が裏で支えている(第 1 章)。withdraw は両方のアカウントに書き込み、プログラムは自分が所有していないアカウントを変えられないので、すり替えたアカウントはどのみち命令の最後で落ちる。残りの 2 つは SPL Token が支えている(第 6 章)。deposit は預金者の口座からトークンを動かすので預金者の署名が要り、withdraw は `vault_authority` の PDA の権限で `vault_token` から引き落とすが、この PDA は他のどのトークン口座の権限者でもない。早く、分かりやすいエラーで落ちるので、検査として残す価値はある。ただ、消しても穴は開かない。
+> 先を読む前に、最後の 4 つが「いいえ」になる理由を考えよ。4 つは同じではない。
+>
+> 3 つは、別の仕組みが裏で支えている。これらは攻撃を試しておらず、通り道が見つからなかっただけだ。2 つの所有者チェックは、ランタイム自身が支えている(第 1 章)。withdraw は両方のアカウントに書き込み、プログラムは自分が所有していないアカウントを変えられないので、すり替えたアカウントは次の CPI か命令の最後で落ちる。deposit の署名チェックは SPL Token が支えている(第 6 章)。deposit は預金者の口座からトークンを動かすので、預金者の署名が要る。この 3 つも、早く、分かりやすいエラーで落ちるので、検査として残す価値はある。
+>
+> 4 つ目は本物の穴で、fuzzer は見逃す。`vault_authority` の PDA の seed は `[VAULT_AUTH_SEED, market]` なので、この PDA は**どの** mint についても、市場のトークン口座の持ち主になる。`CreateVault`(第 6 章)を使えば誰でも任意の mint の口座を作れ、`CreateTradingVault` を使えば誰でもそこに vault を開ける。検査がないと、C は屑の mint で vault を開き、屑トークンを 300,000 入れて引き出す。その引き出しで、払い出し元に本物の mint のトークン口座を、送り先に C 自身の本物の mint の口座を指定する。C は屑 300,000 を本物 300,000 に換え、口座を空にした。これは**2 つ**のアカウントを同時に変える必要があり、solinv の account-swap は 1 度に 1 つの slot しか変えない。テスト `withdraw_refuses_the_token_account_of_another_mint` がこれを押さえている。fuzzer の「いいえ」は、通り道が見つからなかったという意味でしかない。通り道がないという意味ではない。
 >
 > このハーネスが扱わないもの: §12.5 のマネージャが申告する NAV。嘘の NAV を申告するマネージャは、自分が渡してよいアカウントしか渡さないので、アカウントを差し替える fuzzer には差し替える物がない。§12.5 の穴は、9 つの検査がすべてそろっていても開いたままである。見つけるには、行を消すのではなく設計を読む必要があった。
 

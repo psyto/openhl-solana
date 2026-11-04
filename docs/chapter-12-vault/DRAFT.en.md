@@ -1,7 +1,7 @@
 # Chapter 12 — Native Vault Program (Pooled Trading)
 
 > Status: draft (v0.1).
-> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`TradingVault`, `VaultShare`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_trading_vault` 3402–3480, `process_vault_deposit` 3494–3655, `process_vault_withdraw` 3669–3786, `process_vault_update_nav` 3793–3833), [`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs), [`fuzz/vault/src/main.rs`](../../fuzz/vault/src/main.rs) (the solinv harness for §12.7).
+> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`TradingVault`, `VaultShare`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_trading_vault` 3402–3480, `process_vault_deposit` 3494–3655, `process_vault_withdraw` 3669–3793, `process_vault_update_nav` 3800–3840), [`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs), [`fuzz/vault/src/main.rs`](../../fuzz/vault/src/main.rs) (the solinv harness for §12.7).
 
 ---
 
@@ -161,7 +161,7 @@ new_NAV_per_share = (total_assets - shares_burned × total_assets / total_shares
 
 Withdrawal also preserves the invariant.
 
-**NAV update.** From `process_vault_update_nav` at `lib.rs:3823–3824`:
+**NAV update.** From `process_vault_update_nav` at `lib.rs:3830–3831`:
 
 ```rust
 let prev = vault.total_assets;
@@ -244,7 +244,7 @@ Simpler than deposit because there's nothing to create — but it does pay out t
 
 **Compute assets to return** at lines 3729–3736 — the inverse of the deposit formula, as covered in §12.2.
 
-**Authorization** at lines 3744–3747:
+**Authorization** at lines 3751–3754:
 
 ```rust
 if share.owner != *owner_ai.key.as_ref() {
@@ -264,9 +264,11 @@ if share.vault != *vault_ai.key.as_ref() {
 }
 ```
 
-Deposit never needed this line: it re-derives the share PDA from `[VAULT_SHARE_SEED, vault, depositor]`, so a share of another vault fails the seed check. Withdraw does not re-derive it, and the first version of this chapter left the comparison out. It looked harmless, but every `TradingVault` in a market pays out of the *same* per-(market, mint) token account. So anyone can open their own vault in the market, report its NAV as 1, deposit 2 tokens for 200,000 shares, and burn those shares against someone else's vault. In the test that reproduces it, that took all 200,000 tokens of the other vault, other depositors' included. solinv found the gap, not a reviewer; §12.7 has you find it the same way.
+Deposit never needed this line: it re-derives the share PDA from `[VAULT_SHARE_SEED, vault, depositor]`, so a share of another vault fails the seed check. Withdraw does not re-derive it, and the first version of this chapter left the comparison out. It looked harmless, but every `TradingVault` in a market pays out of the *same* per-(market, mint) token account, and vaults' share prices differ. They differ honestly, too, with no one lying: if vault X's shares are worth 1 and vault Y's are worth 2 after a good month, a holder of X shares who burns them against Y gets twice what they put in, paid out of Y's depositors. A manager who lies makes it worse. The regression test opens its own vault with 100,000 tokens, reports NAV 1, deposits 2 more for 200,000 new shares, and burns them against another vault: that took all 200,000 tokens of the other vault, other depositors' included. solinv found the gap, not a reviewer; §12.7 has you find it the same way.
 
-**Sufficient-balance check** at lines 3748–3755:
+This check does not make the market safe on its own. §12.5 shows that a manager's NAV still reaches every vault's tokens, and anyone can be a manager.
+
+**Sufficient-balance check** at lines 3755–3762:
 
 ```rust
 if share.shares < shares_to_burn {
@@ -276,7 +278,7 @@ if share.shares < shares_to_burn {
 
 You can't burn more shares than you hold.
 
-**Cost basis reduction** at lines 3760–3762:
+**Cost basis reduction** at lines 3767–3769:
 
 ```rust
 let basis_reduction = (((shares_to_burn as u128) * (share.cost_basis as u128))
@@ -324,7 +326,7 @@ If the seeds don't form a valid PDA whose address equals `vault_authority_ai.key
 
 ## §12.5  The manager-trust problem — `VaultUpdateNAV`
 
-`process_vault_update_nav` at lines 3793–3833 is short, but it is where the entire vault model's trust assumption lives:
+`process_vault_update_nav` at lines 3800–3840 is short, but it is where the entire vault model's trust assumption lives:
 
 ```rust
 if vault.manager != *manager_ai.key.as_ref() {
@@ -338,7 +340,7 @@ vault.total_assets = new_total_assets;
 
 The manager signs a transaction that updates `total_assets` to whatever number they choose. There is no on-chain verification that this number reflects the manager's actual trading PnL. **The depositors trust the manager.**
 
-In this codebase it is worse than that: *everyone in the market* trusts *every* manager. Withdrawals pay out of the per-(market, mint) token account, which also holds every other vault's deposits and every position's collateral. Nothing caps a vault's payout at what that vault put in. A manager who deposits 100,000 into their own vault, reports NAV 300,000 and withdraws gets 300,000 out. The test `manager_cannot_withdraw_more_than_its_vault_holds` in `fuzz/vault` shows it: it drained the token account to 0. It is marked `#[ignore]` because the hole is open. Closing it takes one token account per vault (seeds `[VAULT_SEED, vault]`), which changes every handler that moves the vault's tokens. That is a design change, not a missing line, and is left as homework, like §13.5's production escrow. The three patterns below protect a vault's own depositors. They do not remove this one.
+In this codebase it is worse than that: *everyone in the market* trusts *every* manager, and `CreateTradingVault` lets anyone become one. Withdrawals pay out of the per-(market, mint) token account, which also holds every other vault's deposits and every position's collateral. Nothing caps a vault's payout at what that vault put in. A manager who deposits 100,000 into their own vault, reports NAV 300,000 and withdraws gets 300,000 out. The test `manager_cannot_withdraw_more_than_its_vault_holds` in `fuzz/vault` shows it: it drained the token account to 0. It is marked `#[ignore]` because the hole is open. Closing it takes one token account per vault (seeds `[VAULT_SEED, vault]`), which changes every handler that moves the vault's tokens. That is a design change, not a missing line, and is left as homework, like the vault's trading half (§12.0). The three patterns below protect a vault's own depositors. They do not remove this one.
 
 Three patterns to harden this in production:
 
@@ -456,14 +458,18 @@ On the program as it is, no `[FUZZ_FINDING]` line appears. (Crucible checks `--t
 > | withdraw: `owner.is_signer` | yes, signer-skip, slot 0 |
 > | withdraw: `share.vault == vault` | yes, account-swap, slot 1 |
 > | withdraw: `share.owner == owner` | yes, account-swap, slot 2 |
-> | deposit: the share PDA re-derivation | yes, account-swap, slots 1 and 7 |
+> | deposit: the share PDA re-derivation | yes, account-swap, slot 1 |
 > | deposit: `verify_vault_token_account` | yes, account-swap, slot 7 |
 > | deposit: `depositor.is_signer` | no |
 > | withdraw: `vault.owner == program_id` | no |
 > | withdraw: `share.owner == program_id` | no |
-> | withdraw: `verify_vault_token_account` | no |
+> | withdraw: `verify_vault_token_account` | **no, but it is a hole** — see below |
 >
-> Before reading on, work out why the last four come back "no". Here is our reading. We did not try to exploit them; we only found no way through. The two owner checks are backed by the runtime itself (Chapter 1): withdraw writes both accounts, and a program cannot change an account it does not own, so a substituted account fails at the end of the instruction anyway. The two remaining checks are backed by SPL Token (Chapter 6): a deposit moves tokens out of the depositor's account, which needs the depositor's signature, and a withdraw debits `vault_token` under the `vault_authority` PDA, which is the authority of no other token account. They are still worth keeping, because they fail earlier and with a clearer error. But deleting them does not open a hole.
+> Before reading on, work out why the last four come back "no". They are not alike.
+>
+> Three of them are backed by something else. We did not try to exploit these, we only found no way through. The two owner checks are backed by the runtime itself (Chapter 1): withdraw writes both accounts, and a program cannot change an account it does not own, so a substituted account fails at the next CPI or at the end of the instruction. The deposit signer check is backed by SPL Token (Chapter 6): deposit moves tokens out of the depositor's account, which needs the depositor's signature. These three are still worth keeping, because they fail earlier and with a clearer error.
+>
+> The fourth is a real hole, and the fuzzer misses it. The `vault_authority` PDA has seeds `[VAULT_AUTH_SEED, market]`, so it owns the market's token account for *every* mint. `CreateVault` (Chapter 6) lets anyone create one for any mint, and `CreateTradingVault` lets anyone open a vault in it. Without the check, C opens a vault in a junk mint, deposits 300,000 junk tokens, and withdraws them. The withdrawal names the real mint's token account as the source and C's own real-mint account as the destination. C swapped 300,000 junk for 300,000 real and emptied the account. That takes *two* accounts changed together, and solinv's account-swap changes one slot at a time. The test `withdraw_refuses_the_token_account_of_another_mint` covers it. A "no" from a fuzzer means only that it did not find a way through. It does not mean there is none.
 >
 > What the harness does not cover: §12.5's manager-reported NAV. A manager who reports a false NAV passes only accounts they are entitled to pass, so a fuzzer that swaps accounts has nothing to swap. The hole §12.5 describes stays open with all nine checks in place. Finding it took reading the design, not deleting lines.
 

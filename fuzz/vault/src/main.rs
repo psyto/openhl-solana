@@ -150,6 +150,16 @@ impl VaultFixture {
         self.send(ix, &[&*who], what);
     }
 
+    /// Sends `ix` and returns whether it succeeded, with the outcome's
+    /// Debug text (it includes the program logs) to assert on.
+    fn send_logged(&mut self, ix: Instruction, signer: Arc<Keypair>) -> (bool, String) {
+        let payer = Arc::clone(&self.payer);
+        match self.ctx.raw_call(ix).fee_payer(&*payer).signers(&[&*payer, &*signer]).send() {
+            Ok(o) => (o.is_success(), format!("{o:?}")),
+            Err(e) => (false, format!("{e:?}")),
+        }
+    }
+
     fn send_ok(&mut self, ix: Instruction, signer: Arc<Keypair>) -> bool {
         let payer = Arc::clone(&self.payer);
         self.ctx
@@ -381,10 +391,63 @@ mod tests {
         let mut accounts = f.withdraw_metas(&vault, &a.pubkey(), &a_ata);
         accounts[2] = AccountMeta::new(share(&a_vault, &a.pubkey()), false);
         let ix = Instruction { program_id: CORE_ID, accounts, data: amount_data(IX_VAULT_WITHDRAW, 2 * START_DEPOSIT) };
-        let ok = f.send_ok(ix, Arc::clone(&a));
+        let (ok, out) = f.send_logged(ix, Arc::clone(&a));
         let taken = f.ctx.token_balance(&a_ata) - before;
         let left = f.ctx.token_balance(&vault_token(&market, &mint));
         assert!(!ok, "withdraw from K's vault with A's other share succeeded: A took {taken}, {left} left in the token account");
+        assert!(out.contains("share belongs to another vault"), "refused for another reason: {out}");
+    }
+
+    /// CreateVault (tag 5) lets anyone create the market's token account for
+    /// any mint, and the vault authority PDA is the owner of all of them. So
+    /// C opens a vault in a junk mint, deposits junk, and withdraws naming
+    /// the real mint's token account as the source and its own real-mint
+    /// account as the destination. Two accounts change together, which
+    /// solinv's one-slot account-swap does not try.
+    #[test]
+    fn withdraw_refuses_the_token_account_of_another_mint() {
+        let mut f = VaultFixture::setup();
+        let (market, mint) = (f.market, f.mint);
+        let c = Arc::new(Keypair::new());
+        f.ctx.create_account().pubkey(c.pubkey()).lamports(10_000_000_000).owner(SYSTEM_ID).create().unwrap();
+        let junk = Keypair::new().pubkey();
+        let (c_junk, c_real) = (Keypair::new().pubkey(), Keypair::new().pubkey());
+        f.put(junk, token(), mint_data(6));
+        // What CreateVault would create for the junk mint.
+        f.put(vault_token(&market, &junk), token(), token_account_data(&junk, &vault_auth(&market), 0));
+        f.put(c_junk, token(), token_account_data(&junk, &c.pubkey(), 3 * START_DEPOSIT));
+        f.put(c_real, token(), token_account_data(&mint, &c.pubkey(), 0));
+
+        let c_vault = trading_vault(&market, &c.pubkey());
+        let payer = f.payer.pubkey();
+        let ix = Instruction {
+            program_id: CORE_ID,
+            accounts: vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new_readonly(c.pubkey(), true),
+                AccountMeta::new_readonly(junk, false),
+                AccountMeta::new(c_vault, false),
+                AccountMeta::new_readonly(SYSTEM_ID, false),
+            ],
+            data: vec![IX_CREATE_TRADING_VAULT],
+        };
+        f.send(ix, &[&*c], "C opens a junk-mint vault");
+        let mut accounts = f.deposit_metas(&c_vault, &c.pubkey(), &c_junk);
+        accounts[5] = AccountMeta::new_readonly(junk, false);
+        accounts[7] = AccountMeta::new(vault_token(&market, &junk), false);
+        let ix = Instruction { program_id: CORE_ID, accounts, data: amount_data(IX_VAULT_DEPOSIT, 3 * START_DEPOSIT) };
+        f.send(ix, &[&*c], "C deposits junk");
+
+        let mut accounts = f.withdraw_metas(&c_vault, &c.pubkey(), &c_real);
+        accounts[4] = AccountMeta::new_readonly(junk, false);
+        // accounts[6] stays the real mint's token account.
+        let ix = Instruction { program_id: CORE_ID, accounts, data: amount_data(IX_VAULT_WITHDRAW, 3 * START_DEPOSIT) };
+        let (ok, out) = f.send_logged(ix, Arc::clone(&c));
+        let taken = f.ctx.token_balance(&c_real);
+        let left = f.ctx.token_balance(&vault_token(&market, &mint));
+        assert!(!ok, "C swapped junk for {taken} real tokens; {left} left in the token account");
+        assert!(out.contains("vault_token_account does not match derived PDA"), "refused for another reason: {out}");
     }
 
     /// Not fixed: a vault's manager sets its NAV, and every vault in the

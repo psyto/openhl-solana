@@ -11,6 +11,10 @@ on:
       - programs/openhl-core/**
       - crates/**
       - fuzz/vault/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/fuzz-vault.yml
   workflow_dispatch:
 
 permissions:
