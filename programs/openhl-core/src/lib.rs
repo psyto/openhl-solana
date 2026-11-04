@@ -2775,7 +2775,7 @@ fn spl_token_transfer_fee_vault_signed<'a>(
 ///   2. `[WRITE]`         position        — PDA at [b"position", user, market]
 ///   3. `[]`              oracle
 ///   4. `[]`              funding
-///   5. `[]`              mint            — quote-asset SPL Mint
+///   5. `[]`              mint            — must be market.quote_mint
 ///   6. `[WRITE]`         user_token      — user's quote token account (SPL)
 ///   7. `[WRITE]`         vault_token     — PDA at [b"vault", market, mint]
 ///   8. `[]`              system_program
@@ -2826,6 +2826,24 @@ fn process_open_position(
     if user_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
         msg!("open_position: user_token_account not owned by SPL Token");
         return Err(ProgramError::IncorrectProgramId);
+    }
+    // The position records no mint, and ClosePosition / Liquidate pay out of
+    // the quote-mint vault, so collateral must be escrowed in the quote mint
+    // or a worthless mint could be closed out for real quote tokens.
+    if market_ai.data_len() != Market::LEN {
+        msg!("open_position: market is not a Market account");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    {
+        let market_data = market_ai.try_borrow_data()?;
+        let market: &Market = bytemuck::from_bytes(&market_data[..Market::LEN]);
+        if market.discriminator != MARKET_DISCRIMINATOR {
+            return Err(ProgramError::UninitializedAccount);
+        }
+        if market.quote_mint != *mint_ai.key.as_ref() {
+            msg!("open_position: mint != market.quote_mint");
+            return Err(ProgramError::InvalidAccountData);
+        }
     }
     verify_vault_token_account(vault_token_ai, market_ai.key, mint_ai.key, program_id)?;
 

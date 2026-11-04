@@ -109,7 +109,7 @@ The gap between IM (10%) and MM (5%) is the **maintenance buffer** — how far t
 
 `process_open_position` at `programs/openhl-core/src/lib.rs`. The handler decomposes into six parts: validation, oracle/funding read, initial margin check, position PDA allocation, **collateral escrow CPI**, and the position state write.
 
-**Validation**: payload size, non-zero size and collateral, user is signer, market is owned by us, system program is the System program, **token program is SPL Token, user_token_account is owned by SPL Token, and the vault_token_account matches the derived PDA at `[VAULT_SEED, market, mint]`** (the new escrow-side checks). PDA derivation for the position itself:
+**Validation**: payload size, non-zero size and collateral, user is signer, market is a Market account owned by us **whose `quote_mint` is the passed mint** (a position records no mint and ClosePosition/Liquidate pay out of the quote-mint vault, so without this a worthless mint could be escrowed and closed out for real quote tokens), system program is the System program, **token program is SPL Token, user_token_account is owned by SPL Token, and the vault_token_account matches the derived PDA at `[VAULT_SEED, market, mint]`** (the new escrow-side checks). PDA derivation for the position itself:
 
 ```rust
 let (expected, bump) = Pubkey::find_program_address(

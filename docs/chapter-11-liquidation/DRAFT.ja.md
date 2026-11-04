@@ -109,7 +109,7 @@ IM（10%）と MM（5%）のギャップが**維持バッファ**だ — 清算�
 
 `programs/openhl-core/src/lib.rs` の `process_open_position`。ハンドラは 6 部分に分解できる: 検証、オラクル/ファンディング読み、初期証拠金チェック、ポジション PDA 確保、**担保エスクロー CPI**、ポジション状態書き込み。
 
-**検証**: ペイロード サイズ、非ゼロ size と担保、user は signer、market は本書のプログラム所有、system プログラムは System プログラム、**token プログラムは SPL Token、user_token_account は SPL Token 所有、vault_token_account は `[VAULT_SEED, market, mint]` の派生 PDA と一致**（escrow 側の新しいチェック）。ポジション PDA 派生:
+**検証**: ペイロード サイズ、非ゼロ size と担保、user は signer、market は本書のプログラムが所有する Market アカウントで、**その `quote_mint` が渡された mint と一致**(ポジションは mint を記録せず、ClosePosition と Liquidate は quote mint の vault から払うので、これがないと価値のない mint を担保に入れて本物の quote トークンで清算できてしまう)、system プログラムは System プログラム、**token プログラムは SPL Token、user_token_account は SPL Token 所有、vault_token_account は `[VAULT_SEED, market, mint]` の派生 PDA と一致**（escrow 側の新しいチェック）。ポジション PDA 派生:
 
 ```rust
 let (expected, bump) = Pubkey::find_program_address(
