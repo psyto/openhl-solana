@@ -3741,6 +3741,13 @@ fn process_vault_withdraw(
         if share.discriminator != VAULT_SHARE_DISCRIMINATOR {
             return Err(ProgramError::UninitializedAccount);
         }
+        // Every vault in a market draws on the same per-(market, mint)
+        // token account, so shares of one vault must not burn against
+        // another's price.
+        if share.vault != *vault_ai.key.as_ref() {
+            msg!("vault_withdraw: share belongs to another vault");
+            return Err(ProgramError::InvalidAccountData);
+        }
         if share.owner != *owner_ai.key.as_ref() {
             msg!("vault_withdraw: caller is not the share owner");
             return Err(ProgramError::IllegalOwner);
