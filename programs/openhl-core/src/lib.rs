@@ -305,13 +305,6 @@ pub const PROTOCOL_FEE_BPS: u64 = 10;
 /// fund or treasury account).
 pub const PROTOCOL_BUILDER_SHARE_CAP_BPS: u64 = 5000;
 
-/// PDA seed prefix for the per-market `Slab` order book account.
-/// Companion to `BOOK_SEED` (the flat-array Chapter 7 book); this is the
-/// Chapter 15 critbit implementation.
-///
-/// Full seed list: `[SLAB_SEED, market.as_ref(), &[bump]]`.
-pub const SLAB_SEED: &[u8] = b"slab";
-
 /// PDA seed prefix for the per-(quote_mint) protocol fee vault token
 /// account. Every place-order variant Transfers `protocol_fee` from the
 /// trader's quote token account into this PDA; ClaimBuilderFees moves

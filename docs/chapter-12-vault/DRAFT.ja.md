@@ -1,7 +1,7 @@
 # 第12章 — ネイティブ Vault プログラム（プール取引）
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`TradingVault`、`VaultShare`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_trading_vault` 3346–3465 行、`process_vault_deposit` 3480–3639 行、`process_vault_withdraw` 3653–3804 行、`process_vault_update_nav` 3811–3851 行）、[`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs)、[`fuzz/vault/src/main.rs`](../../fuzz/vault/src/main.rs)（§12.7 の solinv ハーネス）。
+> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`TradingVault`、`VaultShare`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_trading_vault` 3357–3476 行、`process_vault_deposit` 3491–3650 行、`process_vault_withdraw` 3664–3815 行、`process_vault_update_nav` 3822–3862 行）、[`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs)、[`fuzz/vault/src/main.rs`](../../fuzz/vault/src/main.rs)（§12.7 の solinv ハーネス）。
 >
 > 部品化に伴い、この章で読むロジックは [`crates/vault/src/lib.rs`](../../crates/vault/src/lib.rs)(`openhl-vault`)に移り、プログラムはそれを呼び出す。以下に引用するコードは分割前の `programs/openhl-core/src/lib.rs` の版で、行番号は追従していない。
 
