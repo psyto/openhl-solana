@@ -709,6 +709,11 @@ pub const PYTH_V2_VERIFICATION_PARTIAL: u8 = 0;
 /// Tag value for `VerificationLevel::Full`.
 pub const PYTH_V2_VERIFICATION_FULL: u8 = 1;
 
+// The offsets below are for `VerificationLevel::Partial`, which Borsh
+// writes as 2 bytes (tag + num_signatures). `Full` is 1 byte, so in a Full
+// update every field from `price_message` on sits one byte earlier.
+// `openhl_oracle::pyth_v2::parse` handles both.
+
 /// Offset of `write_authority: Pubkey` inside PriceUpdateV2.
 pub const PYTH_V2_OFFSET_WRITE_AUTHORITY: usize = 8;
 

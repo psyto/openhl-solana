@@ -1,0 +1,11 @@
+[package]
+name = "openhl-oracle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Oracle checks for Solana programs: staleness, a sanity band around the mark, and Pyth v1 / v2 (PriceUpdateV2) account parsing from raw bytes. no_std."
+
+[dependencies]
+openhl-state = { path = "../state" }

@@ -1,0 +1,10 @@
+[package]
+name = "openhl-vault"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Share math for a pooled vault on Solana: shares per deposit, assets per withdrawal, cost basis. no_std, no dependencies."
+
+[dependencies]

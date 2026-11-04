@@ -2,6 +2,8 @@
 
 > Status: draft (v0.1).
 > Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Slab`, `OrderNode`, `CritbitTree`, `TreeNode`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (slab helpers + `process_create_slab`, `process_slab_place_order`, `process_slab_match`), [`scripts/slab/src/main.rs`](../../scripts/slab/src/main.rs).
+>
+> Since the parts split, the logic this chapter walks through lives in [`crates/slab/src/lib.rs`](../../crates/slab/src/lib.rs) (`openhl-slab`); the program calls it. The code quoted below is the pre-split version from `programs/openhl-core/src/lib.rs`, and its line numbers are not kept in sync.
 
 ---
 

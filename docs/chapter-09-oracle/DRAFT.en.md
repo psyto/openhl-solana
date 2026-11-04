@@ -3,6 +3,8 @@
 > Status: draft (v0.1).
 > Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Oracle`, plus the Pyth v1 and v2 layout constants for §9.5), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_oracle`, `process_set_oracle_price`, `process_place_order_checked`, `process_place_order_checked_pyth`, `process_place_order_checked_pyth_v2`, and the `read_fresh_oracle` / `read_fresh_pyth_v1_oracle` / `read_fresh_pyth_v2_oracle` helpers), [`scripts/oracle/src/main.rs`](../../scripts/oracle/src/main.rs).
 > Reference targets: Pyth Network mainnet program (`FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH`), Switchboard On-Demand.
+>
+> Since the parts split, the logic this chapter walks through lives in [`crates/oracle/src/lib.rs`](../../crates/oracle/src/lib.rs) (`openhl-oracle`); the program calls it. The code quoted below is the pre-split version from `programs/openhl-core/src/lib.rs`, and its line numbers are not kept in sync.
 
 ---
 
@@ -337,7 +339,7 @@ offset | size | field                            | what we do with it
  134                                                — end
 ```
 
-The offsets are exported as `PYTH_V2_OFFSET_*` from `crates/state/src/lib.rs`. As with v1, we don't mirror the full Pod struct — six field reads, no Anchor dep, the byte layout *is* the contract.
+The offsets are exported as `PYTH_V2_OFFSET_*` from `crates/state/src/lib.rs`. They are the offsets of a **Partial** update: Borsh writes `VerificationLevel::Full` as 1 byte instead of 2, so in a Full update every field from `price_message` on sits one byte earlier. The pre-split reader quoted above used the fixed offsets and misread Full updates; `openhl_oracle::pyth_v2::parse` now handles both. As with v1, we don't mirror the full Pod struct — six field reads, no Anchor dep, the byte layout *is* the contract.
 
 ### The two-instruction transaction pattern
 

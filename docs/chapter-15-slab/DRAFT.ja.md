@@ -2,6 +2,8 @@
 
 > 状態: ドラフト (v0.1)。
 > 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Slab`、`OrderNode`、`CritbitTree`、`TreeNode`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（slab ヘルパ + `process_create_slab`、`process_slab_place_order`、`process_slab_match`）、[`scripts/slab/src/main.rs`](../../scripts/slab/src/main.rs)。
+>
+> 部品化に伴い、この章で読むロジックは [`crates/slab/src/lib.rs`](../../crates/slab/src/lib.rs)(`openhl-slab`)に移り、プログラムはそれを呼び出す。以下に引用するコードは分割前の `programs/openhl-core/src/lib.rs` の版で、行番号は追従していない。
 
 ---
 

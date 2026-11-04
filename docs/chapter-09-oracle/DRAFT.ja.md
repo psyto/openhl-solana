@@ -3,6 +3,8 @@
 > 状態: ドラフト (v0.1)。
 > 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Oracle`、加えて §9.5 のための Pyth v1 と v2 のレイアウト定数）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_oracle`、`process_set_oracle_price`、`process_place_order_checked`、`process_place_order_checked_pyth`、`process_place_order_checked_pyth_v2`、ヘルパ `read_fresh_oracle` / `read_fresh_pyth_v1_oracle` / `read_fresh_pyth_v2_oracle`）、[`scripts/oracle/src/main.rs`](../../scripts/oracle/src/main.rs)。
 > 参照対象: Pyth Network mainnet プログラム（`FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH`）、Switchboard On-Demand。
+>
+> 部品化に伴い、この章で読むロジックは [`crates/oracle/src/lib.rs`](../../crates/oracle/src/lib.rs)(`openhl-oracle`)に移り、プログラムはそれを呼び出す。以下に引用するコードは分割前の `programs/openhl-core/src/lib.rs` の版で、行番号は追従していない。
 
 ---
 
@@ -337,7 +339,7 @@ offset | size | field                            | 何に使うか
  134                                                — 終わり
 ```
 
-オフセットは `crates/state/src/lib.rs` から `PYTH_V2_OFFSET_*` としてエクスポートされる。v1 と同様、完全な Pod 構造体をミラーしない — 6 フィールド読み込み、Anchor 依存なし、バイト レイアウトが**契約**だ。
+オフセットは `crates/state/src/lib.rs` から `PYTH_V2_OFFSET_*` としてエクスポートされる。これは **Partial** の更新のオフセットだ。Borsh は `VerificationLevel::Full` を 2 バイトでなく 1 バイトで書くため、Full の更新では `price_message` 以降の全フィールドが 1 バイト前にずれる。上に引用した分割前の読み手は固定オフセットを使っており Full を誤読していた。現在は `openhl_oracle::pyth_v2::parse` が両方を扱う。v1 と同様、完全な Pod 構造体をミラーしない — 6 フィールド読み込み、Anchor 依存なし、バイト レイアウトが**契約**だ。
 
 ### 2 命令 トランザクション パターン
 

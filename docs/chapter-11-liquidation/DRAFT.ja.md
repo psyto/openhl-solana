@@ -2,6 +2,8 @@
 
 > 状態: ドラフト (v0.1)。
 > 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Position`、`InsuranceFund`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（ヘルパ + `process_open_position`、`process_close_position`、`process_liquidate`、`process_create_insurance_fund`、`process_insurance_fund_deposit`）、[`scripts/position/src/main.rs`](../../scripts/position/src/main.rs)。
+>
+> 部品化に伴い、この章で読むロジックは [`crates/margin/src/lib.rs`](../../crates/margin/src/lib.rs)(`openhl-margin`)に移り、プログラムはそれを呼び出す。以下に引用するコードは分割前の `programs/openhl-core/src/lib.rs` の版で、行番号は追従していない。
 
 ---
 

@@ -159,19 +159,11 @@
 #![allow(unexpected_cfgs)] // solana_program::entrypoint! gates on `target_os = "solana"`
 
 use openhl_state::{
-    side, tree_tag, BuilderProfile, CritbitTree, FundingState, InsuranceFund, Market, Oracle,
-    Order, OrderBook, Position, Slab, Stats, TradingVault, TreeNode, VaultShare,
-    BUILDER_PROFILE_DISCRIMINATOR, FUNDING_DISCRIMINATOR, INSURANCE_FUND_DISCRIMINATOR,
-    MARKET_DISCRIMINATOR, ORACLE_DISCRIMINATOR, ORDER_BOOK_DISCRIMINATOR, ORDER_CAPACITY,
-    POSITION_DISCRIMINATOR, PYTH_V1_ACCOUNT_TYPE_PRICE, PYTH_V1_MAGIC, PYTH_V1_MIN_LEN,
-    PYTH_V1_OFFSET_AGG_CONF, PYTH_V1_OFFSET_AGG_PRICE, PYTH_V1_OFFSET_AGG_PUB_SLOT,
-    PYTH_V1_OFFSET_AGG_STATUS, PYTH_V1_OFFSET_EXPO, PYTH_V1_STATUS_TRADING, PYTH_V1_VERSION,
-    PYTH_V2_MIN_LEN, PYTH_V2_OFFSET_CONF, PYTH_V2_OFFSET_EXPONENT, PYTH_V2_OFFSET_POSTED_SLOT,
-    PYTH_V2_OFFSET_PRICE, PYTH_V2_OFFSET_PUBLISH_TIME, PYTH_V2_OFFSET_VERIFICATION_LEVEL,
-    PYTH_V2_OFFSET_VERIFICATION_NUM_SIGS, PYTH_V2_PRICE_UPDATE_DISCRIMINATOR,
-    PYTH_V2_VERIFICATION_FULL, PYTH_V2_VERIFICATION_PARTIAL, SLAB_DISCRIMINATOR, SLAB_NONE_INDEX,
-    SLAB_POOL_CAPACITY, SLAB_TREE_CAPACITY, STATS_DISCRIMINATOR, TRADING_VAULT_DISCRIMINATOR,
-    VAULT_SHARE_DISCRIMINATOR,
+    side, BuilderProfile, FundingState, InsuranceFund, Market, Oracle, Order, OrderBook, Position,
+    Slab, Stats, TradingVault, VaultShare, BUILDER_PROFILE_DISCRIMINATOR, FUNDING_DISCRIMINATOR,
+    INSURANCE_FUND_DISCRIMINATOR, MARKET_DISCRIMINATOR, ORACLE_DISCRIMINATOR,
+    ORDER_BOOK_DISCRIMINATOR, ORDER_CAPACITY, POSITION_DISCRIMINATOR, SLAB_DISCRIMINATOR,
+    STATS_DISCRIMINATOR, TRADING_VAULT_DISCRIMINATOR, VAULT_SHARE_DISCRIMINATOR,
 };
 use solana_program::{
     account_info::AccountInfo,
@@ -1726,9 +1718,7 @@ fn process_place_order_checked(
     let mark = read_fresh_oracle(oracle_ai, program_id)?;
 
     // (2) Sanity band: price must lie within ±SANITY_BAND_BPS bps of mark.
-    let band = mark.saturating_mul(SANITY_BAND_BPS) / 10_000;
-    let low = mark.saturating_sub(band);
-    let high = mark.saturating_add(band);
+    let (low, high) = openhl_oracle::sanity_band(mark, SANITY_BAND_BPS);
     if price < low || price > high {
         msg!(
             "place_order_checked: price {} outside sanity band [{}, {}] (mark={})",
@@ -1745,8 +1735,8 @@ fn process_place_order_checked(
     // The asymmetric alternative — where only the builder path charges a
     // token-denominated fee — would make trades through a builder cost
     // the user more in real terms than identical trades without one.
-    let notional_val = (price as u128) * (size as u128);
-    let protocol_fee = (notional_val * (PROTOCOL_FEE_BPS as u128) / 10_000) as u64;
+    let notional_val = openhl_fees::order_notional(price, size);
+    let protocol_fee = openhl_fees::protocol_fee(notional_val, PROTOCOL_FEE_BPS);
 
     msg!(
         "place_order_checked: side={} price={} size={} mark={} protocol_fee={}",
@@ -1904,9 +1894,7 @@ fn process_place_order_checked_pyth(
     let mark = read_fresh_pyth_v1_oracle(pyth_ai)?;
 
     // (2) Sanity band — identical math to the mock path.
-    let band = mark.saturating_mul(SANITY_BAND_BPS) / 10_000;
-    let low = mark.saturating_sub(band);
-    let high = mark.saturating_add(band);
+    let (low, high) = openhl_oracle::sanity_band(mark, SANITY_BAND_BPS);
     if price < low || price > high {
         msg!(
             "place_order_checked_pyth: price {} outside band [{}, {}] (mark={})",
@@ -1919,8 +1907,8 @@ fn process_place_order_checked_pyth(
     }
 
     // (3) Protocol fee — identical math to the mock path.
-    let notional_val = (price as u128) * (size as u128);
-    let protocol_fee = (notional_val * (PROTOCOL_FEE_BPS as u128) / 10_000) as u64;
+    let notional_val = openhl_fees::order_notional(price, size);
+    let protocol_fee = openhl_fees::protocol_fee(notional_val, PROTOCOL_FEE_BPS);
     msg!(
         "place_order_checked_pyth: side={} price={} size={} mark={} protocol_fee={}",
         order_side,
@@ -2064,9 +2052,7 @@ fn process_place_order_checked_pyth_v2(
     let mark = read_fresh_pyth_v2_oracle(pyth_ai)?;
 
     // (2)-(5) — identical to PlaceOrderChecked / PlaceOrderCheckedPyth.
-    let band = mark.saturating_mul(SANITY_BAND_BPS) / 10_000;
-    let low = mark.saturating_sub(band);
-    let high = mark.saturating_add(band);
+    let (low, high) = openhl_oracle::sanity_band(mark, SANITY_BAND_BPS);
     if price < low || price > high {
         msg!(
             "place_order_checked_pyth_v2: price {} outside band [{}, {}] (mark={})",
@@ -2078,8 +2064,8 @@ fn process_place_order_checked_pyth_v2(
         return Err(ProgramError::InvalidArgument);
     }
 
-    let notional_val = (price as u128) * (size as u128);
-    let protocol_fee = (notional_val * (PROTOCOL_FEE_BPS as u128) / 10_000) as u64;
+    let notional_val = openhl_fees::order_notional(price, size);
+    let protocol_fee = openhl_fees::protocol_fee(notional_val, PROTOCOL_FEE_BPS);
     msg!(
         "place_order_checked_pyth_v2: side={} price={} size={} mark={} protocol_fee={}",
         order_side,
@@ -2257,9 +2243,7 @@ fn process_update_funding(
 
     // Clamp the keeper's proposed rate to the program's hard cap. A keeper
     // bug or compromise should not produce arbitrarily large funding payments.
-    let new_rate = new_rate_raw
-        .max(-MAX_FUNDING_RATE_PER_SEC_ABS)
-        .min(MAX_FUNDING_RATE_PER_SEC_ABS);
+    let new_rate = openhl_funding::clamp_rate(new_rate_raw, MAX_FUNDING_RATE_PER_SEC_ABS);
     if new_rate != new_rate_raw {
         msg!(
             "update_funding: keeper rate {} clamped to {}",
@@ -2281,24 +2265,23 @@ fn process_update_funding(
     // preceding interval, then installs the new rate for the next one.
     // This is the standard "step function" accumulator — cumulative_index
     // grows in piecewise-linear segments, one segment per UpdateFunding call.
-    let elapsed = clock.unix_timestamp.saturating_sub(funding.last_update_ts);
-    if elapsed < 0 {
-        msg!("update_funding: clock went backwards (elapsed={})", elapsed);
-        return Err(ProgramError::InvalidAccountData);
-    }
-    let elapsed_u = elapsed as u64;
-
-    let delta = (funding.current_rate_per_sec as i128) * (elapsed_u as i128);
-    let new_cumulative = (funding.cumulative_funding_index as i128).saturating_add(delta);
-    // i64 saturation if the cumulative would overflow. Practical books take
-    // years to even approach i64 range with realistic rates.
-    let new_cumulative_clamped: i64 = if new_cumulative > i64::MAX as i128 {
-        i64::MAX
-    } else if new_cumulative < i64::MIN as i128 {
-        i64::MIN
-    } else {
-        new_cumulative as i64
+    let accrual = match openhl_funding::accrue(
+        funding.cumulative_funding_index,
+        funding.current_rate_per_sec,
+        funding.last_update_ts,
+        clock.unix_timestamp,
+    ) {
+        Ok(a) => a,
+        Err(openhl_funding::FundingError::ClockWentBackwards { elapsed }) => {
+            msg!("update_funding: clock went backwards (elapsed={})", elapsed);
+            return Err(ProgramError::InvalidAccountData);
+        }
     };
+    let elapsed_u = accrual.elapsed;
+    let delta = accrual.delta;
+    // Saturates at the i64 bounds; practical books take years to even
+    // approach them with realistic rates.
+    let new_cumulative_clamped = accrual.cumulative;
 
     msg!(
         "update_funding: prior_rate={} elapsed={}s delta={} new_cumulative={}",
@@ -2327,24 +2310,14 @@ const LIQUIDATE_PAYLOAD_LEN: usize = 0;
 /// Compute equity = collateral + price PnL + funding PnL.
 /// All returned in quote units, signed (negative means underwater).
 fn compute_equity(position: &Position, mark: u64, funding_index_now: i64) -> i128 {
-    let size = position.size as i128;
-    let entry = position.entry_price as i128;
-    let mark_i = mark as i128;
-    let collateral = position.collateral as i128;
-
-    let price_pnl = size * (mark_i - entry);
-
-    let funding_delta = (funding_index_now as i128) - (position.funding_snapshot_index as i128);
-    // funding pnl uses the 1e9 scaling from the FundingState index
-    let funding_pnl = funding_delta * size / 1_000_000_000_i128;
-
-    collateral + price_pnl + funding_pnl
-}
-
-/// Compute notional = abs(size) * mark.
-fn notional(size: i64, mark: u64) -> u128 {
-    let abs_size = (size.unsigned_abs()) as u128;
-    abs_size * (mark as u128)
+    openhl_margin::equity(
+        position.collateral,
+        position.size,
+        position.entry_price,
+        mark,
+        position.funding_snapshot_index,
+        funding_index_now,
+    )
 }
 
 /// Read a fresh oracle mark price from an oracle account. Same staleness
@@ -2363,9 +2336,10 @@ fn read_fresh_oracle(oracle_ai: &AccountInfo, program_id: &Pubkey) -> Result<u64
         return Err(ProgramError::InvalidAccountData);
     }
     let clock = Clock::get()?;
-    let age = clock.slot.saturating_sub(oracle.publish_slot);
-    if age > MAX_ORACLE_STALENESS_SLOTS {
-        msg!("oracle stale ({} slots, max {})", age, MAX_ORACLE_STALENESS_SLOTS);
+    if let Err(stale) =
+        openhl_oracle::check_fresh(oracle.publish_slot, clock.slot, MAX_ORACLE_STALENESS_SLOTS)
+    {
+        msg!("oracle stale ({} slots, max {})", stale.age, stale.max_age);
         return Err(ProgramError::InvalidAccountData);
     }
     Ok(oracle.price as u64)
@@ -2392,92 +2366,53 @@ fn read_fresh_pyth_v1_oracle(
     oracle_ai: &AccountInfo,
 ) -> Result<u64, ProgramError> {
     let data = oracle_ai.try_borrow_data()?;
-    if data.len() < PYTH_V1_MIN_LEN {
-        msg!(
-            "pyth: account too small ({} bytes, need {})",
-            data.len(),
-            PYTH_V1_MIN_LEN
-        );
-        return Err(ProgramError::InvalidAccountData);
-    }
 
-    // (1) Magic + version + account type. Any mismatch means we're
-    // pointing at the wrong kind of Pyth account (e.g., the mapping or
-    // product account) or at something else entirely.
-    let magic = u32::from_le_bytes(data[0..4].try_into().expect("4 bytes"));
-    if magic != PYTH_V1_MAGIC {
-        msg!("pyth: bad magic ({:#x})", magic);
-        return Err(ProgramError::InvalidAccountData);
-    }
-    let ver = u32::from_le_bytes(data[4..8].try_into().expect("4 bytes"));
-    if ver != PYTH_V1_VERSION {
-        msg!("pyth: unsupported version ({})", ver);
-        return Err(ProgramError::InvalidAccountData);
-    }
-    let atype = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes"));
-    if atype != PYTH_V1_ACCOUNT_TYPE_PRICE {
-        msg!("pyth: not a PriceAccount (atype={})", atype);
-        return Err(ProgramError::InvalidAccountData);
-    }
-
-    // (2) Aggregate status must be Trading. If the publisher network
-    // couldn't agree on a price this slot, or the market is halted,
-    // we refuse to operate — just like our mock oracle refuses
-    // non-positive prices.
-    let status = u32::from_le_bytes(
-        data[PYTH_V1_OFFSET_AGG_STATUS..PYTH_V1_OFFSET_AGG_STATUS + 4]
-            .try_into()
-            .expect("4 bytes"),
-    );
-    if status != PYTH_V1_STATUS_TRADING {
-        msg!("pyth: aggregate status {} (not Trading)", status);
-        return Err(ProgramError::InvalidAccountData);
-    }
+    // (1) Length, magic, version, account type, then (2) aggregate status
+    // must be Trading. Any mismatch means we're pointing at the wrong kind
+    // of Pyth account (mapping, product) or at something else entirely; a
+    // non-Trading status means the publisher network couldn't agree on a
+    // price this slot, or the market is halted.
+    let agg = match openhl_oracle::pyth_v1::parse(&data) {
+        Ok(agg) => agg,
+        Err(e) => {
+            use openhl_oracle::pyth_v1::Error;
+            match e {
+                Error::TooSmall { len, need } => {
+                    msg!("pyth: account too small ({} bytes, need {})", len, need)
+                }
+                Error::BadMagic(magic) => msg!("pyth: bad magic ({:#x})", magic),
+                Error::UnsupportedVersion(ver) => msg!("pyth: unsupported version ({})", ver),
+                Error::NotPriceAccount { atype } => {
+                    msg!("pyth: not a PriceAccount (atype={})", atype)
+                }
+                Error::NotTrading { status } => {
+                    msg!("pyth: aggregate status {} (not Trading)", status)
+                }
+            }
+            return Err(ProgramError::InvalidAccountData);
+        }
+    };
 
     // (3) Staleness gauntlet — same Clock-based check as the mock path,
     // measured against agg.pub_slot rather than our SetOraclePrice
     // timestamp.
-    let pub_slot = u64::from_le_bytes(
-        data[PYTH_V1_OFFSET_AGG_PUB_SLOT..PYTH_V1_OFFSET_AGG_PUB_SLOT + 8]
-            .try_into()
-            .expect("8 bytes"),
-    );
     let clock = Clock::get()?;
-    let age = clock.slot.saturating_sub(pub_slot);
-    if age > MAX_ORACLE_STALENESS_SLOTS {
-        msg!(
-            "pyth: stale ({} slots, max {})",
-            age,
-            MAX_ORACLE_STALENESS_SLOTS
-        );
+    if let Err(stale) =
+        openhl_oracle::check_fresh(agg.pub_slot, clock.slot, MAX_ORACLE_STALENESS_SLOTS)
+    {
+        msg!("pyth: stale ({} slots, max {})", stale.age, stale.max_age);
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // (4) Read price + log expo + conf for observability. We refuse
-    // non-positive prices for the same reason the mock does (Pyth
-    // occasionally publishes 0 to signal "no good price right now",
-    // even when status == Trading).
-    let price_i = i64::from_le_bytes(
-        data[PYTH_V1_OFFSET_AGG_PRICE..PYTH_V1_OFFSET_AGG_PRICE + 8]
-            .try_into()
-            .expect("8 bytes"),
-    );
-    let conf = u64::from_le_bytes(
-        data[PYTH_V1_OFFSET_AGG_CONF..PYTH_V1_OFFSET_AGG_CONF + 8]
-            .try_into()
-            .expect("8 bytes"),
-    );
-    let expo = i32::from_le_bytes(
-        data[PYTH_V1_OFFSET_EXPO..PYTH_V1_OFFSET_EXPO + 4]
-            .try_into()
-            .expect("4 bytes"),
-    );
-    if price_i <= 0 {
-        msg!("pyth: non-positive price ({})", price_i);
+    // (4) Refuse non-positive prices for the same reason the mock does
+    // (Pyth occasionally publishes 0 to signal "no good price right now",
+    // even when status == Trading), then log expo + conf.
+    if agg.price <= 0 {
+        msg!("pyth: non-positive price ({})", agg.price);
         return Err(ProgramError::InvalidAccountData);
     }
-    msg!("pyth: price={} conf={} expo={}", price_i, conf, expo);
-    Ok(price_i as u64)
+    msg!("pyth: price={} conf={} expo={}", agg.price, agg.conf, agg.expo);
+    Ok(agg.price as u64)
 }
 
 /// Read a fresh aggregate price from a Pyth v2 `PriceUpdateV2` account
@@ -2502,95 +2437,62 @@ fn read_fresh_pyth_v2_oracle(
     oracle_ai: &AccountInfo,
 ) -> Result<u64, ProgramError> {
     let data = oracle_ai.try_borrow_data()?;
-    if data.len() < PYTH_V2_MIN_LEN {
-        msg!(
-            "pyth_v2: account too small ({} bytes, need {})",
-            data.len(),
-            PYTH_V2_MIN_LEN
-        );
-        return Err(ProgramError::InvalidAccountData);
-    }
 
-    // (1) Anchor account discriminator.
-    if data[0..8] != PYTH_V2_PRICE_UPDATE_DISCRIMINATOR {
-        msg!("pyth_v2: discriminator mismatch (not a PriceUpdateV2)");
-        return Err(ProgramError::InvalidAccountData);
-    }
-
-    // (2) VerificationLevel — log for observability. The chapter does NOT
-    // gate on it; a production deployment that demands `Full` (= every
-    // guardian signature verified) would add `if level != FULL { ... }`.
-    let level_tag = data[PYTH_V2_OFFSET_VERIFICATION_LEVEL];
-    let level_str = match level_tag {
-        x if x == PYTH_V2_VERIFICATION_PARTIAL => {
-            let n = data[PYTH_V2_OFFSET_VERIFICATION_NUM_SIGS];
-            msg!("pyth_v2: verification_level = Partial({} sigs)", n);
-            "partial"
+    // (1) Length + Anchor account discriminator, (2) VerificationLevel.
+    // The parser reads either level; a Full update is one byte shorter
+    // before the price message (Borsh enum), which it accounts for.
+    let update = match openhl_oracle::pyth_v2::parse(&data) {
+        Ok(u) => u,
+        Err(openhl_oracle::pyth_v2::Error::TooSmall { len, need }) => {
+            msg!("pyth_v2: account too small ({} bytes, need {})", len, need);
+            return Err(ProgramError::InvalidAccountData);
         }
-        x if x == PYTH_V2_VERIFICATION_FULL => {
-            msg!("pyth_v2: verification_level = Full");
-            "full"
+        Err(openhl_oracle::pyth_v2::Error::BadDiscriminator) => {
+            msg!("pyth_v2: discriminator mismatch (not a PriceUpdateV2)");
+            return Err(ProgramError::InvalidAccountData);
         }
-        other => {
-            msg!("pyth_v2: unknown verification_level tag {}", other);
+        Err(openhl_oracle::pyth_v2::Error::UnknownVerificationLevel(tag)) => {
+            msg!("pyth_v2: unknown verification_level tag {}", tag);
             return Err(ProgramError::InvalidAccountData);
         }
     };
-    let _ = level_str;
+
+    // Log the level for observability. The chapter does NOT gate on it; a
+    // production deployment that demands `Full` (= every guardian
+    // signature verified) would refuse `Partial` here.
+    match update.verification_level {
+        openhl_oracle::pyth_v2::VerificationLevel::Partial { num_signatures } => {
+            msg!("pyth_v2: verification_level = Partial({} sigs)", num_signatures)
+        }
+        openhl_oracle::pyth_v2::VerificationLevel::Full => {
+            msg!("pyth_v2: verification_level = Full")
+        }
+    }
 
     // (3) Staleness — same Clock-based check as v1 + mock, measured
     // against posted_slot (the Solana slot in which the receiver wrote
     // this update).
-    let posted_slot = u64::from_le_bytes(
-        data[PYTH_V2_OFFSET_POSTED_SLOT..PYTH_V2_OFFSET_POSTED_SLOT + 8]
-            .try_into()
-            .expect("8 bytes"),
-    );
     let clock = Clock::get()?;
-    let age = clock.slot.saturating_sub(posted_slot);
-    if age > MAX_ORACLE_STALENESS_SLOTS {
-        msg!(
-            "pyth_v2: stale ({} slots, max {})",
-            age,
-            MAX_ORACLE_STALENESS_SLOTS
-        );
+    if let Err(stale) =
+        openhl_oracle::check_fresh(update.posted_slot, clock.slot, MAX_ORACLE_STALENESS_SLOTS)
+    {
+        msg!("pyth_v2: stale ({} slots, max {})", stale.age, stale.max_age);
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // (4) Read price + log exponent + conf.
-    let price_i = i64::from_le_bytes(
-        data[PYTH_V2_OFFSET_PRICE..PYTH_V2_OFFSET_PRICE + 8]
-            .try_into()
-            .expect("8 bytes"),
-    );
-    let conf = u64::from_le_bytes(
-        data[PYTH_V2_OFFSET_CONF..PYTH_V2_OFFSET_CONF + 8]
-            .try_into()
-            .expect("8 bytes"),
-    );
-    let exponent = i32::from_le_bytes(
-        data[PYTH_V2_OFFSET_EXPONENT..PYTH_V2_OFFSET_EXPONENT + 4]
-            .try_into()
-            .expect("4 bytes"),
-    );
-    let publish_time = i64::from_le_bytes(
-        data[PYTH_V2_OFFSET_PUBLISH_TIME..PYTH_V2_OFFSET_PUBLISH_TIME + 8]
-            .try_into()
-            .expect("8 bytes"),
-    );
-
-    if price_i <= 0 {
-        msg!("pyth_v2: non-positive price ({})", price_i);
+    // (4) Refuse non-positive prices, log exponent + conf.
+    if update.price <= 0 {
+        msg!("pyth_v2: non-positive price ({})", update.price);
         return Err(ProgramError::InvalidAccountData);
     }
     msg!(
         "pyth_v2: price={} conf={} exponent={} publish_time={}",
-        price_i,
-        conf,
-        exponent,
-        publish_time
+        update.price,
+        update.conf,
+        update.exponent,
+        update.publish_time
     );
-    Ok(price_i as u64)
+    Ok(update.price as u64)
 }
 
 /// Read the cumulative_funding_index from a funding account.
@@ -2912,8 +2814,8 @@ fn process_open_position(
     let funding_snapshot = read_funding_index(funding_ai, program_id)?;
 
     // Initial margin requirement check.
-    let notional_val = notional(size, mark);
-    let im_required = notional_val * (INITIAL_MARGIN_BPS as u128) / 10_000;
+    let notional_val = openhl_margin::notional(size, mark);
+    let im_required = openhl_margin::initial_margin(notional_val, INITIAL_MARGIN_BPS);
     if (collateral as u128) < im_required {
         msg!(
             "open_position: collateral {} < initial margin {} (notional {} × {} bps)",
@@ -3056,6 +2958,13 @@ fn process_close_position(
             msg!("close_position: caller is not the position owner");
             return Err(ProgramError::IllegalOwner);
         }
+        // The vault, vault authority and insurance fund are derived from the
+        // market passed in, so it must be the position's own market or the
+        // payout would come out of another market's vault.
+        if position.market != *market_ai.key.as_ref() {
+            msg!("close_position: position belongs to another market");
+            return Err(ProgramError::InvalidAccountData);
+        }
         if position.size == 0 {
             msg!("close_position: position already closed");
             return Err(ProgramError::InvalidArgument);
@@ -3072,7 +2981,7 @@ fn process_close_position(
 
         // Underwater closes pay 0 to the user. The insurance-fund drain
         // below covers the protocol's logical shortfall in the same tx.
-        payout = if equity < 0 { 0 } else { equity as u64 };
+        payout = openhl_margin::close_payout(equity);
 
         // Close the position record. collateral=0 because the value has
         // been (or is about to be) paid out via the CPI below.
@@ -3100,12 +3009,7 @@ fn process_close_position(
             return Err(ProgramError::InvalidAccountData);
         }
 
-        shortfall_drain = if equity < 0 {
-            let shortfall = (-equity).min(u64::MAX as i128) as u64;
-            shortfall.min(fund.balance)
-        } else {
-            0
-        };
+        shortfall_drain = openhl_margin::insurance_draw(equity, fund.balance);
         fund.balance -= shortfall_drain;
         fund.total_drawdowns = fund
             .total_drawdowns
@@ -3229,11 +3133,29 @@ fn process_liquidate(
             msg!("liquidate: position already closed");
             return Err(ProgramError::InvalidArgument);
         }
+        // Same binding as ClosePosition: the vault and fund come from the
+        // market passed in.
+        if position.market != *market_ai.key.as_ref() {
+            msg!("liquidate: position belongs to another market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        // The owner's remainder must go to a token account the position
+        // owner holds, in the quote mint; the liquidator picks the
+        // accounts, so otherwise they could route it to themselves.
+        {
+            let owner_token = owner_token_ai.try_borrow_data()?;
+            if owner_token.len() < TOKEN_ACCOUNT_LEN
+                || owner_token[0..32] != *mint_ai.key.as_ref()
+                || owner_token[32..64] != position.user
+            {
+                msg!("liquidate: owner_token is not the position owner's quote-mint account");
+                return Err(ProgramError::InvalidAccountData);
+            }
+        }
 
         equity = compute_equity(position, mark, funding_now);
-        let notional_val = notional(position.size, mark);
-        let maint_required =
-            (notional_val * (MAINT_MARGIN_BPS as u128) / 10_000) as i128;
+        let notional_val = openhl_margin::notional(position.size, mark);
+        let maint_required = openhl_margin::maintenance_margin(notional_val, MAINT_MARGIN_BPS);
 
         msg!(
             "liquidate: size={} mark={} equity={} maint_required={}",
@@ -3243,7 +3165,7 @@ fn process_liquidate(
             maint_required
         );
 
-        if equity >= maint_required {
+        if !openhl_margin::is_liquidatable(equity, maint_required) {
             msg!(
                 "liquidate: position is healthy (equity {} >= maint {}), not liquidatable",
                 equity,
@@ -3252,25 +3174,19 @@ fn process_liquidate(
             return Err(ProgramError::InvalidArgument);
         }
 
-        // Total penalty (cap to LIQUIDATION_PENALTY_BPS of notional, but
-        // never more than the equity that survives — at equity ≤ 0 the
-        // penalty is zero).
-        let raw_penalty = (notional_val * (LIQUIDATION_PENALTY_BPS as u128) / 10_000)
-            .min(i64::MAX as u128) as i128;
-        let equity_positive = if equity < 0 { 0 } else { equity };
-        let penalty = raw_penalty.min(equity_positive);
-        let owner_remainder = (equity_positive - penalty).max(0);
-
-        // Split the penalty: INSURANCE_FUND_PENALTY_SHARE_BPS to the fund,
-        // remainder to the liquidator. Floor-division keeps the liquidator
-        // slice ≥ floor(penalty / 2) at the 5000 bps split.
-        let fund_slice =
-            ((penalty as u128) * (INSURANCE_FUND_PENALTY_SHARE_BPS as u128) / 10_000) as i128;
-        let liquidator_slice = penalty - fund_slice;
-
-        liquidator_amount = liquidator_slice as u64;
-        owner_amount = owner_remainder as u64;
-        fund_slice_amount = fund_slice as u64;
+        // Total penalty is LIQUIDATION_PENALTY_BPS of notional, never more
+        // than the equity that survives; INSURANCE_FUND_PENALTY_SHARE_BPS of
+        // it goes to the fund, the rest to the liquidator.
+        let split = openhl_margin::liquidation_split(
+            equity,
+            notional_val,
+            LIQUIDATION_PENALTY_BPS,
+            INSURANCE_FUND_PENALTY_SHARE_BPS,
+        );
+        let penalty = split.penalty;
+        liquidator_amount = split.to_liquidator;
+        owner_amount = split.to_owner;
+        fund_slice_amount = split.to_insurance_fund;
 
         msg!(
             "liquidate: penalty={} -> liquidator={} fund={}, owner_remainder={}",
@@ -3314,12 +3230,7 @@ fn process_liquidate(
             .checked_add(fund_slice_amount)
             .ok_or(ProgramError::ArithmeticOverflow)?;
 
-        shortfall_drain = if equity < 0 {
-            let shortfall = (-equity).min(u64::MAX as i128) as u64;
-            shortfall.min(fund.balance)
-        } else {
-            0
-        };
+        shortfall_drain = openhl_margin::insurance_draw(equity, fund.balance);
 
         fund.balance -= shortfall_drain;
         fund.total_drawdowns = fund
@@ -3561,20 +3472,18 @@ fn process_vault_deposit(
 
         // (b) Compute shares to mint. First deposit: 1:1. Subsequent:
         //     shares = assets * total_shares / total_assets.
-        shares_to_mint = if vault.total_shares == 0 || vault.total_assets == 0 {
-            assets
-        } else {
-            let numer = (assets as u128) * (vault.total_shares as u128);
-            let s = numer / (vault.total_assets as u128);
-            if s > u64::MAX as u128 {
-                return Err(ProgramError::ArithmeticOverflow);
+        shares_to_mint = match openhl_vault::shares_for_deposit(
+            assets,
+            vault.total_shares,
+            vault.total_assets,
+        ) {
+            Ok(s) => s,
+            Err(openhl_vault::VaultError::ZeroShares) => {
+                msg!("vault_deposit: deposit too small relative to NAV (would mint 0 shares)");
+                return Err(ProgramError::InvalidArgument);
             }
-            s as u64
+            Err(_) => return Err(ProgramError::ArithmeticOverflow),
         };
-        if shares_to_mint == 0 {
-            msg!("vault_deposit: deposit too small relative to NAV (would mint 0 shares)");
-            return Err(ProgramError::InvalidArgument);
-        }
 
         // (c) Update vault aggregate.
         vault.total_shares = vault
@@ -3726,14 +3635,14 @@ fn process_vault_withdraw(
             return Err(ProgramError::InvalidAccountData);
         }
 
-        assets_to_return = {
-            let numer = (shares_to_burn as u128) * (vault.total_assets as u128);
-            let a = numer / (vault.total_shares as u128);
-            if a > u64::MAX as u128 {
-                return Err(ProgramError::ArithmeticOverflow);
-            }
-            a as u64
-        };
+        // total_shares == 0 was refused above, so the only error left is
+        // overflow.
+        assets_to_return = openhl_vault::assets_for_withdraw(
+            shares_to_burn,
+            vault.total_shares,
+            vault.total_assets,
+        )
+        .map_err(|_| ProgramError::ArithmeticOverflow)?;
 
         let mut share_data = share_ai.try_borrow_mut_data()?;
         let share: &mut VaultShare =
@@ -3741,9 +3650,9 @@ fn process_vault_withdraw(
         if share.discriminator != VAULT_SHARE_DISCRIMINATOR {
             return Err(ProgramError::UninitializedAccount);
         }
-        // Every vault in a market draws on the same per-(market, mint)
-        // token account, so shares of one vault must not burn against
-        // another's price.
+        // The share must be this vault's: a share of another vault would
+        // otherwise burn against this vault's total_shares and pay out of
+        // the shared per-(market, mint) token account.
         if share.vault != *vault_ai.key.as_ref() {
             msg!("vault_withdraw: share belongs to another vault");
             return Err(ProgramError::InvalidAccountData);
@@ -3764,8 +3673,11 @@ fn process_vault_withdraw(
         share.shares -= shares_to_burn;
         // Reduce cost basis proportionally so partial withdrawals don't
         // overstate gains on subsequent reports.
-        let basis_reduction = (((shares_to_burn as u128) * (share.cost_basis as u128))
-            / (share.shares as u128 + shares_to_burn as u128)) as u64;
+        let basis_reduction = openhl_vault::cost_basis_reduction(
+            shares_to_burn,
+            share.cost_basis,
+            share.shares + shares_to_burn,
+        );
         share.cost_basis = share.cost_basis.saturating_sub(basis_reduction);
 
         vault.total_shares -= shares_to_burn;
@@ -4022,9 +3934,7 @@ fn process_place_order_with_builder(
 
     // (1) Same oracle staleness + sanity-band gauntlet as PlaceOrderChecked.
     let mark = read_fresh_oracle(oracle_ai, program_id)?;
-    let band = mark.saturating_mul(SANITY_BAND_BPS) / 10_000;
-    let low = mark.saturating_sub(band);
-    let high = mark.saturating_add(band);
+    let (low, high) = openhl_oracle::sanity_band(mark, SANITY_BAND_BPS);
     if price < low || price > high {
         return Err(ProgramError::InvalidArgument);
     }
@@ -4035,10 +3945,10 @@ fn process_place_order_with_builder(
     // math can express). Protocol fee = notional × PROTOCOL_FEE_BPS / 10000.
     // Builder share = protocol_fee × min(builder.max_fee_share_bps,
     //                                    PROTOCOL_BUILDER_SHARE_CAP_BPS) / 10000.
-    let notional_val = (price as u128) * (size as u128);
-    let protocol_fee = (notional_val * (PROTOCOL_FEE_BPS as u128) / 10_000) as u64;
+    let notional_val = openhl_fees::order_notional(price, size);
+    let protocol_fee = openhl_fees::protocol_fee(notional_val, PROTOCOL_FEE_BPS);
 
-    let mut share_bps;
+    let share_bps;
     let mut builder_pubkey = [0u8; 32];
     let new_volume: u64;
     {
@@ -4048,14 +3958,13 @@ fn process_place_order_with_builder(
         if profile.discriminator != BUILDER_PROFILE_DISCRIMINATOR {
             return Err(ProgramError::UninitializedAccount);
         }
-        share_bps = profile.max_fee_share_bps;
-        if share_bps > PROTOCOL_BUILDER_SHARE_CAP_BPS {
-            // Defensive: registered profile shouldn't exceed cap, but the
-            // cap could have been lowered since the builder registered.
-            share_bps = PROTOCOL_BUILDER_SHARE_CAP_BPS;
-        }
-        let builder_share =
-            ((protocol_fee as u128) * (share_bps as u128) / 10_000) as u64;
+        // Defensive: registered profile shouldn't exceed cap, but the
+        // cap could have been lowered since the builder registered.
+        share_bps = openhl_fees::builder_share_bps(
+            profile.max_fee_share_bps,
+            PROTOCOL_BUILDER_SHARE_CAP_BPS,
+        );
+        let builder_share = openhl_fees::builder_share(protocol_fee, share_bps);
         profile.accumulated_fees = profile
             .accumulated_fees
             .checked_add(builder_share)
@@ -4609,425 +4518,30 @@ fn process_insurance_fund_deposit(
 // otherwise (just FIFO bookkeeping). Chapter 8's flat-array book at
 // `OrderBook` is preserved for the pedagogical comparison and is unchanged.
 
-// ---- Pool helpers ----------------------------------------------------------
+// The book itself (critbit trees, order-node pool, matching) lives in the
+// `openhl-slab` crate; the handlers below check accounts and call it.
 
-/// Initialize the order-node free list inside a fresh `Slab`: all
-/// `SLAB_POOL_CAPACITY` nodes start free, linked via their `next` field.
-fn slab_init_pool(slab: &mut Slab) {
-    for i in 0..SLAB_POOL_CAPACITY {
-        slab.nodes[i].next = if i + 1 < SLAB_POOL_CAPACITY {
-            (i as u16) + 1
-        } else {
-            SLAB_NONE_INDEX
-        };
-        slab.nodes[i].prev = SLAB_NONE_INDEX;
-        slab.nodes[i].size = 0;
-        slab.nodes[i].order_id = 0;
-        slab.nodes[i].owner = [0u8; 32];
-    }
-    slab.pool_free_head = 0;
-}
-
-/// Initialize a critbit tree's tree-node free list.
-fn tree_init(tree: &mut CritbitTree) {
-    tree.root = SLAB_NONE_INDEX;
-    for i in 0..SLAB_TREE_CAPACITY {
-        tree.nodes[i].tag = tree_tag::FREE;
-        tree.nodes[i].next_free = if i + 1 < SLAB_TREE_CAPACITY {
-            (i as u16) + 1
-        } else {
-            SLAB_NONE_INDEX
-        };
-    }
-    tree.free_head = 0;
-}
-
-fn pool_alloc_node(slab: &mut Slab) -> Result<u16, ProgramError> {
-    let head = slab.pool_free_head;
-    if head == SLAB_NONE_INDEX {
-        msg!("slab: order-node pool exhausted");
-        return Err(ProgramError::AccountDataTooSmall);
-    }
-    let next = slab.nodes[head as usize].next;
-    slab.pool_free_head = next;
-    Ok(head)
-}
-
-fn pool_free_node(slab: &mut Slab, idx: u16) {
-    let head = slab.pool_free_head;
-    let node = &mut slab.nodes[idx as usize];
-    node.next = head;
-    node.prev = SLAB_NONE_INDEX;
-    node.size = 0;
-    node.order_id = 0;
-    node.owner = [0u8; 32];
-    slab.pool_free_head = idx;
-}
-
-fn tree_alloc(tree: &mut CritbitTree) -> Result<u16, ProgramError> {
-    let head = tree.free_head;
-    if head == SLAB_NONE_INDEX {
-        msg!("slab: tree-node pool exhausted");
-        return Err(ProgramError::AccountDataTooSmall);
-    }
-    let next = tree.nodes[head as usize].next_free;
-    tree.free_head = next;
-    Ok(head)
-}
-
-fn tree_free(tree: &mut CritbitTree, idx: u16) {
-    let head = tree.free_head;
-    let node = &mut tree.nodes[idx as usize];
-    *node = TreeNode {
-        tag: tree_tag::FREE,
-        split_bit: 0,
-        next_free: head,
-        left_child: SLAB_NONE_INDEX,
-        right_child: SLAB_NONE_INDEX,
-        head_node: SLAB_NONE_INDEX,
-        tail_node: SLAB_NONE_INDEX,
-        order_count: 0,
-        price: 0,
-        _pad: [0u8; 8],
-    };
-    tree.free_head = idx;
-}
-
-// ---- Critbit operations ---------------------------------------------------
-
-/// Walk the tree following `(price >> split_bit) & 1` at each inner node,
-/// stopping at the first leaf encountered. Returns the leaf index (which
-/// may or may not have `price` as its key — caller compares).
-fn critbit_walk_to_leaf(tree: &CritbitTree, price: u64) -> u16 {
-    let mut cur = tree.root;
-    loop {
-        let node = &tree.nodes[cur as usize];
-        if node.tag == tree_tag::LEAF {
-            return cur;
+/// Map an `openhl-slab` error to the program error (and log line) the
+/// handlers have always returned.
+fn slab_error(e: openhl_slab::SlabError) -> ProgramError {
+    use openhl_slab::SlabError;
+    match e {
+        SlabError::PoolExhausted => {
+            msg!("slab: order-node pool exhausted");
+            ProgramError::AccountDataTooSmall
         }
-        // INNER
-        let bit = (price >> node.split_bit) & 1;
-        cur = if bit == 1 { node.right_child } else { node.left_child };
-    }
-}
-
-/// Find an existing leaf with `price`, or create a new one (splicing as
-/// needed). Returns the leaf index. The leaf's FIFO bookkeeping
-/// (`head_node` / `tail_node` / `order_count`) is left to the caller.
-fn critbit_find_or_create_leaf(
-    tree: &mut CritbitTree,
-    price: u64,
-) -> Result<(u16, bool), ProgramError> {
-    // Empty tree → create root leaf.
-    if tree.root == SLAB_NONE_INDEX {
-        let leaf_idx = tree_alloc(tree)?;
-        tree.nodes[leaf_idx as usize] = TreeNode {
-            tag: tree_tag::LEAF,
-            split_bit: 0,
-            next_free: SLAB_NONE_INDEX,
-            left_child: SLAB_NONE_INDEX,
-            right_child: SLAB_NONE_INDEX,
-            head_node: SLAB_NONE_INDEX,
-            tail_node: SLAB_NONE_INDEX,
-            order_count: 0,
-            price,
-            _pad: [0u8; 8],
-        };
-        tree.root = leaf_idx;
-        return Ok((leaf_idx, true));
-    }
-
-    // Walk to any leaf to compare prices.
-    let found_leaf = critbit_walk_to_leaf(tree, price);
-    let found_price = tree.nodes[found_leaf as usize].price;
-    if found_price == price {
-        return Ok((found_leaf, false));
-    }
-
-    // New price — find the bit position to splice at, then splice.
-    let diff = price ^ found_price;
-    // 0-based highest set bit. diff != 0 because prices differ.
-    let shared_bit: u8 = 63u8 - (diff.leading_zeros() as u8);
-
-    // Walk again from root, looking for the spot to splice. We splice
-    // either above the first inner whose split_bit < shared_bit, or
-    // above any leaf we hit (whose split_bit is conceptually -1 < any).
-    let mut parent: u16 = SLAB_NONE_INDEX;
-    let mut parent_side: u8 = 0; // side of parent that cur lives at
-    let mut cur = tree.root;
-    loop {
-        let node = &tree.nodes[cur as usize];
-        if node.tag == tree_tag::LEAF || node.split_bit < shared_bit {
-            break;
+        SlabError::TreeExhausted => {
+            msg!("slab: tree-node pool exhausted");
+            ProgramError::AccountDataTooSmall
         }
-        let bit = ((price >> node.split_bit) & 1) as u8;
-        parent = cur;
-        parent_side = bit;
-        cur = if bit == 1 { node.right_child } else { node.left_child };
-    }
-
-    // Allocate the new leaf and the new inner.
-    let new_leaf_idx = tree_alloc(tree)?;
-    tree.nodes[new_leaf_idx as usize] = TreeNode {
-        tag: tree_tag::LEAF,
-        split_bit: 0,
-        next_free: SLAB_NONE_INDEX,
-        left_child: SLAB_NONE_INDEX,
-        right_child: SLAB_NONE_INDEX,
-        head_node: SLAB_NONE_INDEX,
-        tail_node: SLAB_NONE_INDEX,
-        order_count: 0,
-        price,
-        _pad: [0u8; 8],
-    };
-    let new_inner_idx = tree_alloc(tree)?;
-
-    // Which side does `price` go at shared_bit? That side gets new_leaf_idx;
-    // the other side keeps the existing subtree (cur).
-    let price_bit = ((price >> shared_bit) & 1) as u8;
-    let (left, right) = if price_bit == 1 {
-        (cur, new_leaf_idx)
-    } else {
-        (new_leaf_idx, cur)
-    };
-    tree.nodes[new_inner_idx as usize] = TreeNode {
-        tag: tree_tag::INNER,
-        split_bit: shared_bit,
-        next_free: SLAB_NONE_INDEX,
-        left_child: left,
-        right_child: right,
-        head_node: SLAB_NONE_INDEX,
-        tail_node: SLAB_NONE_INDEX,
-        order_count: 0,
-        price: 0,
-        _pad: [0u8; 8],
-    };
-
-    // Wire the new inner into parent (or as new root).
-    if parent == SLAB_NONE_INDEX {
-        tree.root = new_inner_idx;
-    } else if parent_side == 1 {
-        tree.nodes[parent as usize].right_child = new_inner_idx;
-    } else {
-        tree.nodes[parent as usize].left_child = new_inner_idx;
-    }
-
-    Ok((new_leaf_idx, true))
-}
-
-/// Find the best leaf on the side dictated by `want_max`:
-///   - `want_max = true`  (bids): walk right at every inner — highest price.
-///   - `want_max = false` (asks): walk left at every inner — lowest price.
-fn critbit_find_best(tree: &CritbitTree, want_max: bool) -> Option<u16> {
-    if tree.root == SLAB_NONE_INDEX {
-        return None;
-    }
-    let mut cur = tree.root;
-    loop {
-        let node = &tree.nodes[cur as usize];
-        if node.tag == tree_tag::LEAF {
-            return Some(cur);
-        }
-        cur = if want_max { node.right_child } else { node.left_child };
-    }
-}
-
-/// Remove `leaf_idx` from the tree. Frees both the leaf and the inner above
-/// it (the inner becomes redundant once a leaf is removed — its sibling
-/// promotes up). Handles the root-leaf and single-leaf edge cases.
-fn critbit_remove_leaf(tree: &mut CritbitTree, leaf_idx: u16) -> ProgramResult {
-    // Edge case: leaf is the root.
-    if tree.root == leaf_idx {
-        tree_free(tree, leaf_idx);
-        tree.root = SLAB_NONE_INDEX;
-        return Ok(());
-    }
-
-    // Walk from root by price, tracking parent + grandparent.
-    let target_price = tree.nodes[leaf_idx as usize].price;
-    let mut grandparent: u16 = SLAB_NONE_INDEX;
-    let mut parent: u16 = SLAB_NONE_INDEX;
-    let mut gp_to_p_side: u8 = 0;
-    let mut parent_side: u8 = 0; // which side of parent leads to cur
-    let mut cur = tree.root;
-    loop {
-        if cur == leaf_idx {
-            break;
-        }
-        let node = &tree.nodes[cur as usize];
-        if node.tag != tree_tag::INNER {
-            // Defensive: walking by price reached a non-target leaf — should
-            // not happen with a well-formed tree.
+        SlabError::InvalidOrder => ProgramError::InvalidInstructionData,
+        SlabError::Overflow => ProgramError::ArithmeticOverflow,
+        SlabError::CorruptTree => {
             msg!("slab: critbit walk reached wrong leaf");
-            return Err(ProgramError::InvalidAccountData);
+            ProgramError::InvalidAccountData
         }
-        let bit = ((target_price >> node.split_bit) & 1) as u8;
-        grandparent = parent;
-        gp_to_p_side = parent_side;
-        parent = cur;
-        parent_side = bit;
-        cur = if bit == 1 { node.right_child } else { node.left_child };
+        SlabError::EmptyLevel => ProgramError::InvalidAccountData,
     }
-
-    // `parent` is the inner directly above the leaf. Its other child is the
-    // sibling that promotes up.
-    let parent_node = tree.nodes[parent as usize];
-    let sibling = if parent_side == 1 {
-        parent_node.left_child
-    } else {
-        parent_node.right_child
-    };
-
-    if grandparent == SLAB_NONE_INDEX {
-        tree.root = sibling;
-    } else if gp_to_p_side == 1 {
-        tree.nodes[grandparent as usize].right_child = sibling;
-    } else {
-        tree.nodes[grandparent as usize].left_child = sibling;
-    }
-    tree_free(tree, parent);
-    tree_free(tree, leaf_idx);
-    Ok(())
-}
-
-// ---- Higher-level slab operations ----------------------------------------
-
-/// Insert an order into the slab. Allocates an OrderNode, finds-or-creates
-/// the leaf for `price`, and appends the new node to that level's FIFO.
-/// Returns the assigned `order_id`.
-fn slab_insert_order(
-    slab: &mut Slab,
-    side: u8,
-    price: u64,
-    owner: [u8; 32],
-    size: u64,
-) -> Result<u64, ProgramError> {
-    if size == 0 || price == 0 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-
-    // Alloc + init the order node.
-    let order_idx = pool_alloc_node(slab)?;
-    let order_id = slab.next_order_id;
-    slab.next_order_id = slab
-        .next_order_id
-        .checked_add(1)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    {
-        let node = &mut slab.nodes[order_idx as usize];
-        node.order_id = order_id;
-        node.owner = owner;
-        node.size = size;
-        node.next = SLAB_NONE_INDEX;
-        node.prev = SLAB_NONE_INDEX;
-    }
-
-    // Find or create the leaf, then attach.
-    let tree = if side == side::BID {
-        &mut slab.bid_tree
-    } else {
-        &mut slab.ask_tree
-    };
-    let (leaf_idx, _was_new) = critbit_find_or_create_leaf(tree, price)?;
-    let old_tail_idx: u16;
-    {
-        let leaf = &mut tree.nodes[leaf_idx as usize];
-        if leaf.head_node == SLAB_NONE_INDEX {
-            leaf.head_node = order_idx;
-            leaf.tail_node = order_idx;
-            leaf.order_count = 1;
-            slab.active_count = slab
-                .active_count
-                .checked_add(1)
-                .ok_or(ProgramError::ArithmeticOverflow)?;
-            return Ok(order_id);
-        }
-        old_tail_idx = leaf.tail_node;
-        leaf.tail_node = order_idx;
-        leaf.order_count = leaf
-            .order_count
-            .checked_add(1)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
-    }
-    // Borrow on tree ends here; now touch the OrderNode pool.
-    slab.nodes[old_tail_idx as usize].next = order_idx;
-    slab.nodes[order_idx as usize].prev = old_tail_idx;
-    slab.active_count = slab
-        .active_count
-        .checked_add(1)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    Ok(order_id)
-}
-
-/// Pop the head of the best leaf's FIFO. Returns the order node index +
-/// the price level, or `None` if the side is empty. Caller is responsible
-/// for actually freeing the order node (it may want to read fields first)
-/// and for re-linking the new head if the FIFO had more than one entry.
-fn slab_peek_best(slab: &Slab, want_max: bool) -> Option<(u16, u16, u64)> {
-    let tree = if want_max {
-        &slab.bid_tree
-    } else {
-        &slab.ask_tree
-    };
-    let leaf_idx = critbit_find_best(tree, want_max)?;
-    let leaf = &tree.nodes[leaf_idx as usize];
-    if leaf.head_node == SLAB_NONE_INDEX {
-        return None;
-    }
-    Some((leaf_idx, leaf.head_node, leaf.price))
-}
-
-/// Remove the head of the given leaf's FIFO. If the FIFO becomes empty,
-/// also remove the leaf from the tree (which may free the inner above).
-/// Returns the freed order node index.
-fn slab_pop_head_of_leaf(slab: &mut Slab, side: u8, leaf_idx: u16) -> Result<u16, ProgramError> {
-    let tree = if side == side::BID {
-        &mut slab.bid_tree
-    } else {
-        &mut slab.ask_tree
-    };
-
-    let head_idx: u16;
-    let new_head: u16;
-    let became_empty: bool;
-    {
-        let leaf = &mut tree.nodes[leaf_idx as usize];
-        head_idx = leaf.head_node;
-        if head_idx == SLAB_NONE_INDEX {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        leaf.order_count = leaf.order_count.saturating_sub(1);
-    }
-    new_head = slab.nodes[head_idx as usize].next;
-    {
-        let tree2 = if side == side::BID {
-            &mut slab.bid_tree
-        } else {
-            &mut slab.ask_tree
-        };
-        let leaf = &mut tree2.nodes[leaf_idx as usize];
-        leaf.head_node = new_head;
-        if new_head == SLAB_NONE_INDEX {
-            leaf.tail_node = SLAB_NONE_INDEX;
-            became_empty = true;
-        } else {
-            became_empty = false;
-        }
-    }
-    if new_head != SLAB_NONE_INDEX {
-        slab.nodes[new_head as usize].prev = SLAB_NONE_INDEX;
-    }
-    if became_empty {
-        let tree3 = if side == side::BID {
-            &mut slab.bid_tree
-        } else {
-            &mut slab.ask_tree
-        };
-        critbit_remove_leaf(tree3, leaf_idx)?;
-    }
-    pool_free_node(slab, head_idx);
-    slab.active_count = slab.active_count.saturating_sub(1);
-    Ok(head_idx)
 }
 
 // ---- Handlers --------------------------------------------------------------
@@ -5096,9 +4610,7 @@ fn process_create_slab(
     slab.next_order_id = 0;
     slab.active_count = 0;
     slab._pad1 = [0u8; 2];
-    tree_init(&mut slab.bid_tree);
-    tree_init(&mut slab.ask_tree);
-    slab_init_pool(slab);
+    openhl_slab::init(slab);
 
     msg!("slab created (bump {})", bump);
     Ok(())
@@ -5145,7 +4657,8 @@ fn process_slab_place_order(
 
     let mut owner = [0u8; 32];
     owner.copy_from_slice(user_ai.key.as_ref());
-    let order_id = slab_insert_order(slab, order_side, price, owner, size)?;
+    let order_id = openhl_slab::insert_order(slab, order_side, price, owner, size)
+        .map_err(slab_error)?;
 
     msg!(
         "slab_place_order: side={} price={} size={} order_id={} active_count={}",
@@ -5202,58 +4715,26 @@ fn process_slab_match(
         return Err(ProgramError::UninitializedAccount);
     }
 
-    // Maker side = the side we cross against. A BID taker (wants to buy)
-    // takes from asks (min price); an ASK taker (wants to sell) takes from
-    // bids (max price).
-    let maker_side = if taker_side == side::BID {
-        side::ASK
-    } else {
-        side::BID
-    };
-    let want_max = maker_side == side::BID; // crossing the bid tree → want highest
-
-    let mut fills: usize = 0;
-    while fills < max_fills && remaining > 0 {
-        let (leaf_idx, head_idx, level_price) = match slab_peek_best(slab, want_max) {
-            Some(v) => v,
-            None => break, // book empty on the maker side
-        };
-
-        // Limit-price gate. Taker is willing to:
-        //   BID taker: buy up to limit_price → cross asks where level_price <= limit_price.
-        //   ASK taker: sell down to limit_price → cross bids where level_price >= limit_price.
-        let crosses = if taker_side == side::BID {
-            level_price <= limit_price
-        } else {
-            level_price >= limit_price
-        };
-        if !crosses {
-            break;
-        }
-
-        // How much can we take from this maker?
-        let maker_size = slab.nodes[head_idx as usize].size;
-        let fill = remaining.min(maker_size);
-
-        if fill == maker_size {
-            // Maker fully consumed — pop it from the FIFO. May also drop
-            // the leaf if this was the last order at this level.
-            slab_pop_head_of_leaf(slab, maker_side, leaf_idx)?;
-        } else {
-            // Partial fill — maker stays, size shrinks.
-            slab.nodes[head_idx as usize].size = maker_size - fill;
-        }
-
-        remaining -= fill;
-        fills = fills.saturating_add(1);
-        msg!(
-            "slab_match: fill #{} price={} size={} remaining={}",
-            fills,
-            level_price,
-            fill,
-            remaining
-        );
-    }
+    // Price-time priority against the opposite side; see openhl-slab.
+    let outcome = openhl_slab::match_order(
+        slab,
+        taker_side,
+        limit_price,
+        remaining,
+        max_fills,
+        |f| {
+            msg!(
+                "slab_match: fill #{} price={} size={} remaining={}",
+                f.n,
+                f.price,
+                f.size,
+                f.remaining
+            )
+        },
+    )
+    .map_err(slab_error)?;
+    let fills = outcome.fills;
+    remaining = outcome.remaining;
 
     msg!(
         "slab_match: done. fills={} remaining_taker_size={} active_count={}",

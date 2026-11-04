@@ -13,7 +13,7 @@
 //!                                     (active_count + best bid + best ask)
 //!
 //! Usage:
-//!   slab --rpc http://127.0.0.1:8899 \
+//!   slab-cli --rpc http://127.0.0.1:8899 \
 //!        --payer ~/.config/solana/id.json \
 //!        --program <openhl-core program ID> \
 //!        --market <market PDA> \
@@ -58,9 +58,9 @@ struct Cli {
 
     #[arg(long)]
     r#match: bool,
-    #[arg(long, requires = "r#match")]
+    #[arg(long, requires = "match")]
     taker_side: Option<String>,
-    #[arg(long, requires = "r#match")]
+    #[arg(long, requires = "match")]
     max_fills: Option<u8>,
 
     /// price for both --place (limit) and --match (taker price cap)

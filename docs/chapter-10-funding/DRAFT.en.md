@@ -2,6 +2,8 @@
 
 > Status: draft (v0.1).
 > Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`FundingState`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_funding_state` 2162–2232, `process_update_funding` 2239–2317), [`scripts/funding/src/main.rs`](../../scripts/funding/src/main.rs).
+>
+> Since the parts split, the logic this chapter walks through lives in [`crates/funding/src/lib.rs`](../../crates/funding/src/lib.rs) (`openhl-funding`); the program calls it. The code quoted below is the pre-split version from `programs/openhl-core/src/lib.rs`, and its line numbers are not kept in sync.
 
 ---
 
