@@ -1,7 +1,7 @@
 # Chapter 4 — Compute Budget and Heap Discipline
 
 > Status: draft (v0.1).
-> Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_bench` at lines 689–735), [`scripts/bench/src/main.rs`](../../scripts/bench/src/main.rs), [`fuzz/basics/src/main.rs`](../../fuzz/basics/src/main.rs) (the solinv harness for §4.7).
+> Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_bench` at lines 682–728), [`scripts/bench/src/main.rs`](../../scripts/bench/src/main.rs), [`fuzz/basics/src/main.rs`](../../fuzz/basics/src/main.rs) (the solinv harness for §4.7).
 > Tested against: solana-program 2.3.0, solana-program-entrypoint 2.3.0, solana-compute-budget-interface 2.2.2.
 
 ---
@@ -168,7 +168,7 @@ Three properties to remember:
 
 ## §4.4  Walking `process_bench`
 
-The handler is small — about 50 lines at `programs/openhl-core/src/lib.rs:355–402`. Its structure is three phases bracketed by `sol_log_compute_units`:
+The handler is small — about 50 lines at `programs/openhl-core/src/lib.rs:682–728`. Its structure is three phases bracketed by `sol_log_compute_units`:
 
 **Entry.** Decode the 8-byte payload (`rounds: u32 LE` then `heap_bytes: u32 LE`) and log the starting CU:
 
@@ -203,7 +203,7 @@ for i in 0..rounds {
 
 This is the workload that actually burns CU. `sha256` is a syscall on BPF (`sol_sha256_`), and its cost depends on the input length. Subtracting the Phase A reading from the Phase B reading gives the per-round CU cost — roughly `(sha256 syscall base) + (per-byte cost × heap_bytes)`.
 
-The XOR-with-counter on line `lib.rs:392` exists to keep the optimizer honest. Without it, every iteration would hash the same bytes, and a sufficiently aggressive optimizer could collapse the loop. Stirring `i` into the buffer makes every iteration's input genuinely different.
+The XOR-with-counter on line `lib.rs:720` exists to keep the optimizer honest. Without it, every iteration would hash the same bytes, and a sufficiently aggressive optimizer could collapse the loop. Stirring `i` into the buffer makes every iteration's input genuinely different.
 
 The `_` final reading is captured automatically by `sol_log_compute_units` when the function returns (in the form of the runtime's own "consumed N of M compute units" log line, emitted after the program exits).
 

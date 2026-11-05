@@ -1,7 +1,7 @@
 # 第4章 — コンピュートバジェットとヒープの規律
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_bench`、689–735 行）、[`scripts/bench/src/main.rs`](../../scripts/bench/src/main.rs)、[`fuzz/basics/src/main.rs`](../../fuzz/basics/src/main.rs)（§4.7 の solinv ハーネス）。
+> 教材コード: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_bench`、682–728 行）、[`scripts/bench/src/main.rs`](../../scripts/bench/src/main.rs)、[`fuzz/basics/src/main.rs`](../../fuzz/basics/src/main.rs)（§4.7 の solinv ハーネス）。
 > 検証対象バージョン: solana-program 2.3.0、solana-program-entrypoint 2.3.0、solana-compute-budget-interface 2.2.2。
 
 ---
@@ -168,7 +168,7 @@ compute-budget 命令はトランザクション内の位置に関わらずラ�
 
 ## §4.4  `process_bench` を歩く
 
-ハンドラは小さい — `programs/openhl-core/src/lib.rs:355–402` の約 50 行。構造は、`sol_log_compute_units` で挟まれた 3 フェーズだ。
+ハンドラは小さい — `programs/openhl-core/src/lib.rs:682–728` の約 50 行。構造は、`sol_log_compute_units` で挟まれた 3 フェーズだ。
 
 **入口。** 8 バイトのペイロードを復号し（`rounds: u32 LE`、`heap_bytes: u32 LE`）、開始 CU を記録する。
 
@@ -203,7 +203,7 @@ for i in 0..rounds {
 
 ここが実際に CU を燃やす作業だ。`sha256` は BPF 上では syscall（`sol_sha256_`）で、コストは入力長に依存する。フェーズ A の読み値からフェーズ B の読み値を引いた差が、1 ラウンドあたりの CU コスト — おおよそ `(sha256 syscall 基本コスト) + (バイトあたりコスト × heap_bytes)` だ。
 
-`lib.rs:392` のカウンタとの XOR は、オプティマイザに正直でいてもらうために存在する。これがないと、毎回同じバイトをハッシュすることになり、十分に攻撃的なオプティマイザはループを潰してしまう可能性がある。`i` をバッファに混ぜることで、各反復の入力が本当に異なるものになる。
+`lib.rs:720` のカウンタとの XOR は、オプティマイザに正直でいてもらうために存在する。これがないと、毎回同じバイトをハッシュすることになり、十分に攻撃的なオプティマイザはループを潰してしまう可能性がある。`i` をバッファに混ぜることで、各反復の入力が本当に異なるものになる。
 
 最後の `_` 読み値は、関数 return 時に `sol_log_compute_units` が自動で残す（ランタイム自身が「consumed N of M compute units」というログ行をプログラム終了後に出力する形で）。
 
