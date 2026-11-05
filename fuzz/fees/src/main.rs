@@ -136,12 +136,16 @@ fn fee_mint_guards(profile_ix: usize, market_ix: usize) -> Vec<GuardCondition> {
         .collect()
 }
 
-/// `profile.accumulated_fees <= fee_vault.amount`.
-fn fees_covered(profile_ix: usize, vault_ix: usize) -> StateInvariant {
+/// `sum(profile.accumulated_fees) <= fee_vault.amount` over the builders
+/// paid from that vault (B and B2, both in Q).
+fn fees_covered(profile_ixs: &[usize], vault_ix: usize) -> StateInvariant {
     StateInvariant {
-        name: "fee vault covers what the builder is owed".into(),
+        name: "fee vault covers what builders are owed".into(),
         kind: StateInvariantKind::Relation {
-            lhs: vec![RelTerm::Field { account: profile_ix, field_offset: PROFILE_ACCUMULATED, field_size: 8 }],
+            lhs: profile_ixs
+                .iter()
+                .map(|&a| RelTerm::Field { account: a, field_offset: PROFILE_ACCUMULATED, field_size: 8 })
+                .collect(),
             op: RelOp::Le,
             rhs: vec![RelTerm::Field { account: vault_ix, field_offset: TOKEN_AMOUNT, field_size: 8 }],
             tolerance: 0,
@@ -362,9 +366,10 @@ impl FeesFixture {
             );
             f.send(ix, &[&**kp], "register builder");
         }
-        // B2 has earned something, so its profile is worth stealing.
-        let ix = f.ix(f.place_metas(&m, &q, &u_q, &b2.pubkey()), order_data(1_000));
-        f.send(ix, &[&*u], "U trades through B2");
+        // Setup credits no builder: a mutation that over-credits would
+        // then break the relation before the fuzzer starts, and solinv
+        // (rightly) reports nothing for a relation already false. The
+        // fuzzer's own orders credit B and B2.
         // J's fee vault holds fees from a plain order (no builder), so a
         // claim pointed at it has something to take.
         let mut metas = f.place_metas(&jm, &j, &u_j, &b.pubkey());
@@ -376,9 +381,15 @@ impl FeesFixture {
         f
     }
 
-    pub fn action_place(&mut self, #[range(1..100_000)] size: u64, #[range(0..2)] second_market: u8) -> bool {
+    pub fn action_place(
+        &mut self,
+        #[range(1..100_000)] size: u64,
+        #[range(0..2)] second_market: u8,
+        #[range(0..2)] through_b2: u8,
+    ) -> bool {
         let market = if second_market == 1 { self.m2 } else { self.m };
-        let ix = self.ix(self.place_metas(&market, &self.q, &self.u_q, &self.b.pubkey()), order_data(size));
+        let builder = if through_b2 == 1 { self.b2.pubkey() } else { self.b.pubkey() };
+        let ix = self.ix(self.place_metas(&market, &self.q, &self.u_q, &builder), order_data(size));
         self.send_logged(ix, Arc::clone(&self.u)).0
     }
 
@@ -433,8 +444,12 @@ impl HasInstructionSet for FeesFixture {
     fn instructions(&self) -> Vec<InstructionSpec> {
         let (b, b2) = (self.b.pubkey(), self.b2.pubkey());
         let place = |name: &str, market: &Pubkey, mint: &Pubkey, from: &Pubkey| {
-            let mut s = spec(name, self.place_metas(market, mint, from, &b), order_data(10), Arc::clone(&self.u));
-            s.state_invariants = vec![fees_covered(8, 6)];
+            // B2's profile rides along at the end, unread by the handler, so
+            // the relation can sum both builders.
+            let mut metas = self.place_metas(market, mint, from, &b);
+            metas.push(AccountMeta::new_readonly(profile(&b2), false));
+            let mut s = spec(name, metas, order_data(10), Arc::clone(&self.u));
+            s.state_invariants = vec![fees_covered(&[8, 9], 6)];
             s.guards = fee_mint_guards(8, 3);
             s.swap_alternates[1] = vec![book(&self.m2)]; // another market's book
             s.swap_alternates[2] = vec![oracle(&self.m2)]; // another market's oracle
@@ -453,13 +468,10 @@ impl HasInstructionSet for FeesFixture {
         // B's Q credit against J's vault says nothing; only the guard applies.
         place_jm.state_invariants = vec![];
 
-        let mut claim = spec(
-            "claim_builder_fees",
-            self.claim_metas(&b, &self.q, &self.b_q),
-            vec![IX_CLAIM_BUILDER_FEES],
-            Arc::clone(&self.b),
-        );
-        claim.state_invariants = vec![fees_covered(1, 3)];
+        let mut claim_accounts = self.claim_metas(&b, &self.q, &self.b_q);
+        claim_accounts.push(AccountMeta::new_readonly(profile(&b2), false));
+        let mut claim = spec("claim_builder_fees", claim_accounts, vec![IX_CLAIM_BUILDER_FEES], Arc::clone(&self.b));
+        claim.state_invariants = vec![fees_covered(&[1, 7], 3)];
         claim.swap_alternates[1] = vec![profile(&b2)]; // claim B2's fees as B
         claim.swap_alternates[3] = vec![fee_vault(&self.j)]; // pay out of J's vault
 

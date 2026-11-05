@@ -304,9 +304,9 @@ Builder ライフサイクル:
 
 第 3・6・12 章は、[solinv](https://github.com/psyto/solinv) にアカウントを差し替えさせて終わった。ここでの問いは違う。手数料の vault は、builder に払うべき額をいつも持っているか。第 6 章 §6.6 はこれを持ち越した。手数料の vault は全市場が共有する唯一のアカウントで、組には PDA ではない 2 つ目の市場がありうるからだ。
 
-[`fuzz/fees/`](../../fuzz/fees) がそのハーネスである。builder B は quote の mint Q で登録し、利用者 U は B を通して取引する。市場は 3 つあり、それぞれに板と新しいオラクルがある。PDA にある `(base, Q)`、第 2 章の `Initialize` で PDA ではないアドレスに作った 2 つ目の `(base, Q)`、誰でも作れる mint J の `(base, J)` だ。いつもの signer-skip と account-swap に加えて、仕様は 2 つの規則を宣言する:
+[`fuzz/fees/`](../../fuzz/fees) がそのハーネスである。builder B と B2 は quote の mint Q で登録し、利用者 U はどちらかを通して取引する。市場は 3 つあり、それぞれに板と新しいオラクルがある。PDA にある `(base, Q)`、第 2 章の `Initialize` で PDA ではないアドレスに作った 2 つ目の `(base, Q)`、誰でも作れる mint J の `(base, J)` だ。いつもの signer-skip と account-swap に加えて、仕様は 2 つの規則を宣言する:
 
-- **関係**(solinv の `Relation`。`unchecked_math` が確かめる): `PlaceOrderWithBuilder` と `ClaimBuilderFees` の両方で `profile.accumulated_fees <= fee_vault.amount`。命令の前に成り立っていて、後で崩れたときだけ報告する。
+- **関係**(solinv の `Relation`。`unchecked_math` が確かめる): `PlaceOrderWithBuilder` と `ClaimBuilderFees` の両方で、B と B2 の profile の `accumulated_fees` の合計が Q の手数料の vault の残高以下。(関係が読めるよう、B2 の profile を各命令のアカウントの末尾に足してある。ハンドラはその余分なアカウントを読まない。)命令の前に成り立っていて、後で崩れたときだけ報告する。
 - **ガード**(`precondition_skip` が確かめる): `PlaceOrderWithBuilder` が成功してよいのは `profile.fee_mint == market.quote_mint` のときだけ。solinv が比べるフィールドは 16 バイトまでなので、32 バイトの mint にはガードが 2 つ要る。
 
 第 3 章 §3.7 のとおり準備してから:
@@ -336,10 +336,10 @@ timeout -s INT 60 crucible run openhl_fees_fuzz invariant_ch13 \
 > | Claim: `builder_ai.is_signer` | **はい** | signer-skip: 誰でも B の手数料を、自分の指定する口座に受け取れた |
 > | Claim: `profile.fee_mint == mint` | **はい**(組で) | account-swap `check_sets`: B の Q の手数料が J の vault から B の J の口座へ払われた(4 つの slot を一緒に) |
 > | Claim: `verify_fee_vault_token_account` | いいえ | SPL Token: `owner does not match`(Q の vault の authority は J の vault に署名できない) |
-> | Claim: `accumulated_fees = 0` を消す | **はい** | 関係: 2 回目の claim の前は成り立ち(1004 ≤ 2004)、後で崩れた(1004 対 1000)。`claim_pays_once` が落ちる |
-> | Place: builder の取り分を `protocol_fee` でなく `notional` から計算 | **はい** | 関係: 注文 1 回で、vault の 1010 に対して借りが 5000 |
+> | Claim: `accumulated_fees = 0` を消す | **はい** | 関係、最初の claim で: 前は vault の 12,266 に対して借り 12,262、後は 6 に対して 12,262。`claim_pays_once` が落ちる |
+> | Place: builder の取り分を `protocol_fee` でなく `notional` から計算 | **はい** | 関係: 最初の注文の前は借り 0 対 vault 0、後は 10 に対して 5,000 |
 >
-> 2 つのことを見直す価値がある。最後の 2 行は、検査の抜けではまったくない。どのアカウントも正しく、どの検査も通るのに、プログラムは持っている以上を約束する。それが見えるのは数についての規則だけで、それはこの章の原子性の議論(§13.4)が扱っている規則でもある。もう 1 つ、claim 側の `fee_mint` の行には、4 つのアカウントを一緒に差し替える必要があった。私たちの最初の組は 3 つを差し替え、送り先を B の Q の口座のままにしていたので、SPL Token が mint の不一致で拒否した。それは消した検査について何も語っていなかった。攻撃者は J の送り先を指定する。第 12 章と同じく、拒否は、どの検査が拒否したかが分かって初めて証拠になる。
+> 3 つのことを見直す価値がある。最後の 2 行は、検査の抜けではまったくない。どのアカウントも正しく、どの検査も通るのに、プログラムは持っている以上を約束する。それが見えるのは数についての規則だけで、それはこの章の原子性の議論(§13.4)が扱っている規則でもある。もう 1 つ、これは私たちのハーネスの罠だ。最初の版では B2 が `setup()` の中で手数料を得ていた。取り分を `notional` から計算すると、その準備の注文の時点で関係がもう崩れており、solinv は命令の前から偽の関係を検出ではなく宣言の問題として報告するので、この行は「いいえ」になっていた。今は fuzzer 自身の注文だけが builder に加算する。最後に、claim 側の `fee_mint` の行には、4 つのアカウントを一緒に差し替える必要があった。私たちの最初の組は 3 つを差し替え、送り先を B の Q の口座のままにしていたので、SPL Token が mint の不一致で拒否した。それは消した検査について何も語っていなかった。攻撃者は J の送り先を指定する。第 12 章と同じく、拒否は、どの検査が拒否したかが分かって初めて証拠になる。
 >
 > 1 つの差し替えはわざと外してある。`PlaceOrderWithBuilder` の slot 8 を別の builder の profile にすると通る。U が B ではなく B2 に加算する。それが設計だ。どのフロントエンドに加算するかは利用者が選び、どちらでも手数料は払う。
 
