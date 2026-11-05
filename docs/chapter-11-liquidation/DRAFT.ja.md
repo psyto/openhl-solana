@@ -1,7 +1,7 @@
 # 第11章 — ポジション ライフサイクルと清算エンジン
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Position`、`InsuranceFund`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（ヘルパ + `process_open_position`、`process_close_position`、`process_liquidate`、`process_create_insurance_fund`、`process_insurance_fund_deposit`）、[`scripts/position/src/main.rs`](../../scripts/position/src/main.rs)。
+> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Position`、`InsuranceFund`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（ヘルパ + `process_open_position`、`process_close_position`、`process_liquidate`、`process_create_insurance_fund`、`process_insurance_fund_deposit`）、[`scripts/position/src/main.rs`](../../scripts/position/src/main.rs)、[`fuzz/positions/src/main.rs`](../../fuzz/positions/src/main.rs)（§11.7 の solinv ハーネス）。
 >
 > 部品化に伴い、この章で読むロジックは [`crates/margin/src/lib.rs`](../../crates/margin/src/lib.rs)(`openhl-margin`)に移り、プログラムはそれを呼び出す。以下に引用するコードは分割前の `programs/openhl-core/src/lib.rs` の版で、行番号は追従していない。
 
@@ -124,11 +124,14 @@ if position_ai.key != &expected {
 **外部入力を読む**（2911–2912 行）:
 
 ```rust
+verify_market_oracle_and_funding(oracle_ai, funding_ai, market_ai.key, program_id)?;
 let mark = read_fresh_oracle(oracle_ai, program_id)?;
 let funding_snapshot = read_funding_index(funding_ai, program_id)?;
 ```
 
 `read_fresh_oracle`（2353–2372 行）は第 9 章の staleness ガントレットをヘルパに分離した — 同じチェック（owner + discriminator + price>0 + Clock に対する age）、3 つのポジション ハンドラで再利用。`read_funding_index`（2597–2607 行）はファンディング指数をスナップショットする簡単な読み。
+
+どちらのヘルパも、渡されたオラクルやファンディング状態が**誰の**ものかを問わない。どの市場のオラクルもこのプログラムが所有し、同じ discriminator を持つからだ。そこで 3 つのポジション ハンドラはどれも、まず `verify_market_oracle_and_funding` を呼ぶ。2 つのアカウントがこの市場の PDA、つまり `[ORACLE_SEED, market]` と `[FUNDING_SEED, market]` であることを求める。`PlaceOrderChecked` がオラクルについてすでに使っていた導き方と同じだ(第 9 章)。この章の最初の版は、3 つのハンドラすべてでこれを書き忘れていた。同じ quote の mint に市場が 2 つあり、一方が 100、もう一方が 200 のとき、利用者は 1 つ目でロングを開き、2 つ目の市場のオラクルを指定して閉じた。200 を入れて、1 つ目の市場のトークン口座(全員の担保が入っている)から 1,200 を持ち出した。清算者も同じやり方で健全なショートを清算できた。第 9 章の publisher の検査(演習 §9.2)は役に立たない。どちらの価格も正直で、ただ市場が違うだけだからだ。fuzzer がこれをどう見つけたかは §11.7 で示す。
 
 **初期証拠金チェック**（2915–2926 行）:
 
@@ -462,6 +465,54 @@ N-1.  [WRITE]  insurance_fund_token  — 基金の SPL トークン アカウン
 1. **IM↔MM ギャップがバッファ。** IM ちょうど（担保 = notional の 10%）でポジションをオープン。オラクルを動かさずに、ダンプ出力からポジションが健全（equity ≈ collateral、MM をしっかり上回る）であることを確認。IM ギャップが消費される程度（5% 逆行）にオラクルを動かす。これで equity ≈ MM — まだ清算可能ではない。さらに 1 bp の逆行で `Liquidate` が成功する。
 2. **ファンディング蓄積で答えが反転しうる。** 担保ちょうど MM でポジションをオープン。オラクルに触れない。`funding --update --rate 100` で逆方向にファンディングを蓄積させ、1 分待ち、`funding --update --rate 100`。ダンプでポジションの計算済み equity をチェック — 価格は動いていなくてもファンディング PnL が equity を MM 以下に引きずる。`Liquidate` が成功する。
 3. **クローズは担保を返すが、清算は返さない。** IM でオープン、即座にクローズ（価格動かず、ファンディングなし）。`position.collateral` ≈ オリジナル。再び IM でオープン、MM まで落ちて別の鍵ペアに清算される。清算後の `position.collateral` = equity − ペナルティ ≈ かなり少ない。ペナルティが「綺麗に退出する」vs「清算される」の差。
+
+
+### 書き忘れた検査を道具に探させる
+
+[`fuzz/positions/`](../../fuzz/positions) は、3 つのポジション ハンドラのための [solinv](https://github.com/psyto/solinv) のハーネスである。2 つの市場が quote の mint Q を共有し、それぞれにオラクル、ファンディング状態、トークン口座、保険基金がある。`m` は 100、`n` は 200。`m` では A がロング、B がショートを持ち、どちらも健全だ。E は 110 で開いたロングを持ち、100 では維持証拠金を下回るが、まだ残りを受け取る権利がある。C はまだポジションを持たない。`n` では D がロングを持つので、`n` のトークン口座にはトークンがある。仕様は C のポジションを開き、A のを閉じ、B と E のを清算し、`n` のオラクルとファンディング状態、別の利用者のポジション、`n` のトークン口座と保険基金、呼び出し側が持たないトークン口座を差し替える。2 つの組は `n` のアカウントを全部一緒に差し替える。第 3 章 §3.7 のとおり準備してから:
+
+```bash
+cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
+cd fuzz/positions
+cargo build --release --features invariant_ch11
+cargo test --release --features invariant_ch11
+timeout -s INT 60 crucible run openhl_positions_fuzz invariant_ch11 \
+    --binary-in target/release/invariant_test --timeout 45
+```
+
+今のプログラムでは `[FUZZ_FINDING]` の行は出ない。`verify_market_oracle_and_funding` を入れる前のプログラムでは、最初の実行で数秒のうちにこう報告された:
+
+```
+[FUZZ_FINDING] [account-swap:…] ix open_position succeeded with account 3 swapped … (different context, same shape)
+```
+
+slot 3 はオラクルだ。Crucible は最初の検出で 1 回の実行を止めるので、Close と Liquidate には順番が回ってこなかった。その 2 つはテスト `close_refuses_another_markets_oracle` と `liquidate_refuses_another_markets_oracle` で押さえてある。
+
+> **演習 §11.7.** 検査を 1 つずつ消し、作り直して走らせよ。先に予想すること。私たちが各 45 秒で測った結果を示す。「いいえ」の行の最後の列は、差し替えた呼び出しを代わりに拒否したもので、ログから読んだ(`probe` テストが出力する):
+>
+> | 消した検査 | 捕まったか | どう捕まったか、または代わりに拒否したもの |
+> |---|---|---|
+> | Open: `user_ai.is_signer` | いいえ | ランタイム: 権限のない署名者(担保の転送に利用者の署名が要る) |
+> | Open: `market_ai.owner == program_id` | いいえ | 次の自前の検査: `market is not a Market account` |
+> | Open: `verify_vault_token_account` | **はい**、account-swap、slot 7 | 担保が `n` の口座に預けられ、`m` に記録された |
+> | Open: ポジションの PDA | いいえ | ランタイム: 権限のない署名者(別のアドレスへの `create_account` にはそのアドレスの署名が要る) |
+> | Open: `verify_market_oracle_and_funding` | **はい**、account-swap、slot 3 | 建値が `n` のオラクルから来た |
+> | Open: 初期証拠金の検査 | いいえ | ハーネスのどこにも証拠金の規則がない。`open_below_initial_margin_is_refused` が落ちる |
+> | Close: `user_ai.is_signer` | **はい**、signer-skip | 誰でも A のポジションを閉じられた |
+> | Close: `position.user == user` | **はい**、account-swap、slot 1 | A が B のポジションを閉じた |
+> | Close: `position.market == market` | **はい**(組で) | `m` のポジションが `n` のアカウント一式に対して閉じられた |
+> | Close: `verify_vault_token_account` | いいえ | SPL Token: `owner does not match`(`m` の authority は `n` の口座に署名できない) |
+> | Close: `verify_market_oracle_and_funding` | **はい**、account-swap、slot 2 | `n` の価格で閉じた。`close_refuses_another_markets_oracle` が落ちる |
+> | Close: `fund.market == market` | **はい**、account-swap、slot 10 | `m` のポジションに `n` の保険基金が使われた |
+> | Liquidate: `liquidator_ai.is_signer` | **はい**、signer-skip | — ただし下を見よ |
+> | Liquidate: `position.market == market` | **はい**(組で) | Close と同じ |
+> | Liquidate: 所有者のトークン口座 | **はい**、account-swap、slot 6 | E の残りが清算者に払われた |
+> | Liquidate: `is_liquidatable` | いいえ | ハーネスのどこにも、清算してよい条件がない。`healthy_position_is_not_liquidatable` が落ちる |
+> | Liquidate: `verify_market_oracle_and_funding` | **はい**、account-swap、slot 2 | B の健全なショートが `n` の価格で清算された。`liquidate_refuses_another_markets_oracle` が落ちる |
+>
+> 3 つの行は見直す価値がある。清算者の署名の行は、穴ではない検出だ。清算は誰でもでき(§11.5)、ペナルティは呼び出し側が指定したトークン口座に入り、誰が署名したかに頼るものはほかにない。だからこの検査を外しても、もともと許されていなかった人は誰も入ってこない。証拠金の 2 行は、fuzzer には見えない穴だ。担保の足りないポジションを開くことも、健全なポジションを清算することも、アカウントはすべて正しい呼び出しである。それを捕まえるのは、規則を書いたテストだけだ。アカウントを差し替える fuzzer が見つけるのは**結びつけ**の抜けで、数についての規則は誰かが書き下す必要がある(第 13 章 §13.6 が手数料についてそれをする)。
+>
+> ハーネスを書く途中の罠が 2 つあり、どちらも行を間違った理由で「いいえ」にした。最初の清算の対象は B で、`m` の価格では健全だったので、B の清算の差し替えはどれも、確かめたいアカウントにたどり着く前に健全性の検査で落ちた。100 で清算できる E でそれは直ったが、今度は E のペナルティ後の残りが 0 で、それを清算者に回しても何も動かなかった。今の E の担保は 130 だ。もう 1 つ、所有者の口座についての最初の変異は、`||` でつながった条件の頭に `false &&` を付けたので、優先順位のせいで検査の残りがそのまま残った。どの場合も、実際にどの検査が呼び出しを拒否したかは、probe のログの行が示していた。
 
 ---
 

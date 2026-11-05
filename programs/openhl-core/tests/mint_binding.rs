@@ -6,7 +6,9 @@
 //! natively (CPIs, the clock and rent are stubbed).
 
 use bytemuck::Zeroable;
-use openhl_core::{process_instruction, POSITION_SEED, SPL_TOKEN_PROGRAM_ID, VAULT_SEED};
+use openhl_core::{
+    process_instruction, FUNDING_SEED, ORACLE_SEED, POSITION_SEED, SPL_TOKEN_PROGRAM_ID, VAULT_SEED,
+};
 use openhl_state::*;
 use solana_program::{
     account_info::AccountInfo, clock::Clock, entrypoint::ProgramResult, instruction::Instruction,
@@ -115,8 +117,8 @@ fn open(market_data: Vec<u8>, mint: Pubkey) -> ProgramResult {
             *p,
             vec![0u8; Position::LEN],
         ),
-        acc(Pubkey::new_unique(), *p, pod(o)),
-        acc(Pubkey::new_unique(), *p, pod(f)),
+        acc(pda(&[ORACLE_SEED, market.as_ref()], p), *p, pod(o)),
+        acc(pda(&[FUNDING_SEED, market.as_ref()], p), *p, pod(f)),
         acc(mint, SPL_TOKEN_PROGRAM_ID, vec![]),
         acc(Pubkey::new_unique(), SPL_TOKEN_PROGRAM_ID, vec![0u8; 165]),
         acc(

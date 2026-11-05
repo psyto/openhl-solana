@@ -1,7 +1,7 @@
 # Chapter 11 — Position Lifecycle and Liquidation Engine
 
 > Status: draft (v0.1).
-> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Position`, `InsuranceFund`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (helpers + `process_open_position`, `process_close_position`, `process_liquidate`, `process_create_insurance_fund`, `process_insurance_fund_deposit`), [`scripts/position/src/main.rs`](../../scripts/position/src/main.rs).
+> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Position`, `InsuranceFund`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (helpers + `process_open_position`, `process_close_position`, `process_liquidate`, `process_create_insurance_fund`, `process_insurance_fund_deposit`), [`scripts/position/src/main.rs`](../../scripts/position/src/main.rs), [`fuzz/positions/src/main.rs`](../../fuzz/positions/src/main.rs) (the solinv harness for §11.7).
 >
 > Since the parts split, the logic this chapter walks through lives in [`crates/margin/src/lib.rs`](../../crates/margin/src/lib.rs) (`openhl-margin`); the program calls it. The code quoted below is the pre-split version from `programs/openhl-core/src/lib.rs`, and its line numbers are not kept in sync.
 
@@ -124,11 +124,14 @@ if position_ai.key != &expected {
 **Read external inputs** (lines 2911–2912):
 
 ```rust
+verify_market_oracle_and_funding(oracle_ai, funding_ai, market_ai.key, program_id)?;
 let mark = read_fresh_oracle(oracle_ai, program_id)?;
 let funding_snapshot = read_funding_index(funding_ai, program_id)?;
 ```
 
 `read_fresh_oracle` (lines 2353–2372) factors the Chapter 9 staleness gauntlet into a helper — same checks (owner + discriminator + price>0 + age vs Clock), reused across all three position handlers. `read_funding_index` (lines 2597–2607) is the simpler read used to snapshot the funding index.
+
+Neither helper asks *whose* oracle or funding state it was handed: every market's oracle is owned by this program and carries the same discriminator. So all three position handlers first call `verify_market_oracle_and_funding`, which requires the two accounts to be this market's PDAs, `[ORACLE_SEED, market]` and `[FUNDING_SEED, market]`, the same derivation `PlaceOrderChecked` already used for its oracle (Chapter 9). The first version of this chapter left it out of all three handlers. With two markets in one quote mint, one at 100 and one at 200, a user opened a long on the first and closed it naming the second market's oracle: 200 in, 1,200 out of the first market's token account, which holds everyone's collateral. A liquidator could liquidate a healthy short the same way. Chapter 9's publisher check (Exercise §9.2) does not help, because both prices are honest; they are just the wrong market's. §11.7 shows how a fuzzer found it.
 
 **Initial margin check** (lines 2915–2926):
 
@@ -462,6 +465,54 @@ Math:
 1. **The IM↔MM gap is the buffer.** Open a position right at IM (collateral = 10% of notional). Without any oracle move, check via the dump output that the position is healthy (equity ≈ collateral, well above MM). Move the oracle to where the IM gap is consumed (5% adverse). Now equity ≈ MM — still not liquidatable. One more bp of adverse move and `Liquidate` succeeds.
 2. **Funding accrual can flip the answer.** Open a position with collateral right at MM. Don't touch the oracle. Let funding accumulate against you via `funding --update --rate 100`, wait a minute, `funding --update --rate 100`. Check the position's computed equity in the dump — funding PnL has dragged it below MM even though the price hasn't moved. `Liquidate` will succeed.
 3. **Closing returns collateral; liquidating doesn't.** Open at IM, close immediately (no price move, no funding). `position.collateral` ≈ original. Open at IM again, let it fall to MM, get liquidated by a separate keypair. `position.collateral` after liquidate = equity − penalty ≈ much less. The penalty is the daylight between "exit cleanly" and "let yourself get liquidated."
+
+
+### Now let a tool look for the check you forgot
+
+[`fuzz/positions/`](../../fuzz/positions) is a [solinv](https://github.com/psyto/solinv) harness for the three position handlers. Two markets share the quote mint Q, each with its oracle, funding state, token account and insurance fund: `m` at 100 and `n` at 200. On `m`, A holds a long and B a short, both healthy; E holds a long opened at 110 that is under maintenance margin at 100 but still owed a remainder; C has no position yet. On `n`, D holds a long, so `n`'s token account has tokens in it. The specs open C's position, close A's, liquidate B's and E's, and swap in `n`'s oracle and funding state, another user's position, `n`'s token account and insurance fund, and token accounts the caller does not hold; two sets swap all of `n`'s accounts at once. Set up as in Chapter 3 §3.7, then:
+
+```bash
+cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
+cd fuzz/positions
+cargo build --release --features invariant_ch11
+cargo test --release --features invariant_ch11
+timeout -s INT 60 crucible run openhl_positions_fuzz invariant_ch11 \
+    --binary-in target/release/invariant_test --timeout 45
+```
+
+On the program as it is, no `[FUZZ_FINDING]` line appears. On the program before `verify_market_oracle_and_funding`, the first run reported, within seconds:
+
+```
+[FUZZ_FINDING] [account-swap:…] ix open_position succeeded with account 3 swapped … (different context, same shape)
+```
+
+Slot 3 is the oracle. Crucible stops an iteration at the first finding, so Close and Liquidate never got their turn; the tests `close_refuses_another_markets_oracle` and `liquidate_refuses_another_markets_oracle` pin those two.
+
+> **Exercise §11.7.** Delete each check in turn, rebuild, run, and predict first. Here is what we measured, 45 seconds each; for the "no" rows, the last column is what refused the swapped call instead, read from its logs (the `probe` test prints them):
+>
+> | Check deleted | Caught? | How, or what refused it instead |
+> |---|---|---|
+> | Open: `user_ai.is_signer` | no | the runtime: unauthorized signer (the collateral transfer needs the user's signature) |
+> | Open: `market_ai.owner == program_id` | no | our next check: `market is not a Market account` |
+> | Open: `verify_vault_token_account` | **yes**, account-swap, slot 7 | collateral escrowed into `n`'s account, recorded on `m` |
+> | Open: the position PDA | no | the runtime: unauthorized signer (`create_account` at another address needs its signature) |
+> | Open: `verify_market_oracle_and_funding` | **yes**, account-swap, slot 3 | entry price from `n`'s oracle |
+> | Open: the initial margin check | no | nothing in the harness states the margin rule; `open_below_initial_margin_is_refused` fails |
+> | Close: `user_ai.is_signer` | **yes**, signer-skip | anyone could close A's position |
+> | Close: `position.user == user` | **yes**, account-swap, slot 1 | A closed B's position |
+> | Close: `position.market == market` | **yes**, with a set | `m`'s position closed against all of `n`'s accounts |
+> | Close: `verify_vault_token_account` | no | SPL Token: `owner does not match` (`m`'s authority cannot sign for `n`'s account) |
+> | Close: `verify_market_oracle_and_funding` | **yes**, account-swap, slot 2 | closed at `n`'s price; `close_refuses_another_markets_oracle` fails |
+> | Close: `fund.market == market` | **yes**, account-swap, slot 10 | `n`'s insurance fund used for `m`'s position |
+> | Liquidate: `liquidator_ai.is_signer` | **yes**, signer-skip | — but see below |
+> | Liquidate: `position.market == market` | **yes**, with a set | as for Close |
+> | Liquidate: the owner's token account | **yes**, account-swap, slot 6 | E's remainder paid to the liquidator |
+> | Liquidate: `is_liquidatable` | no | nothing in the harness states when liquidation is allowed; `healthy_position_is_not_liquidatable` fails |
+> | Liquidate: `verify_market_oracle_and_funding` | **yes**, account-swap, slot 2 | B's healthy short liquidated at `n`'s price; `liquidate_refuses_another_markets_oracle` fails |
+>
+> Three rows need a second look. The liquidator signer row is a finding that is not a hole: liquidation is permissionless (§11.5), the penalty goes to whatever token account the caller names, and nothing else depends on who signed, so dropping that check lets in no one who was not already allowed. The two margin rows are holes the fuzzer cannot see: a position opened without enough collateral, or a healthy one liquidated, is a call with all the right accounts. Only the tests, which state the rules, catch those. A fuzzer that swaps accounts finds missing *bindings*; rules about numbers need someone to write them down (Chapter 13 §13.6 does that for fees).
+>
+> Two traps from writing the harness, both of which made a row read "no" for the wrong reason. Our first liquidation target was B, healthy at `m`'s price, so every swap of B's liquidation failed the health check before it reached the account being tested. E, liquidatable at 100, fixed that, and then E's remainder after the penalty was 0, so routing it to the liquidator moved nothing; E now has 130 collateral. And our first version of the owner-account mutation added `false &&` to a condition chained with `||`, which by precedence left the rest of the check in place. In each case the probe's log line showed which check had actually refused the call.
 
 ---
 

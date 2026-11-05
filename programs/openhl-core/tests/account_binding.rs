@@ -5,8 +5,8 @@
 
 use bytemuck::Zeroable;
 use openhl_core::{
-    process_instruction, INSURANCE_FUND_TOKEN_SEED, SPL_TOKEN_PROGRAM_ID, TRADING_VAULT_TOKEN_SEED,
-    VAULT_AUTH_SEED, VAULT_SEED,
+    process_instruction, FUNDING_SEED, INSURANCE_FUND_TOKEN_SEED, ORACLE_SEED, SPL_TOKEN_PROGRAM_ID,
+    TRADING_VAULT_TOKEN_SEED, VAULT_AUTH_SEED, VAULT_SEED,
 };
 use openhl_state::*;
 use solana_program::{
@@ -214,8 +214,8 @@ impl PositionSetup {
         f.discriminator = FUNDING_DISCRIMINATOR;
         [
             acc(Pubkey::new_unique(), *p, pod(pos)),
-            acc(Pubkey::new_unique(), *p, pod(o)),
-            acc(Pubkey::new_unique(), *p, pod(f)),
+            acc(pda(&[ORACLE_SEED, self.market.as_ref()], p), *p, pod(o)),
+            acc(pda(&[FUNDING_SEED, self.market.as_ref()], p), *p, pod(f)),
         ]
     }
 

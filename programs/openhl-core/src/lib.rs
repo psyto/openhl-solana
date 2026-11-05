@@ -2496,6 +2496,33 @@ fn read_fresh_pyth_v2_oracle(
     Ok(update.price as u64)
 }
 
+/// The oracle and funding state a position handler reads must be the
+/// passed market's own, at `[ORACLE_SEED, market]` and
+/// `[FUNDING_SEED, market]`. Another market's would open, close or
+/// liquidate this market's position at another asset's price, paid out of
+/// this market's vault. (The program owner and discriminator checks in
+/// `read_fresh_oracle` / `read_funding_index` accept any market's.)
+fn verify_market_oracle_and_funding(
+    oracle_ai: &AccountInfo,
+    funding_ai: &AccountInfo,
+    market_key: &Pubkey,
+    program_id: &Pubkey,
+) -> ProgramResult {
+    let (expected_oracle, _) =
+        Pubkey::find_program_address(&[ORACLE_SEED, market_key.as_ref()], program_id);
+    if oracle_ai.key != &expected_oracle {
+        msg!("oracle does not descend from passed market");
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let (expected_funding, _) =
+        Pubkey::find_program_address(&[FUNDING_SEED, market_key.as_ref()], program_id);
+    if funding_ai.key != &expected_funding {
+        msg!("funding state does not descend from passed market");
+        return Err(ProgramError::InvalidSeeds);
+    }
+    Ok(())
+}
+
 /// Read the cumulative_funding_index from a funding account.
 fn read_funding_index(funding_ai: &AccountInfo, program_id: &Pubkey) -> Result<i64, ProgramError> {
     if funding_ai.owner != program_id || funding_ai.data_len() != FundingState::LEN {
@@ -2850,6 +2877,7 @@ fn process_open_position(
     }
 
     // Pull oracle mark + funding snapshot.
+    verify_market_oracle_and_funding(oracle_ai, funding_ai, market_ai.key, program_id)?;
     let mark = read_fresh_oracle(oracle_ai, program_id)?;
     let funding_snapshot = read_funding_index(funding_ai, program_id)?;
 
@@ -2979,6 +3007,7 @@ fn process_close_position(
     let vault_auth_bump = verify_vault_authority(vault_authority_ai, market_ai.key, program_id)?;
     verify_insurance_fund_token_account(fund_token_ai, market_ai.key, mint_ai.key, program_id)?;
 
+    verify_market_oracle_and_funding(oracle_ai, funding_ai, market_ai.key, program_id)?;
     let mark = read_fresh_oracle(oracle_ai, program_id)?;
     let funding_now = read_funding_index(funding_ai, program_id)?;
 
@@ -3154,6 +3183,7 @@ fn process_liquidate(
     let vault_auth_bump = verify_vault_authority(vault_authority_ai, market_ai.key, program_id)?;
     verify_insurance_fund_token_account(fund_token_ai, market_ai.key, mint_ai.key, program_id)?;
 
+    verify_market_oracle_and_funding(oracle_ai, funding_ai, market_ai.key, program_id)?;
     let mark = read_fresh_oracle(oracle_ai, program_id)?;
     let funding_now = read_funding_index(funding_ai, program_id)?;
 
