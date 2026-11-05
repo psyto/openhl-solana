@@ -1,7 +1,7 @@
 # 第13章 — プロトコル プリミティブとしての Builder Codes
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`BuilderProfile`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_register_builder`、`process_place_order_with_builder`、`process_claim_builder_fees`、`process_create_fee_vault`）、[`scripts/builder/src/main.rs`](../../scripts/builder/src/main.rs)。
+> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`BuilderProfile`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_register_builder`、`process_place_order_with_builder`、`process_claim_builder_fees`、`process_create_fee_vault`）、[`scripts/builder/src/main.rs`](../../scripts/builder/src/main.rs)、[`fuzz/fees/src/main.rs`](../../fuzz/fees/src/main.rs)（§13.6 の solinv ハーネス）。
 >
 > 部品化に伴い、この章で読むロジックは [`crates/fees/src/lib.rs`](../../crates/fees/src/lib.rs)(`openhl-fees`)に移り、プログラムはそれを呼び出す。以下に引用するコードは分割前の `programs/openhl-core/src/lib.rs` の版で、行番号は追従していない。
 
@@ -298,6 +298,50 @@ Builder ライフサイクル:
 1. **キャップが正しく積み重なる。** `--max-share-bps 9999 --mint <quote_mint>` で builder を登録する。ハンドラはクランプをログし、ダンプは `max_fee_share_bps = 5000`（本書の `PROTOCOL_BUILDER_SHARE_CAP_BPS`）を示すはずだ。次に取引をその builder 経由でルートする — builder のシェアはちょうどプロトコル手数料の 50% のはずだ。
 2. **失敗下でアトミシティが保たれる。** シミュレートされた失敗を使う: stale なオラクルで `PlaceOrderWithBuilder` を試す（注文配置が失敗する）。シミュレーションは `oracle stale` で失敗し、**かつ**失敗 sim 後、builder profile の `accumulated_fees` は不変、fee vault の残高は不変、トレーダの quote-token アカウントも不変のはずだ（トランザクション全体が revert するので）。取引が起きない限り分割は起きない。
 3. **取引ごとに volume が蓄積する。** 同じ builder 経由で 5 つの注文をサイズ 10、20、30、40、50 で配置する。`total_volume` はちょうど 150 （10+20+30+40+50）のはずだ。`accumulated_fees` が `(notional_total × PROTOCOL_FEE_BPS × share_bps / 10000 / 10000)` に加算されないなら、数学に off-by-one がある — それを追いかけよ。その後 `--claim --mint <fee_mint> --builder-token-account <pubkey>` を走らせる(ダンプが `fee_mint` を表示する)。Builder の quote-token アカウント残高は `accumulated_fees` ぶんちょうど増え、ダンプは `accumulated_fees = 0` を示すはずだ。
+
+
+### アカウントだけでなく、お金を道具に確かめさせる
+
+第 3・6・12 章は、[solinv](https://github.com/psyto/solinv) にアカウントを差し替えさせて終わった。ここでの問いは違う。手数料の vault は、builder に払うべき額をいつも持っているか。第 6 章 §6.6 はこれを持ち越した。手数料の vault は全市場が共有する唯一のアカウントで、組には PDA ではない 2 つ目の市場がありうるからだ。
+
+[`fuzz/fees/`](../../fuzz/fees) がそのハーネスである。builder B は quote の mint Q で登録し、利用者 U は B を通して取引する。市場は 3 つあり、それぞれに板と新しいオラクルがある。PDA にある `(base, Q)`、第 2 章の `Initialize` で PDA ではないアドレスに作った 2 つ目の `(base, Q)`、誰でも作れる mint J の `(base, J)` だ。いつもの signer-skip と account-swap に加えて、仕様は 2 つの規則を宣言する:
+
+- **関係**(solinv の `Relation`。`unchecked_math` が確かめる): `PlaceOrderWithBuilder` と `ClaimBuilderFees` の両方で `profile.accumulated_fees <= fee_vault.amount`。命令の前に成り立っていて、後で崩れたときだけ報告する。
+- **ガード**(`precondition_skip` が確かめる): `PlaceOrderWithBuilder` が成功してよいのは `profile.fee_mint == market.quote_mint` のときだけ。solinv が比べるフィールドは 16 バイトまでなので、32 バイトの mint にはガードが 2 つ要る。
+
+第 3 章 §3.7 のとおり準備してから:
+
+```bash
+cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
+cd fuzz/fees
+cargo build --release --features invariant_ch13
+cargo test --release --features invariant_ch13
+timeout -s INT 60 crucible run openhl_fees_fuzz invariant_ch13 \
+    --binary-in target/release/invariant_test --timeout 45
+```
+
+今のプログラムでは、3 つの市場のどれでも `[FUZZ_FINDING]` の行は出ない。これが、この章についての §6.6 の答えになる。`accumulated_fees` への加算はどれも、同じトランザクションが同じ mint で手数料の vault に移す `protocol_fee` の半分以下なので、2 つ目の市場でも(どの市場でも)、利用者が払った以上を builder に借りることはできない。テスト `credit_never_exceeds_payment` が両方の Q の市場でこれを確かめる。
+
+> **演習 §13.6.** 下の検査を 1 つずつ消し(最後の 2 行はその変更を加え)、作り直して走らせよ。先に予想すること。私たちが各 45 秒で測った結果を示す。「いいえ」の行の最後の列は、差し替えた呼び出しを代わりに拒否したもので、ログから読んだ(`probe` テストが出力する):
+>
+> | 変更 | 捕まったか | どう捕まったか、または代わりに拒否したもの |
+> |---|---|---|
+> | Place: `profile.fee_mint == mint` | **はい** | precondition-skip: J の市場でガードが偽のまま注文が通った。`junk_mint_order_does_not_credit_a_q_builder` が落ちる |
+> | Place: `market.quote_mint == mint` | いいえ | `fee_mint` の検査: Q の市場で J で払っても、指定する builder は Q で払われる B のまま |
+> | Place: `verify_fee_vault_token_account` | いいえ | SPL Token: `Account not associated with this Mint` |
+> | Place: `user_ai.is_signer` | いいえ | ランタイム: 権限のない署名者 |
+> | Place: 板の PDA | **はい** | account-swap: 注文が別の市場の板に入った |
+> | Place: オラクルの PDA | **はい** | account-swap: 価格の帯が別の市場のオラクルから来た |
+> | Claim: `profile.builder == builder` | **はい** | account-swap: B が B2 の手数料を受け取った |
+> | Claim: `builder_ai.is_signer` | **はい** | signer-skip: 誰でも B の手数料を、自分の指定する口座に受け取れた |
+> | Claim: `profile.fee_mint == mint` | **はい**(組で) | account-swap `check_sets`: B の Q の手数料が J の vault から B の J の口座へ払われた(4 つの slot を一緒に) |
+> | Claim: `verify_fee_vault_token_account` | いいえ | SPL Token: `owner does not match`(Q の vault の authority は J の vault に署名できない) |
+> | Claim: `accumulated_fees = 0` を消す | **はい** | 関係: 2 回目の claim の前は成り立ち(1004 ≤ 2004)、後で崩れた(1004 対 1000)。`claim_pays_once` が落ちる |
+> | Place: builder の取り分を `protocol_fee` でなく `notional` から計算 | **はい** | 関係: 注文 1 回で、vault の 1010 に対して借りが 5000 |
+>
+> 2 つのことを見直す価値がある。最後の 2 行は、検査の抜けではまったくない。どのアカウントも正しく、どの検査も通るのに、プログラムは持っている以上を約束する。それが見えるのは数についての規則だけで、それはこの章の原子性の議論(§13.4)が扱っている規則でもある。もう 1 つ、claim 側の `fee_mint` の行には、4 つのアカウントを一緒に差し替える必要があった。私たちの最初の組は 3 つを差し替え、送り先を B の Q の口座のままにしていたので、SPL Token が mint の不一致で拒否した。それは消した検査について何も語っていなかった。攻撃者は J の送り先を指定する。第 12 章と同じく、拒否は、どの検査が拒否したかが分かって初めて証拠になる。
+>
+> 1 つの差し替えはわざと外してある。`PlaceOrderWithBuilder` の slot 8 を別の builder の profile にすると通る。U が B ではなく B2 に加算する。それが設計だ。どのフロントエンドに加算するかは利用者が選び、どちらでも手数料は払う。
 
 ---
 
