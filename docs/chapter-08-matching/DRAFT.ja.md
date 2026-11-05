@@ -21,7 +21,7 @@
 
 ## §8.1  フラット book 上の Match アルゴリズム
 
-`programs/openhl-core/src/lib.rs:1361–1489` から。ハンドラはペイロードの 4 フィールドを取る。
+`programs/openhl-core/src/lib.rs:1354–1482` から。ハンドラはペイロードの 4 フィールドを取る。
 
 ```text
 [side u8][limit_price u64 LE][size u64 LE][max_fills u8]
@@ -29,7 +29,7 @@
 
 `side` は**taker** 側だ（bid の taker は ask に対して買う、ask の taker は bid に対して売る）。`limit_price` は taker が受け入れる最悪価格。`size` は取りたい総 base 単位。`max_fills` は 1 命令あたりに交差する resting maker 注文数の上限 — ページングつまみだ。
 
-マッチングループ、1420–1479 行。
+マッチングループ、1413–1472 行。
 
 ```rust
 let mut fills_done: u8 = 0;
@@ -93,7 +93,7 @@ fill ごとに 5 ステップ。吸収すべき点は 2 つ。
 
 fill あたりの限界コストはほぼ一定で、16 maker の book で約 1.5 KCU。一部は線形走査で、fill ごとに空でも埋まっていても 32 スロットすべてを見る。一部は maker の書き込みと、fill ごとに出す `msg!` の行だ。それ以上は分けて測っていない。大事なのは、それがどう増えるかだ。
 
-book とともに増えるが、この大きさではゆっくりだ。8、16、24、32 maker に対する 4 fill は 8,500、9,276、9,980、10,680 CU で、maker が 1 増えるごとに fill あたり約 22 CU。32 スロットの book には 32 maker までしか入らないので、ここで 1 回の `Match` がする最悪は 32 maker に対する 32 fill で 57,696 CU、既定の 200K に十分収まる。バジェットが壊れるのを見るには book を大きくする。`ORDER_CAPACITY = 128`(`crates/state` にある)では、128 maker に対する 1 fill が 7,565 CU、16 fill が 80,533 で fill あたり約 4,900。64 maker に対する 64 fill は 194,916、128 maker に対する 64 fill はもう収まらない。
+book とともに増えるが、この大きさではゆっくりだ。8、16、24、32 maker に対する 4 fill は 8,500、9,276、9,980、10,680 CU で、maker が 1 増えるごとに fill あたり約 22 CU。32 スロットの book には 32 maker までしか入らないので、ここで 1 回の `Match` がする fill は最大 32 で、`max_fills = 32` なら 57,696 CU。それより多く求めると、何も見つからない走査がもう 1 回加わり、それが最悪の場合になる。`max_fills = 255` で 58,148 CU、既定の 200K に十分収まる。バジェットが壊れるのを見るには book を大きくする。`ORDER_CAPACITY = 128`(`crates/state` にある)では、128 maker に対する 1 fill が 7,565 CU、16 fill が 80,533 なので、最初の 1 fill のあとは 1 fill ごとに約 4,900 増える。64 maker に対する 64 fill は 194,916、128 maker に対する 64 fill はもう収まらない。
 
 これが本章が可視化するためにある CU コスト形状だ。フラットマッチャの fill あたりコストは book サイズに比例して成長する。命令あたり総コストは `O(fills × N)`。両因子とも押し上げたくなるつまみだ（呼び出しあたり fill 数を増やす、book を大きくする）。十分に押し上げればバジェットが壊れる。32 スロットでは、その「十分」は book が行ける先より遠い。
 
@@ -269,7 +269,7 @@ slab 実装は、初めてなら 3-4 日の演習だ。1 日目はプール + �
 
   fill ごと:    O(N) 走査 + O(1) 書き込み     → O(K × N) 総計
   ORDER_CAPACITY=32 book で K=16:           約 27 KCU(16 maker)、33 KCU(32)
-  失敗モード:    32 スロットではなし(最悪の 32 fill で約 58 KCU)。
+  失敗モード:    32 スロットではなし(最悪の 32 fill + 空振りの走査 1 回で約 58 KCU)。
                  128 スロットでは約 40 fill を超えると CU 枯渇
 
 
@@ -304,7 +304,7 @@ CU 圧への 3 つの対応:
 
 ### 高くつくマッチを道具に探させる
 
-第 4 章 §4.7 では、呼び出し側がわざと値段を選ぶ `Bench` に [solinv](https://github.com/psyto/solinv) の cu-dos を走らせた。`Match` は他の人が頼る命令で、その値段を選ぶのは 2 者だ。taker が `max_fills` を選び、maker が book をどれだけ埋めるかを選ぶ。[`fuzz/matching/`](../../fuzz/matching) は book を 32 の買い注文で満たし、空いたスロットを maker が埋め直せるようにし、taker が 1〜255 の任意の `max_fills` を選べるようにして、1 回の `Match` に 50,000 CU の上限(`MATCH_CU_CAP`)を宣言する。第 3 章 §3.7 のとおり準備してから:
+第 4 章 §4.7 では、呼び出し側がわざと値段を選ぶ `Bench` に [solinv](https://github.com/psyto/solinv) の cu-dos を走らせた。`Match` は他の人が頼る命令で、その値段を選ぶのは 2 者だ。taker が `max_fills` を選び、maker が book をどれだけ埋めるかを選ぶ。[`fuzz/matching/`](../../fuzz/matching) は book を 32 の買い注文で満たし(入る最大数。cu-dos は試すたびに book を元に戻す)、taker が 1〜255 の任意の `max_fills` を選べるようにして、1 回の `Match` に 50,000 CU の上限(`MATCH_CU_CAP`)を宣言する。第 3 章 §3.7 のとおり準備してから:
 
 ```bash
 cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
@@ -321,9 +321,9 @@ timeout -s INT 60 crucible run openhl_matching_fuzz invariant_ch8 \
 > [FUZZ_FINDING] [cu-dos:…] ix match consumed 58148 CU (cap 50000)
 > ```
 >
-> taker が、満杯の book で上限が許す以上の fill を求めた。第 4 章の教訓は、上限をランタイムの限界まで上げても何も直らない、だった。ここには本当の直し方がある。最悪の場合に上限があるからだ。book は 32 スロットで、1 回の呼び出しがどれだけ働くかはプログラムが決める。§8.2 の数値から、満杯の book で 50,000 に収まる `max_fills` はいくつまでか。その答えで `process_match` に `if max_fills > N { return Err(...) }` を足し、作り直してもう一度走らせよ。
+> taker が、満杯の book で上限が許す以上の fill を求めた。58,148 は §8.2 の満杯の book での最悪の場合だ。第 4 章の教訓は、上限をランタイムの限界まで上げても何も直らない、だった。ここには本当の直し方がある。最悪の場合に上限があるからだ。book は 32 スロットで、1 回の呼び出しがどれだけ働くかはプログラムが決める。§8.2 の数値から、満杯の book で 50,000 に収まる `max_fills` はいくつまでか。その答えで `process_match` に `if max_fills > N { return Err(...) }` を足し、作り直してもう一度走らせよ。
 >
-> 私たちは 24 を使った(満杯の book で 25 fill は 47,645、30 は 54,935 だったので、24 なら余裕がある)。45 秒で検出は出なかった。これは §8.3 の選択肢 (2)、ページングを必須にしたものだ。もっと fill がほしい taker は呼び出しを増やす。これが成り立つのは book が 32 スロットのままの間だけだ。128 スロットでは 1 fill が約 4,900 CU なので、同じ上限で 1 呼び出しが約 118,000 になりうる。`ORDER_CAPACITY` を上げるたびに上限を下げなければならない。この結びつきが、選択肢 (3)、slab(第 15 章)を選ぶ理由だ。slab の fill あたりコストは N ではなく log N で増える(§8.4)。
+> 答えは測定にある。満杯の book で 26 fill は 49,147、27 fill は 50,627 なので、収まる最大は 26 だ。一部だけ埋まった book では同じ上限でもコストが低い(27 maker に 28 を求めて 48,011)。maker がなくなれば fill が止まるからで、どの上限でも満杯の book が最悪の場合になる。私たちは次のツールチェーンの値段に備えて余裕をとり 24 を使った。fuzzer は 45 秒で何も見つけず、上限から予想したとおりだった。これは §8.3 の選択肢 (2)、ページングを必須にしたものだ。もっと fill がほしい taker は呼び出しを増やす。これが成り立つのは book が 32 スロットのままの間だけだ。128 スロットでは最初の 1 fill が 7,565 CU、以後 1 fill ごとに約 4,900 なので、同じ上限で 1 呼び出しが約 119,000 になりうる。`ORDER_CAPACITY` を上げるたびに上限を下げなければならない。この結びつきが、選択肢 (3)、slab(第 15 章)を選ぶ理由だ。slab の fill あたりコストは N ではなく log N で増える(§8.4)。
 
 ---
 

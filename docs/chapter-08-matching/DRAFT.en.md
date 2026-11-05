@@ -21,7 +21,7 @@ So this chapter:
 
 ## §8.1  The Match algorithm on a flat book
 
-From `programs/openhl-core/src/lib.rs:1361–1489`. The handler takes four payload fields:
+From `programs/openhl-core/src/lib.rs:1354–1482`. The handler takes four payload fields:
 
 ```text
 [side u8][limit_price u64 LE][size u64 LE][max_fills u8]
@@ -29,7 +29,7 @@ From `programs/openhl-core/src/lib.rs:1361–1489`. The handler takes four paylo
 
 `side` is the *taker's* side (a bid taker buys against asks, an ask taker sells against bids). `limit_price` is the worst price the taker will accept. `size` is total base units to take. `max_fills` is the per-instruction cap on how many resting maker orders to cross — the pagination knob.
 
-The matching loop at lines 1420–1479:
+The matching loop at lines 1413–1472:
 
 ```rust
 let mut fills_done: u8 = 0;
@@ -94,7 +94,7 @@ Run the matcher with `--max-fills` varying from 1 to 16 against a half-full book
 
 Per-fill marginal cost is roughly constant, about 1.5 KCU for a 16-maker book. Part of it is the linear scan, which visits all 32 slots on every fill, empty or not. Part is the maker write and the `msg!` line each fill logs. We did not split it further; the number that matters is how it grows.
 
-It grows with the book, but slowly at this size. Four fills against 8, 16, 24 and 32 makers cost 8,500, 9,276, 9,980 and 10,680 CU: about 22 CU per extra active maker per fill. A full 32-slot book can never hold more than 32 makers, so the worst a single `Match` can do here is 32 fills against 32 makers: 57,696 CU, well inside the 200K default. To see the budget break, make the book bigger. With `ORDER_CAPACITY = 128` (in `crates/state`), one fill against 128 makers costs 7,565 CU and 16 fills 80,533, about 4,900 per fill; 64 fills against 64 makers cost 194,916, and 64 fills against 128 makers no longer fit at all.
+It grows with the book, but slowly at this size. Four fills against 8, 16, 24 and 32 makers cost 8,500, 9,276, 9,980 and 10,680 CU: about 22 CU per extra active maker per fill. A full 32-slot book can never hold more than 32 makers, so a single `Match` here makes at most 32 fills: 57,696 CU with `max_fills = 32`. Asking for more adds one more scan that finds nothing, and that is the worst case: 58,148 CU with `max_fills = 255`, well inside the 200K default. To see the budget break, make the book bigger. With `ORDER_CAPACITY = 128` (in `crates/state`), one fill against 128 makers costs 7,565 CU and 16 fills 80,533, so each fill after the first adds about 4,900; 64 fills against 64 makers cost 194,916, and 64 fills against 128 makers no longer fit at all.
 
 This is the cost shape the chapter exists to make visible. The flat matcher's per-fill cost grows linearly with the book size. The total per-instruction cost is `O(fills × N)`. Both factors are knobs you might want to push (more fills per call, bigger book). Push either far enough and the budget breaks; at 32 slots, "far enough" is further than the book can go.
 
@@ -271,7 +271,7 @@ Match on flat book (this chapter):
 
   Per fill:    O(N) scan + O(1) write     → O(K × N) total
   Per K=16 on ORDER_CAPACITY=32 book:    ~27 KCU (16 makers), 33 KCU (32)
-  Failure mode:  none at 32 slots (worst case 32 fills ≈ 58 KCU);
+  Failure mode:  none at 32 slots (worst case 32 fills + one empty scan ≈ 58 KCU);
                  CU exhaustion past ~40 fills at 128 slots
 
 
@@ -306,7 +306,7 @@ Three responses to CU pressure:
 
 ### Now let a tool look for the expensive match
 
-Chapter 4 §4.7 ran [solinv](https://github.com/psyto/solinv)'s cu-dos check on `Bench`, whose cost the caller picks on purpose. `Match` is the instruction other people depend on, and its cost is picked by two parties: the taker chooses `max_fills`, and the makers choose how full the book is. [`fuzz/matching/`](../../fuzz/matching) fills the book with 32 bids, lets makers refill emptied slots, lets the taker pick any `max_fills` from 1 to 255, and declares a cap of 50,000 CU (`MATCH_CU_CAP`) for one `Match`. Set up as in Chapter 3 §3.7, then:
+Chapter 4 §4.7 ran [solinv](https://github.com/psyto/solinv)'s cu-dos check on `Bench`, whose cost the caller picks on purpose. `Match` is the instruction other people depend on, and its cost is picked by two parties: the taker chooses `max_fills`, and the makers choose how full the book is. [`fuzz/matching/`](../../fuzz/matching) fills the book with 32 bids (the most it holds; cu-dos restores it after every attempt), lets the taker pick any `max_fills` from 1 to 255, and declares a cap of 50,000 CU (`MATCH_CU_CAP`) for one `Match`. Set up as in Chapter 3 §3.7, then:
 
 ```bash
 cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
@@ -323,9 +323,9 @@ timeout -s INT 60 crucible run openhl_matching_fuzz invariant_ch8 \
 > [FUZZ_FINDING] [cu-dos:…] ix match consumed 58148 CU (cap 50000)
 > ```
 >
-> The taker asked for more fills than the cap allows on a full book. In Chapter 4 the lesson was that raising the cap to the runtime's limit fixes nothing. Here there is a real fix, because the worst case is bounded: the book has 32 slots, and the program decides how much work one call may do. From the §8.2 numbers, how large may `max_fills` be for a full book to stay under 50,000? Add `if max_fills > N { return Err(...) }` to `process_match` with your answer, rebuild, and run again.
+> The taker asked for more fills than the cap allows on a full book; 58,148 is the full-book worst case from §8.2. In Chapter 4 the lesson was that raising the cap to the runtime's limit fixes nothing. Here there is a real fix, because the worst case is bounded: the book has 32 slots, and the program decides how much work one call may do. From the §8.2 numbers, how large may `max_fills` be for a full book to stay under 50,000? Add `if max_fills > N { return Err(...) }` to `process_match` with your answer, rebuild, and run again.
 >
-> We used 24 (25 fills on a full book measured 47,645, 30 measured 54,935, so 24 leaves room) and saw no finding in 45 seconds. That is option (2) of §8.3, pagination, made mandatory: a taker who wants more fills sends more calls. It holds only while the book stays at 32 slots. At 128 slots one fill costs about 4,900 CU, so the same cap would let a call cost about 118,000, and the cap would have to come down with every increase in `ORDER_CAPACITY`. That coupling is the argument for option (3), the slab (Chapter 15), whose per-fill cost grows with log N rather than N (§8.4).
+> The measurements answer it. On a full book, 26 fills cost 49,147 and 27 cost 50,627, so 26 is the largest that fits. A partly full book costs less for the same cap (28 asked of 27 makers: 48,011), because the fills stop when the makers run out, so the full book is the worst case for any cap. We used 24, to leave room for the next toolchain's prices, and the fuzzer then found nothing in 45 seconds, as the bound predicts. That is option (2) of §8.3, pagination, made mandatory: a taker who wants more fills sends more calls. It holds only while the book stays at 32 slots. At 128 slots the first fill costs 7,565 CU and each later one about 4,900, so the same cap would let a call cost about 119,000, and the cap would have to come down with every increase in `ORDER_CAPACITY`. That coupling is the argument for option (3), the slab (Chapter 15), whose per-fill cost grows with log N rather than N (§8.4).
 
 ---
 

@@ -2,9 +2,10 @@
 //!
 //! Loads the real `openhl_core.so` from `target/deploy/` (`cargo build-sbf
 //! --manifest-path programs/openhl-core/Cargo.toml`). One market and its
-//! book; makers fill the book with bids. The `Match` spec is an ask whose
+//! book, full: 32 bids of size 1. The `Match` spec is an ask whose
 //! `max_fills` the fuzzer picks, with a CU cap of `MATCH_CU_CAP` (cu-dos):
-//! how much can one taker make a match cost?
+//! how much can one taker make a match cost? (cu-dos restores the book
+//! after each attempt, so every attempt sees the same full book.)
 
 use crucible_fuzzer::*;
 use solana_instruction::{AccountMeta, Instruction};
@@ -159,11 +160,6 @@ impl MatchingFixture {
         Self::with_bids(ORDER_CAPACITY)
     }
 
-    /// A maker refills a slot the last match emptied.
-    pub fn action_place(&mut self, #[range(100..200)] price: u64) -> bool {
-        self.place(BID, price, 1)
-    }
-
     pub fn action_choose_max_fills(&mut self, #[range(1..=255)] max_fills: u8) -> bool {
         self.max_fills = max_fills;
         true
@@ -247,6 +243,12 @@ mod tests {
             for (n, mf) in [(128usize, 1u8), (128, 16), (128, 64), (128, 128), (64, 64)] {
                 println!("GRID128 book={n} max_fills={mf} cu={:?}", MatchingFixture::with_bids(n).try_cu(mf));
             }
+        }
+        for max_fills in [25u8, 26, 27, 28, 33, 255] {
+            println!("GRID book=32 max_fills={max_fills} cu={:?}", MatchingFixture::with_bids(32).try_cu(max_fills));
+        }
+        for (n, mf) in [(24usize, 25u8), (25, 26), (26, 27), (27, 28)] {
+            println!("GRID book={n} max_fills={mf} cu={:?}", MatchingFixture::with_bids(n).try_cu(mf));
         }
         // Two pages of 8 against one call of 16, on a full book.
         let mut f = MatchingFixture::with_bids(32);
