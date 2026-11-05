@@ -182,7 +182,7 @@ if market_ai.owner != program_id {
 2. `data[0..256]` に任意のバイトを書く。
 3. それを本書の `Initialize` に渡す。
 4. 他のチェックはすべて通る（サイズは 256、ディスクリミネータは攻撃者が設定したもの、ペイロードは正しく復号できる）。
-5. プログラムはバイトを上書きしようとし、ここではランタイムがそれを止める。プログラムが変えられるのは自分が所有するアカウントだけなので(第 1 章)、トランザクションは `instruction modified data of an account it does not own` で失敗する。`Initialize` がこの検査なしでも安全なのは、**書く**だけだからにすぎない。危ないのは、アカウントを**読んで**そのバイトを信じるすべてのハンドラだ。後の章で同じアカウントが `place_order` や `CreateVault` に渡されると、攻撃者が書いた内容を信じるのを止めるものはない。他人のアカウントを読むことは許されているからだ。
+5. プログラムはバイトを上書きしようとし、ここではランタイムがそれを止める。プログラムが変えられるのは自分が所有するアカウントだけなので(第 1 章)、トランザクションは `instruction modified data of an account it does not own` で失敗する。`Initialize` がこの検査なしでも安全なのは、**書く**だけだからにすぎない。危ないのは、アカウントを**読んで**そのバイトを信じるすべてのハンドラだ。こういうアカウントが、market を書かずにその `quote_mint` を読む `PlaceOrderChecked`(第 9 章)や `OpenPosition`(第 11 章)に渡されると、攻撃者が書いた内容を信じるのをランタイムは止めない。他人のアカウントを読むことは許されているからだ。止めるのは、それらの命令自身の所有者検査である。
 
 所有者チェックこそが「正しい形の 256 バイト」を「自分が書いた 256 バイト」に変える。読むハンドラでこれを省くことは、セキュリティモデルを省くことに等しい。
 
@@ -192,7 +192,7 @@ if market_ai.owner != program_id {
 
 > **演習 §2.3.** `process_initialize` を編集して、所有者チェックを意図的にスキップせよ（87–94 行をコメントアウト）。ビルドし直し、第 1 章のアロケータが作った System 所有アカウント（§2.5 で追加する Assign ステップを**経ずに**）を `Initialize` に渡すトランザクションを組み立てよ。実行すると何が起きるか。なぜか。
 >
-> 道具に試させることもできる。[`fuzz/basics/`](../../fuzz/basics) には `Initialize` の仕様があり、その `invariant_ch2` は [solinv](https://github.com/psyto/solinv) の owner-skip を走らせる。market のアカウントを、別のプログラムが所有する複製に差し替える検査だ。第 3 章 §3.7 のとおりプログラムを作り、`fuzz/basics` で `cargo build --release --features invariant_ch2` と `crucible run openhl_basics_fuzz invariant_ch2 --binary-in target/release/invariant_test --timeout 45`(`timeout` の下で)を実行する。測ると、検査があっても検出はなく、消しても検出はなかった。`ch2_probe` テスト(`cargo test --release --features invariant_ch2 -- --ignored --nocapture ch2_probe`)が理由を示す。検査があれば自前の `market owner … != program` が呼び出しを拒否し、なければランタイムが拒否する。System が所有するアカウントでも、SPL Token が所有するアカウントでも、適当なプログラムが所有するアカウントでも同じだ。これが演習の答えで、fuzzer についての教訓でもある。ここでの「いいえ」は、検査の後ろにランタイムが立っていたという意味で、検査が要らないという意味ではない。後ろに何も立っていない、**読む**側の所有者検査(`CreateVault` の market)は第 6 章 §6.6 が示す。
+> 道具に試させることもできる。[`fuzz/basics/`](../../fuzz/basics) には `Initialize` の仕様があり、その `invariant_ch2` は [solinv](https://github.com/psyto/solinv) の owner-skip を走らせる。market のアカウントを、別のプログラムが所有する複製に差し替える検査だ。第 3 章 §3.7 のとおりプログラムを作り、`fuzz/basics` で `cargo build --release --features invariant_ch2` と `crucible run openhl_basics_fuzz invariant_ch2 --binary-in target/release/invariant_test --timeout 45`(`timeout` の下で)を実行する。測ると、検査があっても検出はなく、消しても検出はなかった。`ch2_probe` テスト(`cargo test --release --features invariant_ch2 -- --ignored --nocapture ch2_probe`)が理由を示す。検査があれば自前の `market owner … != program` が呼び出しを拒否し、なければランタイムが拒否する。System が所有するアカウントでも、SPL Token が所有するアカウントでも、適当なアドレスが所有するアカウントでも同じだ。これが演習の答えで、fuzzer についての教訓でもある。ここでの「いいえ」は、検査の後ろにランタイムが立っていたという意味で、検査が要らないという意味ではない。後ろに何も立っていない所有者検査は第 6 章 §6.6 が示す。`CreateVault` は market を読みも書きもせず、そのアドレスを seed に使うだけなので、ランタイムには拒否するものがない。
 
 ---
 

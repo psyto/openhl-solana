@@ -392,15 +392,20 @@ impl HasInstructionSet for BasicsFixture {
             vec![SYSTEM_ID],   // a program that is not SPL Token
         ];
 
-        // Chapter 2: Initialize into a fresh program-owned 256-byte account.
-        let mut d = market_payload(&a, &self.base2, &self.quote);
-        d[0] = IX_INITIALIZE;
-        let mut initialize = spec("initialize", vec![AccountMeta::new(self.blank, false)], d, Arc::clone(&self.payer));
-        initialize.signer_indices = vec![];
-        initialize.signers = vec![];
-        initialize.expected_owners = vec![c];
-
-        vec![create_market, bench, create_vault, deposit, initialize]
+        let mut specs = vec![create_market, bench, create_vault, deposit];
+        // Chapter 2: Initialize into a fresh program-owned 256-byte account,
+        // only in the Chapter 2 build so the other chapters' runs keep
+        // their own scope.
+        if cfg!(feature = "invariant_ch2") {
+            let mut d = market_payload(&a, &self.base2, &self.quote);
+            d[0] = IX_INITIALIZE;
+            let mut initialize = spec("initialize", vec![AccountMeta::new(self.blank, false)], d, Arc::clone(&self.payer));
+            initialize.signer_indices = vec![];
+            initialize.signers = vec![];
+            initialize.expected_owners = vec![c];
+            specs.push(initialize);
+        }
+        specs
     }
 }
 
@@ -575,7 +580,7 @@ mod tests {
     #[ignore]
     fn ch2_probe() {
         let f0 = BasicsFixture::setup();
-        let spec = f0.instructions().into_iter().find(|s| s.name == "initialize").unwrap();
+        let spec = f0.instructions().into_iter().find(|s| s.name == "initialize").expect("build with --features invariant_ch2");
         for owner in [SYSTEM_ID, token(), Pubkey::new_unique()] {
             let mut f = f0.clone();
             let key = Keypair::new().pubkey();
