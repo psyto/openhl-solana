@@ -27,7 +27,7 @@ Solana 上で課される制約は独特だ。トランザクションごとに�
 Solana 上の本物の CLOB は次の 2 つのどちらかになる。
 
 1. **Slab** — ノードの連続アリーナ。価格レベルの上の critbit 木で、各レベルの下に注文の双方向リンク FIFO キューを持つ(第 15 章で作る設計)。place とベスト価格の検索は 1 本の経路をたどり、その長さは価格のビットに従う(価格がばらけていれば約 log₂ N、最大 64。§15.7)。第 15 章は cancel を作らない(演習 §15.6)。コンパクション不要。
-2. **Critbit-of-orders** — 各注文が critbit ツリーの葉、キーは価格(同価格内の FIFO 順序のために副キーにシーケンス番号)。Serum と OpenBook v2 がこれ([Serum](https://github.com/project-serum/serum-dex/blob/92992b308885f5323b3f51eb1a0c899e35c62cb3/dex/src/critbit.rs)、[OpenBook v2](https://github.com/openbook-dex/openbook-v2/blob/f3e17421e675b083b584867594bf3cf4f675d156/programs/openbook-v2/src/state/orderbook/nodes.rs))。Phoenix は同じ (価格, シーケンス) のキーを red-black 木で使う([Phoenix](https://github.com/Ellipsis-Labs/phoenix-v1/blob/6ae54af5f07f4d0ae8430b08cbe81d10432cd34c/src/state/markets/fifo.rs))。すべてが O(log N)、slab より推論しやすい、メモリ局所性はやや劣る。
+2. **Critbit-of-orders** — 各注文が critbit ツリーの葉、キーは価格(同価格内の FIFO 順序のために副キーにシーケンス番号)。Serum と OpenBook v2 がこれ([Serum](https://github.com/project-serum/serum-dex/blob/92992b308885f5323b3f51eb1a0c899e35c62cb3/dex/src/critbit.rs)、[OpenBook v2](https://github.com/openbook-dex/openbook-v2/blob/f3e17421e675b083b584867594bf3cf4f675d156/programs/openbook-v2/src/state/orderbook/nodes.rs))。Phoenix は同じ (価格, シーケンス) のキーを red-black 木で使う([Phoenix](https://github.com/Ellipsis-Labs/phoenix-v1/blob/6ae54af5f07f4d0ae8430b08cbe81d10432cd34c/src/state/markets/fifo.rs))。平衡木なら O(log N)(Phoenix)、critbit では深さがやはりキーのビットに従う。slab より推論しやすい、メモリ局所性はやや劣る。
 
 本書が組み立てるのはそのどちらでもない。**固定容量のフラット配列、線形走査**だ。`crates/state/src/lib.rs` から。
 
