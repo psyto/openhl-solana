@@ -1,7 +1,7 @@
 # Chapter 8 — Matching Engine Under CU Pressure
 
 > Status: draft (v0.1).
-> Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_match` at lines 1361–1489), [`scripts/match/src/main.rs`](../../scripts/match/src/main.rs).
+> Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_match` at lines 1354–1482), [`scripts/match/src/main.rs`](../../scripts/match/src/main.rs), [`fuzz/matching/src/main.rs`](../../fuzz/matching/src/main.rs) (the solinv harness for §8.6).
 > Builds on Chapter 7's `OrderBook` data structure.
 
 ---
@@ -82,28 +82,25 @@ The handler deliberately omits the *settlement* step. A real exchange would also
 
 Run the matcher with `--max-fills` varying from 1 to 16 against a half-full book (16 active makers, all bids, taker is an ask matching against them):
 
-| max_fills | sim units_consumed | per-fill marginal |
-|-----------|--------------------|-------------------|
-|   1       |    ~ 5,000         |   ~ 3,500         |
-|   2       |    ~ 8,500         |   ~ 3,500         |
-|   4       |    ~16,000         |   ~ 3,750         |
-|   8       |    ~30,500         |   ~ 3,600         |
-|  16       |    ~58,500         |   ~ 3,500         |
+| max_fills | units consumed | per-fill marginal |
+|-----------|----------------|-------------------|
+|   1       |    4,254       |   —               |
+|   2       |    5,950       |   1,696           |
+|   4       |    9,276       |   1,663           |
+|   8       |   15,637       |   1,590           |
+|  16       |   27,220       |   1,448           |
 
-Per-fill marginal cost is roughly constant at ~3.5 KCU for a 16-maker book. This breaks down into:
+(Measured with `fuzz/matching`'s `grid` test, which runs the real program in LiteSVM; Chapter 4 §4.5 checked that LiteSVM and `solana-test-validator` 4.1.2 count the same. An earlier draft of this table, from an older toolchain, read about 3,500 CU per fill. Measure your own.)
 
-- ~1,000 CU per fill for the linear scan (16 slots × ~60 CU each)
-- ~1,200 CU per fill for the maker mutation + slot zero
-- ~1,000 CU per fill for the `msg!` log line documenting the fill
-- ~300 CU per fill for loop housekeeping and the `Order` write
+Per-fill marginal cost is roughly constant, about 1.5 KCU for a 16-maker book. Part of it is the linear scan, which visits all 32 slots on every fill, empty or not. Part is the maker write and the `msg!` line each fill logs. We did not split it further; the number that matters is how it grows.
 
-Doubling the book size doubles the scan portion but leaves the rest constant. At ORDER_CAPACITY = 32 with all slots active, per-fill marginal becomes ~5 KCU. At 256 slots (a more realistic book), it would be ~20 KCU — and a 10-fill cross would consume 200 KCU on scans alone, hitting the default budget before any work.
+It grows with the book, but slowly at this size. Four fills against 8, 16, 24 and 32 makers cost 8,500, 9,276, 9,980 and 10,680 CU: about 22 CU per extra active maker per fill. A full 32-slot book can never hold more than 32 makers, so the worst a single `Match` can do here is 32 fills against 32 makers: 57,696 CU, well inside the 200K default. To see the budget break, make the book bigger. With `ORDER_CAPACITY = 128` (in `crates/state`), one fill against 128 makers costs 7,565 CU and 16 fills 80,533, about 4,900 per fill; 64 fills against 64 makers cost 194,916, and 64 fills against 128 makers no longer fit at all.
 
-This is the cost shape the chapter exists to make visible. The flat matcher's per-fill cost grows linearly with the book size. The total per-instruction cost is `O(fills × N)`. Both factors are knobs you might want to push (more fills per call, bigger book). Push either far enough and the budget breaks.
+This is the cost shape the chapter exists to make visible. The flat matcher's per-fill cost grows linearly with the book size. The total per-instruction cost is `O(fills × N)`. Both factors are knobs you might want to push (more fills per call, bigger book). Push either far enough and the budget breaks; at 32 slots, "far enough" is further than the book can go.
 
 **What the SDK hides:** Anchor's program logs include the same "consumed N of M compute units" line because it comes from the runtime, not the user code. But Anchor does not surface a typed `units_consumed` field anywhere — you read it from the simulation result like we do here, with `sim.value.units_consumed`.
 
-> **Exercise §8.2.** With the book at 30/32 capacity, run the matcher with `--max-fills 30`. The simulation should report units_consumed near or above 200,000. Now add `--cu-limit 400000` and re-run. Does the on-chain commit succeed? At what `max_fills` does it stop succeeding even at `--cu-limit 1400000` (the network maximum)?
+> **Exercise §8.2.** With the book at 30/32 capacity, run the matcher with `--max-fills 30`. We measured 54,935 CU on a full book: comfortably inside the default. Now set `ORDER_CAPACITY = 128` in `crates/state/src/lib.rs`, rebuild the program, fill the book with 128 makers, and run `--max-fills 64`. It should fail with `ComputationalBudgetExceeded`. Add `--cu-limit 400000` and re-run. Does the on-chain commit succeed? At what `max_fills` does it stop succeeding even at `--cu-limit 1400000` (the network maximum)?
 
 ---
 
@@ -273,8 +270,9 @@ For those, ship the slab. The pseudo-code in §8.4 is the design spec and Chapte
 Match on flat book (this chapter):
 
   Per fill:    O(N) scan + O(1) write     → O(K × N) total
-  Per K=16 on ORDER_CAPACITY=32 book:    ~60 KCU
-  Failure mode:  CU exhaustion past ~30 fills
+  Per K=16 on ORDER_CAPACITY=32 book:    ~27 KCU (16 makers), 33 KCU (32)
+  Failure mode:  none at 32 slots (worst case 32 fills ≈ 58 KCU);
+                 CU exhaustion past ~40 fills at 128 slots
 
 
 Match on slab (Chapter 15, pseudocoded above):
@@ -301,9 +299,33 @@ Three responses to CU pressure:
 
 ### Three things to verify yourself
 
-1. **Cost grows multiplicatively.** Pre-populate the book with 8, 16, 24 active makers. For each, run `match-cli` with `--max-fills 4` (constant). Record `units_consumed`. The numbers should roughly track 4 × N, not just N or 4.
-2. **Pagination has correct subtotals.** Run `match-cli` with `--max-fills 16` against a full 32-maker book and a 10-unit taker. Note `units_consumed` and the post-state `active_count`. Now do the same matcher work as two calls with `--max-fills 8`. The sum of both calls' `units_consumed` should be very close to the single 16-call's number (slightly higher due to two `process_match` setup overheads).
-3. **Budget raise is real.** Run a deliberately-too-large match (e.g., 25 fills against a packed 32-maker book) without `--cu-limit`. It should fail. Add `--cu-limit 500000`. Should succeed. Confirm that `sim.value.units_consumed` is between the default 200,000 and 500,000.
+1. **Cost grows multiplicatively.** Pre-populate the book with 8, 16, 24 active makers. For each, run `match-cli` with `--max-fills 4` (constant). Record `units_consumed`. They grow with N, but at this size the fixed part of each fill dominates: we measured 8,500, 9,276 and 9,980. The `O(K × N)` term is there (about 22 CU per extra maker per fill); it just needs a bigger N to matter (§8.2).
+2. **Pagination has correct subtotals.** Run `match-cli` with `--max-fills 16` against a full 32-maker book and a 10-unit taker. Note `units_consumed` and the post-state `active_count`. Now do the same matcher work as two calls with `--max-fills 8`. The sum of both calls' `units_consumed` should be very close to the single 16-call's number (slightly higher due to two `process_match` setup overheads). With a taker large enough to take all 16, we measured 33,020 for one call and 18,476 + 17,072 for two.
+3. **Budget raise is real.** A 32-slot book cannot hold a match too large for the default budget: 25 fills against a packed 32-maker book measured 47,645. Raise `ORDER_CAPACITY` to 128 (as in Exercise §8.2), fill the book, and run 64 fills without `--cu-limit`. It should fail. Add `--cu-limit 500000`. Should succeed. Confirm that `sim.value.units_consumed` is between the default 200,000 and 500,000.
+
+
+### Now let a tool look for the expensive match
+
+Chapter 4 §4.7 ran [solinv](https://github.com/psyto/solinv)'s cu-dos check on `Bench`, whose cost the caller picks on purpose. `Match` is the instruction other people depend on, and its cost is picked by two parties: the taker chooses `max_fills`, and the makers choose how full the book is. [`fuzz/matching/`](../../fuzz/matching) fills the book with 32 bids, lets makers refill emptied slots, lets the taker pick any `max_fills` from 1 to 255, and declares a cap of 50,000 CU (`MATCH_CU_CAP`) for one `Match`. Set up as in Chapter 3 §3.7, then:
+
+```bash
+cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
+cd fuzz/matching
+cargo build --release --features invariant_ch8
+cargo test --release --features invariant_ch8      # cost grows with the book
+timeout -s INT 60 crucible run openhl_matching_fuzz invariant_ch8 \
+    --binary-in target/release/invariant_test --timeout 45
+```
+
+> **Exercise §8.6.** Run it. Within seconds you should see lines like
+>
+> ```
+> [FUZZ_FINDING] [cu-dos:…] ix match consumed 58148 CU (cap 50000)
+> ```
+>
+> The taker asked for more fills than the cap allows on a full book. In Chapter 4 the lesson was that raising the cap to the runtime's limit fixes nothing. Here there is a real fix, because the worst case is bounded: the book has 32 slots, and the program decides how much work one call may do. From the §8.2 numbers, how large may `max_fills` be for a full book to stay under 50,000? Add `if max_fills > N { return Err(...) }` to `process_match` with your answer, rebuild, and run again.
+>
+> We used 24 (25 fills on a full book measured 47,645, 30 measured 54,935, so 24 leaves room) and saw no finding in 45 seconds. That is option (2) of §8.3, pagination, made mandatory: a taker who wants more fills sends more calls. It holds only while the book stays at 32 slots. At 128 slots one fill costs about 4,900 CU, so the same cap would let a call cost about 118,000, and the cap would have to come down with every increase in `ORDER_CAPACITY`. That coupling is the argument for option (3), the slab (Chapter 15), whose per-fill cost grows with log N rather than N (§8.4).
 
 ---
 

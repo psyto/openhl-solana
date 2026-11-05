@@ -1,7 +1,7 @@
 # 第8章 — CU 圧の下のマッチングエンジン
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_match` 1361–1489 行）、[`scripts/match/src/main.rs`](../../scripts/match/src/main.rs)。
+> 教材コード: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_match` 1354–1482 行）、[`scripts/match/src/main.rs`](../../scripts/match/src/main.rs)、[`fuzz/matching/src/main.rs`](../../fuzz/matching/src/main.rs)（§8.6 の solinv ハーネス）。
 > 第 7 章の `OrderBook` データ構造の上に立つ。
 
 ---
@@ -81,28 +81,25 @@ fill ごとに 5 ステップ。吸収すべき点は 2 つ。
 
 半分埋まった book（resting maker 16、すべて bid、taker は ask でそれに対してマッチ）に対して、`--max-fills` を 1 から 16 まで変化させてマッチャを実行する。
 
-| max_fills | sim units_consumed | fill あたり限界 |
-|-----------|--------------------|-----------------|
-|   1       |    約 5,000        |   約 3,500     |
-|   2       |    約 8,500        |   約 3,500     |
-|   4       |    約16,000        |   約 3,750     |
-|   8       |    約30,500        |   約 3,600     |
-|  16       |    約58,500        |   約 3,500     |
+| max_fills | units consumed | fill あたり限界 |
+|-----------|----------------|----------------|
+|   1       |    4,254       |   —            |
+|   2       |    5,950       |   1,696        |
+|   4       |    9,276       |   1,663        |
+|   8       |   15,637       |   1,590        |
+|  16       |   27,220       |   1,448        |
 
-fill あたりの限界コストは 16 maker book でほぼ一定、約 3.5 KCU。内訳:
+(`fuzz/matching` の `grid` テストで測った。実際のプログラムを LiteSVM で走らせる。LiteSVM と `solana-test-validator` 4.1.2 が同じ数を数えることは第 4 章 §4.5 で確かめた。この表の以前の版は古いツールチェーンのもので、fill あたり約 3,500 CU だった。自分で測ること。)
 
-- fill あたり約 1,000 CU — 線形走査（16 スロット × 約 60 CU）
-- fill あたり約 1,200 CU — maker 変更 + スロットゼロ化
-- fill あたり約 1,000 CU — fill を記録する `msg!` ログ行
-- fill あたり約 300 CU — ループ家事と `Order` 書き込み
+fill あたりの限界コストはほぼ一定で、16 maker の book で約 1.5 KCU。一部は線形走査で、fill ごとに空でも埋まっていても 32 スロットすべてを見る。一部は maker の書き込みと、fill ごとに出す `msg!` の行だ。それ以上は分けて測っていない。大事なのは、それがどう増えるかだ。
 
-book サイズを倍にすれば走査部分が倍になり、残りは定数のまま。ORDER_CAPACITY = 32 で全スロット活性なら fill あたり限界は約 5 KCU。256 スロット（より現実的な book）では約 20 KCU になり、10 fill 交差は走査だけで 200 KCU 消費して既定バジェットを使い切ってしまう。
+book とともに増えるが、この大きさではゆっくりだ。8、16、24、32 maker に対する 4 fill は 8,500、9,276、9,980、10,680 CU で、maker が 1 増えるごとに fill あたり約 22 CU。32 スロットの book には 32 maker までしか入らないので、ここで 1 回の `Match` がする最悪は 32 maker に対する 32 fill で 57,696 CU、既定の 200K に十分収まる。バジェットが壊れるのを見るには book を大きくする。`ORDER_CAPACITY = 128`(`crates/state` にある)では、128 maker に対する 1 fill が 7,565 CU、16 fill が 80,533 で fill あたり約 4,900。64 maker に対する 64 fill は 194,916、128 maker に対する 64 fill はもう収まらない。
 
-これが本章が可視化するためにある CU コスト形状だ。フラットマッチャの fill あたりコストは book サイズに比例して成長する。命令あたり総コストは `O(fills × N)`。両因子とも押し上げたくなるつまみだ（呼び出しあたり fill 数を増やす、book を大きくする）。十分に押し上げればバジェットが壊れる。
+これが本章が可視化するためにある CU コスト形状だ。フラットマッチャの fill あたりコストは book サイズに比例して成長する。命令あたり総コストは `O(fills × N)`。両因子とも押し上げたくなるつまみだ（呼び出しあたり fill 数を増やす、book を大きくする）。十分に押し上げればバジェットが壊れる。32 スロットでは、その「十分」は book が行ける先より遠い。
 
 **SDK が隠していること:** Anchor のプログラムログにも同じ「consumed N of M compute units」行が含まれる。ユーザコードからではなくランタイムから来るからだ。しかし Anchor は `units_consumed` を型付きフィールドとしてどこにも公開しない — 本書のようにシミュレーション結果から `sim.value.units_consumed` で読む。
 
-> **演習 §8.2.** book を 30/32 容量にし、`--max-fills 30` でマッチャを実行せよ。シミュレーションは 200,000 近辺かそれ以上の units_consumed を報告するはずだ。次に `--cu-limit 400000` を加えて再実行する。オンチェーン確定は成功するか。`--cu-limit 1400000`（ネットワーク最大）でも成功しなくなるのはどの `max_fills` か。
+> **演習 §8.2.** book を 30/32 容量にし、`--max-fills 30` でマッチャを実行せよ。満杯の book で測ると 54,935 CU で、既定に余裕で収まる。次に `crates/state/src/lib.rs` で `ORDER_CAPACITY = 128` にしてプログラムを作り直し、book を 128 maker で満たして `--max-fills 64` で実行する。`ComputationalBudgetExceeded` で失敗するはずだ。`--cu-limit 400000` を加えて再実行する。オンチェーン確定は成功するか。`--cu-limit 1400000`（ネットワーク最大）でも成功しなくなるのは `max_fills` がいくつのときか。
 
 ---
 
@@ -271,8 +268,9 @@ slab 実装は、初めてなら 3-4 日の演習だ。1 日目はプール + �
 フラット book 上の Match（本章）:
 
   fill ごと:    O(N) 走査 + O(1) 書き込み     → O(K × N) 総計
-  ORDER_CAPACITY=32 book で K=16:           約 60 KCU
-  失敗モード:    約 30 fill を超えると CU 枯渇
+  ORDER_CAPACITY=32 book で K=16:           約 27 KCU(16 maker)、33 KCU(32)
+  失敗モード:    32 スロットではなし(最悪の 32 fill で約 58 KCU)。
+                 128 スロットでは約 40 fill を超えると CU 枯渇
 
 
 Slab 上の Match（第 15 章、上で擬似コード化）:
@@ -299,9 +297,33 @@ CU 圧への 3 つの対応:
 
 ### 自分で検証する 3 項目
 
-1. **コストは乗算的に成長する。** book に 8、16、24 の活性 maker を事前投入せよ。それぞれに対し `match-cli` を `--max-fills 4`（定数）で実行する。`units_consumed` を記録する。数値はおおよそ 4 × N に追随し、N だけや 4 だけにはならないはずだ。
-2. **ページングは正しい小計を持つ。** 満杯 32 maker book と 10 単位 taker に対し `--max-fills 16` でマッチャを実行する。`units_consumed` と post-state の `active_count` を記録する。次に同じマッチング作業を `--max-fills 8` の 2 呼び出しに分けて行う。両呼び出しの `units_consumed` 合計は 1 回の 16 呼び出しの数値に非常に近いはずだ（2 つの `process_match` セットアップオーバーヘッドのぶんだけわずかに高い）。
-3. **バジェット引き上げは本物。** 詰め込まれた 32 maker book に対し意図的に大きすぎるマッチ（例: 25 fills）を `--cu-limit` なしで実行する。失敗するはずだ。`--cu-limit 500000` を加える。成功するはずだ。`sim.value.units_consumed` が既定 200,000 と 500,000 の間にあることを確認せよ。
+1. **コストは乗算的に成長する。** book に 8、16、24 の活性 maker を事前投入せよ。それぞれに対し `match-cli` を `--max-fills 4`（定数）で実行する。`units_consumed` を記録する。N とともに増えるが、この大きさでは fill ごとの固定部分が支配的だ。私たちの測定では 8,500、9,276、9,980。`O(K × N)` の項はある(maker が 1 増えるごとに fill あたり約 22 CU)が、効いてくるにはもっと大きな N が要る(§8.2)。
+2. **ページングは正しい小計を持つ。** 満杯 32 maker book と 10 単位 taker に対し `--max-fills 16` でマッチャを実行する。`units_consumed` と post-state の `active_count` を記録する。次に同じマッチング作業を `--max-fills 8` の 2 呼び出しに分けて行う。両呼び出しの `units_consumed` 合計は 1 回の 16 呼び出しの数値に非常に近いはずだ（2 つの `process_match` セットアップオーバーヘッドのぶんだけわずかに高い）。taker を 16 すべてを取れる大きさにすると、1 呼び出しで 33,020、2 呼び出しで 18,476 + 17,072 だった。
+3. **バジェット引き上げは本物。** 32 スロットの book には、既定のバジェットに収まらないほど大きなマッチが入らない。詰め込まれた 32 maker book に対する 25 fill は 47,645 だった。`ORDER_CAPACITY` を 128 に上げ(演習 §8.2 のとおり)、book を満たし、64 fill を `--cu-limit` なしで実行する。失敗するはずだ。`--cu-limit 500000` を加える。成功するはずだ。`sim.value.units_consumed` が既定 200,000 と 500,000 の間にあることを確認せよ。
+
+
+### 高くつくマッチを道具に探させる
+
+第 4 章 §4.7 では、呼び出し側がわざと値段を選ぶ `Bench` に [solinv](https://github.com/psyto/solinv) の cu-dos を走らせた。`Match` は他の人が頼る命令で、その値段を選ぶのは 2 者だ。taker が `max_fills` を選び、maker が book をどれだけ埋めるかを選ぶ。[`fuzz/matching/`](../../fuzz/matching) は book を 32 の買い注文で満たし、空いたスロットを maker が埋め直せるようにし、taker が 1〜255 の任意の `max_fills` を選べるようにして、1 回の `Match` に 50,000 CU の上限(`MATCH_CU_CAP`)を宣言する。第 3 章 §3.7 のとおり準備してから:
+
+```bash
+cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
+cd fuzz/matching
+cargo build --release --features invariant_ch8
+cargo test --release --features invariant_ch8      # コストは book とともに増える
+timeout -s INT 60 crucible run openhl_matching_fuzz invariant_ch8 \
+    --binary-in target/release/invariant_test --timeout 45
+```
+
+> **演習 §8.6.** 走らせよ。数秒で次のような行が出るはずだ:
+>
+> ```
+> [FUZZ_FINDING] [cu-dos:…] ix match consumed 58148 CU (cap 50000)
+> ```
+>
+> taker が、満杯の book で上限が許す以上の fill を求めた。第 4 章の教訓は、上限をランタイムの限界まで上げても何も直らない、だった。ここには本当の直し方がある。最悪の場合に上限があるからだ。book は 32 スロットで、1 回の呼び出しがどれだけ働くかはプログラムが決める。§8.2 の数値から、満杯の book で 50,000 に収まる `max_fills` はいくつまでか。その答えで `process_match` に `if max_fills > N { return Err(...) }` を足し、作り直してもう一度走らせよ。
+>
+> 私たちは 24 を使った(満杯の book で 25 fill は 47,645、30 は 54,935 だったので、24 なら余裕がある)。45 秒で検出は出なかった。これは §8.3 の選択肢 (2)、ページングを必須にしたものだ。もっと fill がほしい taker は呼び出しを増やす。これが成り立つのは book が 32 スロットのままの間だけだ。128 スロットでは 1 fill が約 4,900 CU なので、同じ上限で 1 呼び出しが約 118,000 になりうる。`ORDER_CAPACITY` を上げるたびに上限を下げなければならない。この結びつきが、選択肢 (3)、slab(第 15 章)を選ぶ理由だ。slab の fill あたりコストは N ではなく log N で増える(§8.4)。
 
 ---
 
