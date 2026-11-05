@@ -2,9 +2,9 @@
 //! `ClaimBuilderFees`.
 //!
 //! Loads the real `openhl_core.so` from `target/deploy/` (`cargo build-sbf
-//! --manifest-path programs/openhl-core/Cargo.toml`). Builder B registers
-//! in the quote mint Q; user U trades through B. Three markets, each with
-//! its book and a fresh oracle:
+//! --manifest-path programs/openhl-core/Cargo.toml`). Builders B and B2
+//! register in the quote mint Q; user U trades through either. Three
+//! markets, each with its book and a fresh oracle:
 //!
 //! - `m`: the market for `(base, Q)` at its PDA.
 //! - `m2`: a second market for the same pair, made by `Initialize`
@@ -13,8 +13,10 @@
 //!
 //! What the specs declare, beyond the account checks every harness does:
 //!
-//! - a relation, `profile.accumulated_fees <= fee_vault.amount`: the fee
-//!   vault can always pay the builder what it is owed;
+//! - a relation, `B.accumulated_fees + B2.accumulated_fees <= Q fee
+//!   vault.amount`: the fee vault can always pay builders what they are
+//!   owed (B2's profile is appended to each instruction so the relation
+//!   can read it);
 //! - a guard on placing an order, `profile.fee_mint == market.quote_mint`:
 //!   a builder is credited only in the mint it is paid out in.
 
