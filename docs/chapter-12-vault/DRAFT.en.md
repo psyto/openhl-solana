@@ -1,7 +1,7 @@
 # Chapter 12 — Native Vault Program (Pooled Trading)
 
 > Status: draft (v0.1).
-> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`TradingVault`, `VaultShare`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_trading_vault` 3357–3476, `process_vault_deposit` 3491–3650, `process_vault_withdraw` 3664–3815, `process_vault_update_nav` 3822–3862), [`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs), [`fuzz/vault/src/main.rs`](../../fuzz/vault/src/main.rs) (the solinv harness for §12.7).
+> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`TradingVault`, `VaultShare`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_trading_vault` 3387–3506, `process_vault_deposit` 3521–3680, `process_vault_withdraw` 3694–3845, `process_vault_update_nav` 3852–3892), [`scripts/vault/src/main.rs`](../../scripts/vault/src/main.rs), [`fuzz/vault/src/main.rs`](../../fuzz/vault/src/main.rs) (the solinv harness for §12.7).
 >
 > Since the parts split, the logic this chapter walks through lives in [`crates/vault/src/lib.rs`](../../crates/vault/src/lib.rs) (`openhl-vault`); the program calls it. The code quoted below is the pre-split version from `programs/openhl-core/src/lib.rs`, and its line numbers are not kept in sync.
 
