@@ -363,9 +363,10 @@ impl PositionsFixture {
         f
     }
 
-    /// Republish m's price; it stays near 100, where A and B are healthy
-    /// and E is not (E's equity 10 × (p − 100) + 30 against 0.5 × p).
-    pub fn action_reprice(&mut self, #[range(95..102)] price: i64) -> bool {
+    /// Republish m's price at 98..=101, where A and B are healthy and E is
+    /// liquidatable with a remainder: E's equity 10 × (p − 100) + 30 is
+    /// above the 0.1 × p penalty and below the 0.5 × p maintenance margin.
+    pub fn action_reprice(&mut self, #[range(98..102)] price: i64) -> bool {
         let m = self.m;
         self.set_price(m, price);
         true

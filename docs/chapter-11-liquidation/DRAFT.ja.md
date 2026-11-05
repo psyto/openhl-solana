@@ -131,7 +131,7 @@ let funding_snapshot = read_funding_index(funding_ai, program_id)?;
 
 `read_fresh_oracle`（2353–2372 行）は第 9 章の staleness ガントレットをヘルパに分離した — 同じチェック（owner + discriminator + price>0 + Clock に対する age）、3 つのポジション ハンドラで再利用。`read_funding_index`（2597–2607 行）はファンディング指数をスナップショットする簡単な読み。
 
-どちらのヘルパも、渡されたオラクルやファンディング状態が**誰の**ものかを問わない。どの市場のオラクルもこのプログラムが所有し、同じ discriminator を持つからだ。そこで 3 つのポジション ハンドラはどれも、まず `verify_market_oracle_and_funding` を呼ぶ。2 つのアカウントがこの市場の PDA、つまり `[ORACLE_SEED, market]` と `[FUNDING_SEED, market]` であることを求める。`PlaceOrderChecked` がオラクルについてすでに使っていた導き方と同じだ(第 9 章)。この章の最初の版は、3 つのハンドラすべてでこれを書き忘れていた。同じ quote の mint に市場が 2 つあり、一方が 100、もう一方が 200 のとき、利用者は 1 つ目でロングを開き、2 つ目の市場のオラクルを指定して閉じた。200 を入れて、1 つ目の市場のトークン口座(全員の担保が入っている)から 1,200 を持ち出した。清算者も同じやり方で健全なショートを清算できた。第 9 章の publisher の検査(演習 §9.2)は役に立たない。どちらの価格も正直で、ただ市場が違うだけだからだ。fuzzer がこれをどう見つけたかは §11.7 で示す。
+どちらのヘルパも、渡されたオラクルやファンディング状態が**誰の**ものかを問わない。どの市場のオラクルもこのプログラムが所有し、同じ discriminator を持つからだ。そこで 3 つのポジション ハンドラはどれも、まず `verify_market_oracle_and_funding` を呼ぶ。2 つのアカウントがこの市場の PDA、つまり `[ORACLE_SEED, market]` と `[FUNDING_SEED, market]` であることを求める。`PlaceOrderChecked` がオラクルについてすでに使っていた導き方と同じだ(第 9 章)。この章の最初の版は、3 つのハンドラすべてでこれを書き忘れていた。同じ quote の mint に市場が 2 つあり、一方が 100、もう一方が 200 のとき、利用者は 1 つ目でロングを開き、2 つ目の市場のオラクルを指定して閉じた。200 を入れて、1 つ目の市場のトークン口座(全員の担保が入っている)から 1,200 を持ち出した。清算者も同じやり方で健全なショートを清算できた。第 9 章の publisher の検査(演習 §9.2)は役に立たない。どちらの価格も正直で、ただ市場が違うだけだからだ。fuzzer がこれをどう見つけたかは §11.7 で示す。(第 9 章の Pyth を使う 2 つの注文の命令は、今も任意の Pyth のフィードを受け取る。`process_place_order_checked_pyth` の上のコメントにそう書いてあり、直し方は `Market` にフィードを固定することだ。これらは注文の価格の帯を確かめるだけで、ポジションの決済には使われない。)
 
 **初期証拠金チェック**（2915–2926 行）:
 
@@ -503,7 +503,7 @@ slot 3 はオラクルだ。Crucible は最初の検出で 1 回の実行を止�
 > | Close: `position.market == market` | **はい**(組で) | `m` のポジションが `n` のアカウント一式に対して閉じられた |
 > | Close: `verify_vault_token_account` | いいえ | SPL Token: `owner does not match`(`m` の authority は `n` の口座に署名できない) |
 > | Close: `verify_market_oracle_and_funding` | **はい**、account-swap、slot 2 | `n` の価格で閉じた。`close_refuses_another_markets_oracle` が落ちる |
-> | Close: `fund.market == market` | **はい**、account-swap、slot 10 | `m` のポジションに `n` の保険基金が使われた |
+> | Close: `fund.market == market` | **はい**、account-swap、slot 10 | `m` のポジションに `n` の保険基金が受け入れられた(A の決済は利益だったので基金からは引き出されていない。検出は受け入れたこと) |
 > | Liquidate: `liquidator_ai.is_signer` | **はい**、signer-skip | — ただし下を見よ |
 > | Liquidate: `position.market == market` | **はい**(組で) | Close と同じ |
 > | Liquidate: 所有者のトークン口座 | **はい**、account-swap、slot 6 | E の残りが清算者に払われた |
