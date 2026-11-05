@@ -2,7 +2,7 @@
 
 > 状態: ドラフト (v0.1)。
 > 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Oracle`、加えて §9.5 のための Pyth v1 と v2 のレイアウト定数）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_oracle`、`process_set_oracle_price`、`process_place_order_checked`、`process_place_order_checked_pyth`、`process_place_order_checked_pyth_v2`、ヘルパ `read_fresh_oracle` / `read_fresh_pyth_v1_oracle` / `read_fresh_pyth_v2_oracle`）、[`scripts/oracle/src/main.rs`](../../scripts/oracle/src/main.rs)、[`programs/openhl-core/tests/pyth_binding.rs`](../../programs/openhl-core/tests/pyth_binding.rs)（§9.5 のフィード固定のテスト）。
-> 参照対象: Pyth Network mainnet プログラム（`FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH`）、Switchboard On-Demand。
+> 参照対象: Pyth Network mainnet プログラム（`FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH`、[pyth-client-js](https://github.com/pyth-network/pyth-client-js/blob/f37e2d94dcc3043fff4973480b86378e4e623344/src/cluster.ts) による）、Switchboard On-Demand。
 >
 > 部品化に伴い、この章で読むロジックは [`crates/oracle/src/lib.rs`](../../crates/oracle/src/lib.rs)(`openhl-oracle`)に移り、プログラムはそれを呼び出す。以下に引用するコードは分割前の `programs/openhl-core/src/lib.rs` の版で、行番号は追従していない。
 
@@ -284,7 +284,7 @@ fn read_fresh_pyth_v1_oracle(oracle_ai: &AccountInfo) -> Result<u64, ProgramErro
 
 `read_fresh_pyth_v1_oracle` の「v1」が重要。Pyth の v1 モデル — パブリッシャが毎スロット静的 PriceAccount に書き、リーダーがそれをパース — は廃止されつつあり、v2 の **プルオラクル** アーキテクチャに置き換わる。Perp DEX にとって重要な洞察は、v2 アーキテクチャが 2 つの層にきれいに分かれることだ:
 
-1. **Pyth の `pyth-solana-receiver` プログラム**が暗号作業をする。Wormhole VAA（Verified Action Approval — Wormhole の guardian set の 2/3 以上が署名したペイロード）に包まれた Pyth update メッセージを受け取り、Solana の secp256k1 precompile で guardian 署名を検証し、bundled update の Merkle proof があれば検証し、検証済み価格を `PriceUpdateV2` アカウントに書く。
+1. **Pyth の `pyth-solana-receiver` プログラム**が暗号作業をする。Wormhole VAA(Verified Action Approval。Wormhole の guardian の 3 分の 2、完全な guardian set なら 19 中 13 が署名したメッセージ。[Wormhole のドキュメント](https://wormhole.com/docs/protocol/infrastructure/vaas/))つきの Pyth update メッセージを受け取り、guardian 署名を確かめ(`post_update_atomic` では `secp256k1_recover` syscall で、`post_update` では Wormhole の core bridge が検証済みの VAA アカウントを受け取って)、価格の Merkle proof を VAA の root に照らし、価格を `PriceUpdateV2` アカウントに書く。署名が quorum に届いたときだけ `VerificationLevel::Full` を記録する([receiver](https://github.com/pyth-network/pyth-crosschain/blob/ec40e5f1705a3f6c7818b0f2f1e96a4ac75a7454/target_chains/solana/programs/pyth-solana-receiver/src/lib.rs))。
 2. **コンシューマ**（あなた、perp DEX）がその `PriceUpdateV2` アカウントを読む。VAA 検証なし。Guardian set 管理なし。あなたのホット パスに暗号なし。
 
 その 2 層を混同したら（本セクションの初期ドラフトはした）、v2 はあなたの側に ~2000 行の暗号コードが必要だと結論するだろう。そうではない。Wormhole 作業は Pyth のプログラムに住み、それは共有インフラだ; perp DEX で出荷するのは構造的に v1 リーダーと同じ、ただし異なるアカウント レイアウトに対するもの。
@@ -362,7 +362,7 @@ tx = [
 
 ### Switchboard フォールバック
 
-単一オラクルは単一障害点。Pyth は停止したことがある。Switchboard も停止したことがある。両方同時に（稀に）起きたこともある。下方を守るプログラムは**両方**を信頼し、どちらも fresh でなければ動作を拒否する。配線は機械的だ:
+単一オラクルは単一障害点だ。フィードが更新されなくなれば staleness の検査がすべての呼び出しを拒否し、誤った価格を出せばプログラムの中で気づくものはない。下方を守るプログラムは**両方**を信頼し、どちらも fresh でなければ動作を拒否する。配線は機械的だ:
 
 1. トランザクションの `AccountMeta` 配列に両オラクルアカウントを含める。
 2. ハンドラがそれぞれを読み、完全な検証パターン（discriminator/magic + status + 価格正値 + staleness）を行う。

@@ -11,7 +11,7 @@
 
 第 7 章はフラット配列の `OrderBook` を出荷した — 32 スロット、insert で空きスロットを線形スキャン、`Match` で価格マッチを線形スキャン。第 8 章はコストを測った: `K = 10` の fill ループで `N = 32` の板に対して概ね `O(K × N)` を走り、settlement の前に板の簿記だけで約 22 KCU を費やす(測り直した値。§8.2)。これは**教育用のベースラインとして**機能する。本番の板としては機能しない — どんな現実的な深さでもスキャンが支配する。
 
-Hyperliquid と Serum / Phoenix の答えは **slab** だ: 価格水準の上の木で(ここでは critbit。自己平衡はしない。深さは価格のビットに従い、価格がばらけていれば約 log₂ N、maker が敵対的に選べば 64 まで。§15.7)、各葉がその価格水準のオーダの FIFO を持つ。Insert は価格水準ごとに O(log N)。Best-price は O(log N) — 求める側に向かって root から歩く。Best を pop するのは最悪 O(log N)（水準が空になり葉を木から削除する必要がある場合。葉の上の inner が冗長になり、葉と一緒に折りたたまれる）。§8.4 の擬似コードがこの章を約束した。これがそれだ。
+オンチェーンでの普通の答えは木だ。Serum と OpenBook v2 は注文 1 件を 1 枚の葉とし、価格→シーケンス番号の順のキーで並べる critbit 木を持つ([Serum](https://github.com/project-serum/serum-dex/blob/92992b308885f5323b3f51eb1a0c899e35c62cb3/dex/src/critbit.rs)、[OpenBook v2](https://github.com/openbook-dex/openbook-v2/blob/f3e17421e675b083b584867594bf3cf4f675d156/programs/openbook-v2/src/state/orderbook/nodes.rs))。Phoenix は同じキーの red-black 木を持つ([Phoenix](https://github.com/Ellipsis-Labs/phoenix-v1/blob/6ae54af5f07f4d0ae8430b08cbe81d10432cd34c/src/state/markets/fifo.rs))。本書のものは **slab** だ: 価格水準の上の木で(critbit。自己平衡はしない。深さは価格のビットに従い、価格がばらけていれば約 log₂ N、maker が敵対的に選べば 64 まで。§15.7)、各葉がその価格水準のオーダの FIFO を持つ。Insert は価格水準ごとに O(log N)。Best-price は O(log N) — 求める側に向かって root から歩く。Best を pop するのは最悪 O(log N)（水準が空になり葉を木から削除する必要がある場合。葉の上の inner が冗長になり、葉と一緒に折りたたまれる）。§8.4 の擬似コードがこの章を約束した。これがそれだ。
 
 本章は第 7 章の `CreateOrderBook` / `PlaceOrder` / `Match` に並列な、3 つの新しい命令を出荷する:
 
@@ -24,7 +24,7 @@ Hyperliquid と Serum / Phoenix の答えは **slab** だ: 価格水準の上の
 本章が**ない**もの 3 つ:
 
 - **Match エンジン外科手術の章ではない。** slab の `SlabMatch` は第 8 章と同じ fill-loop の形を走る — 変わったのは maker 側にどう到達するか（O(N) でなく O(log N)）だけで、fill がどう会計されるかは変わらない。Settlement、手数料、builder split — どれもここには住まない。
-- **すべての critbit バリアントのガイドではない。** Serum の slab は葉と inner を識別子ビット付きで同じノードプールにパックする; Phoenix はわずかに違うレイアウトを per-level FIFO 会計構造で使う。本章は §8.4 の分割 — OrderNode プール 1 つ、TreeNode プール side ごとに 1 つ — に従う。それが教育的議論を最もクリーンに保つからだ。他のレイアウトはヘッダの数百バイトとアクセスのわずかな高速化を取引する。
+- **すべての critbit バリアントのガイドではない。** Serum の slab は葉と inner を同じノードプールに入れ、タグで見分ける([Serum](https://github.com/project-serum/serum-dex/blob/92992b308885f5323b3f51eb1a0c899e35c62cb3/dex/src/critbit.rs));Phoenix はそもそも critbit ではなく、(価格, シーケンス) をキーにした red-black 木だ([Phoenix](https://github.com/Ellipsis-Labs/phoenix-v1/blob/6ae54af5f07f4d0ae8430b08cbe81d10432cd34c/src/state/markets/fifo.rs))。本章は §8.4 の分割 — OrderNode プール 1 つ、TreeNode プール side ごとに 1 つ — に従う。それが教育的議論を最もクリーンに保つからだ。他のレイアウトはヘッダの数百バイトとアクセスのわずかな高速化を取引する。
 - **完全なベンチマークではない。** §15.6 に、このプログラムで許される大きさでの両方の板の実測値を載せた。本番の深さや settlement の CPI を含めた調査はフォローアップに属する。
 
 ---
@@ -88,7 +88,7 @@ pub struct Slab {                               // 計 ~82 KiB
 
 **4. 共有 OrderNode プール 1 つ。** `Slab.nodes` は単一配列。両方の木が同じプールから FIFO を引く。代替（side ごとプール）なら同じトータルフットプリントで side ごと OrderNode 容量が倍だが、片側だけの板（片方向の動きで bids ほぼ全部のとき）が片方のプールを枯渇させ他方が空のまま、ということになる。共有することで非対称フローでも slab を使えるように保つ。
 
-**5. アカウントサイズ = ~82 KiB。** 計算: `64 (ヘッダ) + 2 × 8208 (木) + 1024 × 64 (プール) = 82_064` バイト。これはプログラムの中からアカウントに与えられる 10 KiB(`MAX_PERMITTED_DATA_INCREASE`)を大きく超える。CPI で出した `create_account` はこの上限に縛られ、`MAX_PERMITTED_DATA_LENGTH = 10 MiB` まで確保できるのはトップレベルの命令だけ。だからプログラムは slab を自分で確保できない。クライアントがトランザクションの 1 つ目の命令で `SystemProgram::CreateAccount`(space `Slab::LEN`、owner は openhl-core)を送り、2 つ目の `CreateSlab` は初期化だけを行う。OpenBook や Phoenix と同じ分け方。このため slab は PDA ではなく keypair のアカウントになる。その結果、1 つの market に slab をいくつでも作れ、`SlabPlaceOrder` と `SlabMatch` は market を受け取らず `slab.market` も確かめない。slab には決済の経路がないので、今は「クライアントがどの板を読むか」だけの問題だが、本番では market の状態に公式の slab のアドレスを記録して照合する。Rent は作る人がブートストラップで払う 1 回限りのコスト。
+**5. アカウントサイズ = ~82 KiB。** 計算: `64 (ヘッダ) + 2 × 8208 (木) + 1024 × 64 (プール) = 82_064` バイト。これはプログラムの中からアカウントに与えられる 10 KiB(`MAX_PERMITTED_DATA_INCREASE`)を大きく超える。CPI で出した `create_account` はこの上限に縛られ、`MAX_PERMITTED_DATA_LENGTH = 10 MiB` まで確保できるのはトップレベルの命令だけ。だからプログラムは slab を自分で確保できない。クライアントがトランザクションの 1 つ目の命令で `SystemProgram::CreateAccount`(space `Slab::LEN`、owner は openhl-core)を送り、2 つ目の `CreateSlab` は初期化だけを行う。OpenBook や Phoenix と同じ分け方([OpenBook v2](https://github.com/openbook-dex/openbook-v2/blob/f3e17421e675b083b584867594bf3cf4f675d156/programs/openbook-v2/src/accounts_ix/create_market.rs)、[Phoenix](https://github.com/Ellipsis-Labs/phoenix-v1/blob/6ae54af5f07f4d0ae8430b08cbe81d10432cd34c/src/program/processor/initialize.rs))。このため slab は PDA ではなく keypair のアカウントになる。その結果、1 つの market に slab をいくつでも作れ、`SlabPlaceOrder` と `SlabMatch` は market を受け取らず `slab.market` も確かめない。slab には決済の経路がないので、今は「クライアントがどの板を読むか」だけの問題だが、本番では market の状態に公式の slab のアドレスを記録して照合する。Rent は作る人がブートストラップで払う 1 回限りのコスト。
 
 > **演習 §15.1.** 構造体レイアウトから正確な `Slab::LEN` を計算せよ（コメントを信用するな）。`bytemuck::bytes_of(&Slab::zeroed()).len()` で検証せよ。次に、`lamports_per_byte_year = 3_480` と `years = 2`（Solana の 2 年 rent 免除）で rent をランポートで計算せよ。それが概ね `CreateSlab` が請求するもの。
 
@@ -454,7 +454,7 @@ timeout -s INT 60 crucible run openhl_slab_fuzz invariant_ch15 \
 これは実装章であり比較章ではない。書かなかったもの:
 
 - `fuzz/slab` の `grid` テスト(§15.6)を超えるベンチマーク: 本番の深さ、settlement の CPI、slab での cancel。
-- Serum の slab vs Phoenix の slab vs 本書のサイドバイサイド。両方の本番 slab は本書が持たない機能を持つ（Serum のオーダブックは cancel-on-disconnect タグを保存する; Phoenix は独自の market-maker reservation スロットを持つ）、公平な比較はそれ自体の章になる。
+- Serum の slab vs Phoenix の slab vs 本書のサイドバイサイド。両方の本番 slab は本書が持たない機能を持つ（Serum の葉は所有者のスロットと client order id を持つ; Phoenix はトレーダーごとに market の seat を要求する）、公平な比較はそれ自体の章になる。
 - フラット板から slab 板への移行ガイド。2 つのアカウント型は独立 — オンチェーン変換はない。`OrderBook`（第 7 章）の上に建てた market と `Slab`（本章）の上に建てた market は同じプログラムで共存できる。
 
 ここまで来てもっと欲しいなら、§8.4 の擬似コードの「3-4 日の練習」フレーミングは正確だった: 日々を使い、バリアントを書き、結果を測れ。

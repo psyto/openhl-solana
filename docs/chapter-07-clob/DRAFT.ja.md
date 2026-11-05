@@ -26,7 +26,7 @@ Solana 上で課される制約は独特だ。トランザクションごとに�
 
 Solana 上の本物の CLOB は次の 2 つのどちらかになる。
 
-1. **Slab** — ノードの連続アリーナ、価格レベルごとに双方向リンクの FIFO キュー、価格レベル自体は ソート済み critbit ツリーに格納（Serum、Phoenix）。place/cancel が O(log N)、ベスト bid/ask 検索が O(1)、キャンセル時にコンパクション不要。
+1. **Slab** — ノードの連続アリーナをソート済みの木で持つ。Serum と OpenBook v2 は注文 1 件を 1 枚の葉とし、価格→シーケンス番号の順のキーで並べる critbit 木([Serum](https://github.com/project-serum/serum-dex/blob/92992b308885f5323b3f51eb1a0c899e35c62cb3/dex/src/critbit.rs)、[OpenBook v2](https://github.com/openbook-dex/openbook-v2/blob/f3e17421e675b083b584867594bf3cf4f675d156/programs/openbook-v2/src/state/orderbook/nodes.rs))。Phoenix は同じキーの red-black 木([Phoenix](https://github.com/Ellipsis-Labs/phoenix-v1/blob/6ae54af5f07f4d0ae8430b08cbe81d10432cd34c/src/state/markets/fifo.rs))。第 15 章の slab は価格レベルの上の critbit で、レベルごとに FIFO キューを持つ。place・cancel・ベスト価格の検索が O(log N)、キャンセル時にコンパクション不要。
 2. **Critbit-of-orders** — 各注文が critbit ツリーの葉、キーは価格（同価格内の FIFO 順序のために副キーにタイムスタンプ）。すべてが O(log N)、slab より推論しやすい、メモリ局所性はやや劣る。
 
 本書が組み立てるのはそのどちらでもない。**固定容量のフラット配列、線形走査**だ。`crates/state/src/lib.rs` から。

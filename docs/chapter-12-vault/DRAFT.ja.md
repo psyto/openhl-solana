@@ -16,7 +16,7 @@
 
 両方とも「vault」の合理的な使い方だ。型名で曖昧さを解消した（`TradingVault` は明確、第 6 章の `Vault` は専用 state 構造体を持たず — 単なる SPL Token アカウントだ）。命令は `CreateVault`（トークン アカウント）vs `CreateTradingVault`（本章）の分離で衝突しない。
 
-trading vault は perp DEX を、ユーザが直接取引する venue から、**基金**もホストする venue に変える概念的プリミティブだ。ポジションを自分で管理したくないユーザは vault に預金できる。vault のマネージャが戦略を走らせる。預金者はリターンを共有する。これは Solana 上のすべての yield vault の構造 — Drift の spot vault、Kamino の leveraged vault、Jupiter の perps vault、その他もろもろ。
+trading vault は perp DEX を、ユーザが直接取引する venue から、**基金**もホストする venue に変える概念的プリミティブだ。ポジションを自分で管理したくないユーザは vault に預金できる。vault のマネージャが戦略を走らせる。預金者はリターンを共有する。マネージャ 1 人が取引し、預金者は結果の持分を持つ。運用者のいるファンドの形だ。
 
 本章は vault の会計半分を組み立てる — shares、deposits、withdrawals、NAV 更新。トークンは実際に動く。deposit は預金者の口座から、trading vault 専用のトークン口座へ移す。この口座は `[TRADING_VAULT_TOKEN_SEED, vault]` の PDA で、`CreateTradingVault` が vault と一緒に作る。withdraw は trading vault の PDA 自身が `invoke_signed` で署名して戻す。(この章の最初の版は、第 6 章が作り第 11 章がポジションの証拠金に使う (market, mint) ごとの口座を、市場の全 vault で共有していた。その代償は §12.5 で示す。)マネージャの取引半分は組み立てない（第 11 章の `OpenPosition` を vault の PDA をポジション所有者として呼び、vault の口座から市場の口座へ証拠金を移す薄いラッパ命令になる）。share 会計が整えば追加は機械的だ。本章は設計を説明し、実装を宿題ピースとして残す。
 

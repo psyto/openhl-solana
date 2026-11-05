@@ -11,7 +11,7 @@
 
 A **builder code** is a per-frontend identifier that gets attached to a trade. When a user opens an order through a frontend, the frontend includes its builder code in the transaction; the program then credits a configurable fraction of the trade's protocol fee to that builder's on-chain account.
 
-Hyperliquid coined the term in its current sense. It is the protocol-native mechanism that lets a frontend monetize its order flow without having to operate the order book itself. Same family as "router fees" (Uniswap), "white-label routing" (CEXes), "introducing broker" (TradFi) — Solana's version of a long-standing distribution incentive.
+The term is Hyperliquid's: a builder (a frontend) receives a fee on fills it sends on behalf of a user, at most 0.1% on perps and 1% on spot, up to a maximum the user approves per builder ([Hyperliquid docs](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/builder-codes)). It lets a frontend earn from its order flow without operating the order book itself. Same family as white-label routing at exchanges and the "introducing broker" of traditional finance — Solana's version of a long-standing distribution incentive.
 
 Two things builder codes are **not**:
 

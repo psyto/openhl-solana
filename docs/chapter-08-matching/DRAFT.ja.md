@@ -166,7 +166,7 @@ remaining > 0 かつ fills_done < max_fills の間:
 
 **コスト:** 大きな実装労力。正しい critbit + ノードプール + FIFO は約 1,500 行の慎重な Rust で、強い不変条件を伴う（各ノードはツリー+キューに住むかフリーリストにあるかのいずれか、各レベルは ≥1 注文を持つかツリーから消えているかのいずれか）。監査コストはそれに比例して高い。全体が `bytemuck::Pod` 適合だが慎重さを要する: ツリーノードはポインタではなくプール内のインデックスを持つ。
 
-**これが正解になるとき:** 非自明な流動性を持つ本番 CLOB。Phoenix と Serum はどちらも理由あってこの設計を使う。
+**これが正解になるとき:** 非自明な流動性を持つ本番 CLOB。Serum・OpenBook v2・Phoenix もこの理由で板を木に持つ。ただし価格レベルの下に注文を並べるのではなく、注文 1 件ごとに (価格, シーケンス) をキーにする([Serum](https://github.com/project-serum/serum-dex/blob/92992b308885f5323b3f51eb1a0c899e35c62cb3/dex/src/critbit.rs)、[OpenBook v2](https://github.com/openbook-dex/openbook-v2/blob/f3e17421e675b083b584867594bf3cf4f675d156/programs/openbook-v2/src/state/orderbook/nodes.rs)、[Phoenix](https://github.com/Ellipsis-Labs/phoenix-v1/blob/6ae54af5f07f4d0ae8430b08cbe81d10432cd34c/src/state/markets/fifo.rs))。
 
 slab 実装は第 15 章に住み、下記の設計仕様から生まれたコードを歩く。
 
@@ -233,7 +233,7 @@ struct TreeNode {
 1. **インデックスを使う、ポインタではなく。** `bytemuck::Pod` はポインタフィールドを許さない。プール配列とツリー配列への `u16` インデックスを使う。`u16` は 65k エントリで足りる — ほとんどの book には十分。
 2. **`NONE_INDEX = u16::MAX` の番兵。** `Option<u16>` はだめ — 構造体を Pod 安全から外す。番兵を使う。
 3. **片方向リンクスタックとしてのフリーリスト。** 空ノードの `next` フィールドが次の空ノードを指す。確保は `free_head` を pop、解放は `free_head` に push。両方とも O(1)。
-4. **critbit、red-black ではない。** critbit ツリーは再バランス規則がより単純で、回転ロジックが要らない。Serum は critbit、Phoenix も critbit。パターンは踏み固められている。
+4. **critbit、red-black ではない。** critbit 木は再バランスをしないので回転のロジックが要らない。代わりに深さがキーのビットに従う(第 15 章 §15.7)。Serum と OpenBook v2 は critbit([Serum](https://github.com/project-serum/serum-dex/blob/92992b308885f5323b3f51eb1a0c899e35c62cb3/dex/src/critbit.rs)、[OpenBook v2](https://github.com/openbook-dex/openbook-v2/blob/f3e17421e675b083b584867594bf3cf4f675d156/programs/openbook-v2/src/state/orderbook/nodes.rs))、Phoenix は red-black 木を選んだ([Phoenix](https://github.com/Ellipsis-Labs/phoenix-v1/blob/6ae54af5f07f4d0ae8430b08cbe81d10432cd34c/src/state/markets/fifo.rs))。どちらも Solana で実績がある。
 5. **side ごとに 1 ツリー。** bid と ask は「ベスト」の意味論が異なる（max vs min）。2 ツリーにすれば比較子をツリーコードに通す必要がない。
 
 slab 実装は、初めてなら 3-4 日の演習だ。1 日目はプール + フリーリスト。2 日目は critbit の insert/remove。3 日目はマッチャへの配線。4 日目はエッジケース（book 満杯、レベル満杯、all-or-nothing fill）のテスト。第 15 章がその結果の実装を歩く。

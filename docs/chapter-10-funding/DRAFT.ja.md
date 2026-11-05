@@ -92,7 +92,7 @@ load-bearing なフィールドは 3 つ。
 
 他のフィールドは機械的: 標準チェックのための discriminator、PDA のための bump、追跡可能性のための market pubkey、設定されたファンディング窓口を知りたい呼び出し側のための window_seconds、forward-compat のための 32 バイト。
 
-> **演習 §10.2.** 「0.01% per 8 hours」（Binance perp の既定）のファンディングレートを、ここで使う scaled-1e9 `current_rate_per_sec` 形式に変換せよ。算術を示せ。
+> **演習 §10.2.** 「0.01% per 8 hours」（Binance の USDⓈ-M perp の大半の既定。金利 1 日 0.03% を 8 時間ごとに払い、プレミアムがクランプ内にある間はそれがレートのすべて。[Binance FAQ](https://www.binance.com/en/support/faq/introduction-to-binance-futures-funding-rates-360033525031)）のファンディングレートを、ここで使う scaled-1e9 `current_rate_per_sec` 形式に変換せよ。算術を示せ。
 
 ---
 

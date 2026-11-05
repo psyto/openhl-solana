@@ -152,7 +152,7 @@ Three operational problems hidden in this innocent loop:
 **Race conditions.** Multiple bots see the same liquidatable position. The first one to land their tx wins; the rest pay fees for failed txes (the on-chain `Liquidate` rejects on already-closed positions). Bots compete by:
 
 - **Pre-built txes.** Build the `Liquidate` tx the moment a position drops below threshold; only fetch a fresh blockhash and sign at submission time. Saves milliseconds.
-- **Submitting through Jito or directly to leader RPCs.** Public RPC has measurable lag; specialized infra cuts it.
+- **Submitting through a bundle service or directly to leader RPCs.** Public RPC has measurable lag; specialized infra cuts it.
 - **Priority fees.** Pay extra to land first in a contested slot. The liquidator who pays the highest priority fee that still leaves them profitable wins.
 
 **Profitability.** A liquidation pays `notional × LIQUIDATION_PENALTY_BPS / 10000 = notional × 0.01` (Chapter 11's value). A liquidator needs revenue > (tx cost + RPC cost + infra cost + opportunity cost of the capital tied up running the bot). At $0.001 per Solana tx, a successful liquidation of a $1000 notional position pays $10 — comfortably profitable. A $10 notional position pays $0.10, which is below most operational thresholds — small underwater positions get less competition, may sit underwater longer, and (if collateral has already gone to zero) are net-negative to liquidate. Production designs sometimes add a per-position minimum size to avoid this.
@@ -172,7 +172,7 @@ A modern Solana liquidator architecture:
    Liquidation candidate queue (sorted by expected revenue)
               │
               ▼
-   Tx builder + submitter (Jito MEV searcher or direct leader RPC)
+   Tx builder + submitter (bundle service or direct leader RPC)
 ```
 
 Multiple competing liquidators run essentially identical stacks. Differentiation is in latency, priority-fee tuning, and the small algorithmic edges (e.g., predicting which positions will become liquidatable next oracle tick, pre-building their txes).
@@ -201,7 +201,7 @@ Three risk areas:
 - **Oracle staleness drift.** If the oracle hasn't been updated, the mark used in `compute_equity` is stale. Same fix: refresh the oracle before NAV update.
 - **Unrealized vs realized.** A vault holding open positions has unrealized PnL that depends on mark price. A vault that mostly closed positions has realized PnL sitting in cash. The keeper should compute both correctly and not double-count partial closes.
 
-This is the part where, in production, the manager often *outsources* the keeper to a service (Squads multi-sig + automated NAV scripts, or a vault-management platform like Lulo or Kamino's vault SDK). Doing it yourself requires owning the operational reliability problem — keeper outages = stale NAV = unhappy depositors.
+This is the part where, in production, the manager often *outsources* the keeper to a service (a multisig such as Squads plus automated NAV scripts, or a vault-management service). Doing it yourself requires owning the operational reliability problem — keeper outages = stale NAV = unhappy depositors.
 
 ---
 
@@ -238,7 +238,7 @@ Three architectural choices.
 
 **(1) Geyser plugin.** Geyser is Solana's validator-side streaming interface. A Geyser plugin runs inside a validator and gets every account change, transaction, and slot event in real time, sub-millisecond latency from chain commit. Pros: lowest latency, complete data. Cons: requires running your own validator (or partnering with a node operator who runs the plugin for you), operational complexity, hardware costs.
 
-Production indexers for large DEXes almost always use Geyser. Helius, Triton, and other Solana-RPC providers offer Geyser-as-a-service to avoid the validator-running burden.
+RPC providers sell these streams so you don't run the validator yourself: Triton's Dragon's Mouth is a Geyser-fed gRPC interface ([Triton](https://docs.triton.one/project-yellowstone/dragons-mouth-grpc-subscriptions)), and Helius's LaserStream speaks the same Yellowstone gRPC protocol ([Helius](https://www.helius.dev/docs/laserstream)).
 
 **(2) RPC pubsub.** Subscribe to account changes via the WebSocket-based RPC pubsub interface (`accountSubscribe`, `programSubscribe`, `logsSubscribe`). Pros: simple to set up, no infrastructure beyond a WebSocket client. Cons: latency is higher (~hundreds of ms), connections drop, some events can be missed during reconnect.
 

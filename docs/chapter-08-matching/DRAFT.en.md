@@ -167,7 +167,7 @@ Per-fill cost is `O(log N)` instead of `O(N)` when prices are spread out: for N 
 
 **Cost:** Significant implementation effort. A correct critbit + node pool + FIFO is roughly 1,500 lines of careful Rust with strong invariants (every node either lives in the tree+queue or on the free-list; every level either has ≥1 order or is gone from the tree). Audit cost is correspondingly higher. The whole thing is `bytemuck::Pod`-friendly but requires care: the tree nodes carry indices into the pool, not pointers.
 
-**When it's the right answer:** for production CLOBs with non-trivial liquidity. Phoenix and Serum both use this design for good reasons.
+**When it's the right answer:** for production CLOBs with non-trivial liquidity. Serum, OpenBook v2 and Phoenix all keep their books in a tree for this reason, though theirs key each order by (price, sequence) rather than queueing orders under a price level ([Serum](https://github.com/project-serum/serum-dex/blob/92992b308885f5323b3f51eb1a0c899e35c62cb3/dex/src/critbit.rs), [OpenBook v2](https://github.com/openbook-dex/openbook-v2/blob/f3e17421e675b083b584867594bf3cf4f675d156/programs/openbook-v2/src/state/orderbook/nodes.rs), [Phoenix](https://github.com/Ellipsis-Labs/phoenix-v1/blob/6ae54af5f07f4d0ae8430b08cbe81d10432cd34c/src/state/markets/fifo.rs)).
 
 The slab implementation lives in Chapter 15, which walks the code produced from the design spec below.
 
@@ -235,7 +235,7 @@ The pedagogical points to absorb if you do implement this:
 1. **Use indices, not pointers.** `bytemuck::Pod` doesn't allow pointer fields. Use `u16` indices into the pool and tree arrays. `u16` is enough for 65k entries — plenty for most books.
 2. **A sentinel `NONE_INDEX = u16::MAX`.** No `Option<u16>` — that would push the struct out of Pod safety. Use the sentinel.
 3. **Free-list as singly-linked stack.** Free nodes' `next` field points to the next free node. Allocation pops `free_head`; deallocation pushes to `free_head`. O(1) both ways.
-4. **Critbit, not red-black.** Critbit trees have simpler rebalancing rules and don't need rotation logic. Serum uses critbit; Phoenix uses critbit. The pattern is well-trodden.
+4. **Critbit, not red-black.** A critbit tree never rebalances, so it needs no rotation logic; the price is depth that follows the key bits (Chapter 15 §15.7). Serum and OpenBook v2 use critbit ([Serum](https://github.com/project-serum/serum-dex/blob/92992b308885f5323b3f51eb1a0c899e35c62cb3/dex/src/critbit.rs), [OpenBook v2](https://github.com/openbook-dex/openbook-v2/blob/f3e17421e675b083b584867594bf3cf4f675d156/programs/openbook-v2/src/state/orderbook/nodes.rs)); Phoenix chose a red-black tree ([Phoenix](https://github.com/Ellipsis-Labs/phoenix-v1/blob/6ae54af5f07f4d0ae8430b08cbe81d10432cd34c/src/state/markets/fifo.rs)). Both are proven on Solana.
 5. **One tree per side.** Bids and asks have different "best" semantics (max vs min). Keep two trees and you avoid threading a comparator through the tree code.
 
 Implementing slab is a 3-4 day exercise if you've never done it before. The first day is the pool + free-list. The second is critbit insert/remove. The third is wiring it into a matcher. The fourth is testing edge cases (book full, level full, all-or-nothing fills). Chapter 15 walks the resulting implementation.

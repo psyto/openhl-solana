@@ -283,7 +283,7 @@ The L1 path becomes necessary when three conditions hold *together*:
 2. Your business model depends on capturing the full transaction value rather than sharing it with the host chain's validator economy.
 3. You have the team and runway to operate a chain for years, not just deploy a program.
 
-Hyperliquid is the textbook case where all three held. For most perp-DEX projects, none of them do — and the program-on-host-chain path is dramatically cheaper to reach launch on, by orders of magnitude in calendar time, infrastructure cost, and team headcount.
+Hyperliquid, which runs its own chain, is the case usually cited for that path. For most perp-DEX projects none of the three holds, and a program on a host chain reaches launch with far less calendar time, infrastructure and headcount.
 
 This curriculum bets on the program path. Not because L1 is the wrong answer in absolute terms, but because the conditions that justify it are rare, and a project that hasn't shipped on a host chain yet hasn't earned the right to commit to a multi-year L1 build. Phase B teaches the path 99% of perp DEX projects will actually take.
 

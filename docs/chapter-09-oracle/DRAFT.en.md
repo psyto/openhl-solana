@@ -2,7 +2,7 @@
 
 > Status: draft (v0.1).
 > Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Oracle`, plus the Pyth v1 and v2 layout constants for §9.5), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_oracle`, `process_set_oracle_price`, `process_place_order_checked`, `process_place_order_checked_pyth`, `process_place_order_checked_pyth_v2`, and the `read_fresh_oracle` / `read_fresh_pyth_v1_oracle` / `read_fresh_pyth_v2_oracle` helpers), [`scripts/oracle/src/main.rs`](../../scripts/oracle/src/main.rs), [`programs/openhl-core/tests/pyth_binding.rs`](../../programs/openhl-core/tests/pyth_binding.rs) (the feed-pinning tests for §9.5).
-> Reference targets: Pyth Network mainnet program (`FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH`), Switchboard On-Demand.
+> Reference targets: Pyth Network mainnet program (`FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH`, per [pyth-client-js](https://github.com/pyth-network/pyth-client-js/blob/f37e2d94dcc3043fff4973480b86378e4e623344/src/cluster.ts)), Switchboard On-Demand.
 >
 > Since the parts split, the logic this chapter walks through lives in [`crates/oracle/src/lib.rs`](../../crates/oracle/src/lib.rs) (`openhl-oracle`); the program calls it. The code quoted below is the pre-split version from `programs/openhl-core/src/lib.rs`, and its line numbers are not kept in sync.
 
@@ -284,7 +284,7 @@ Everything downstream — sanity-band, fee escrow, book write — is identical t
 
 The "v1" in `read_fresh_pyth_v1_oracle` matters. Pyth's v1 model — publishers writing a static PriceAccount each slot, readers parsing it — is being deprecated in favor of v2's *pull-oracle* architecture. The critical insight for a perp DEX is that the v2 architecture splits cleanly across two layers:
 
-1. **Pyth's `pyth-solana-receiver` program** does the cryptographic work. It accepts a Pyth update message wrapped in a Wormhole VAA (Verified Action Approval — a payload signed by 2/3+ of Wormhole's guardian set), verifies the guardian signatures using Solana's secp256k1 precompile, checks any Merkle proofs in the bundled update, and writes the verified price into a `PriceUpdateV2` account.
+1. **Pyth's `pyth-solana-receiver` program** does the cryptographic work. It accepts a Pyth update message with a Wormhole VAA (Verified Action Approval: a message signed by two-thirds of Wormhole's guardians, 13 of 19 on a full guardian set; [Wormhole docs](https://wormhole.com/docs/protocol/infrastructure/vaas/)), checks the guardian signatures (with the `secp256k1_recover` syscall in `post_update_atomic`, or by taking a VAA account Wormhole's core bridge has already verified in `post_update`), checks the Merkle proof of the price against the VAA's root, and writes the price into a `PriceUpdateV2` account, recording `VerificationLevel::Full` only when the signatures reached quorum ([receiver](https://github.com/pyth-network/pyth-crosschain/blob/ec40e5f1705a3f6c7818b0f2f1e96a4ac75a7454/target_chains/solana/programs/pyth-solana-receiver/src/lib.rs)).
 2. **The consumer** (you, the perp DEX) reads that `PriceUpdateV2` account. No VAA verification. No guardian-set management. No cryptography on your hot path.
 
 If you confused those two layers (and an earlier draft of this section did), you'd conclude that v2 needs ~2000 lines of cryptographic code on your side. It doesn't. The Wormhole work lives in Pyth's program, which is shared infrastructure; what you ship on the perp DEX is structurally the same as the v1 reader, just against a different account layout.
@@ -362,7 +362,7 @@ Now that the consumer side ships, what's left is **running your own Wormhole-sty
 
 ### The Switchboard fallback
 
-A single oracle is a single point of failure. Pyth has been down. Switchboard has been down. Both at the same time has happened (rarely). Programs that protect downside trust *both* and refuse to operate when neither is fresh. The wiring is mechanical:
+A single oracle is a single point of failure: if its feed stops updating, the staleness check refuses every call, and if it reports a wrong price, nothing in the program notices. Programs that protect downside trust *both* and refuse to operate when neither is fresh. The wiring is mechanical:
 
 1. The transaction's `AccountMeta` array includes both oracle accounts.
 2. The handler reads each, doing the full validation pattern (discriminator/magic + status + price-positive + staleness).

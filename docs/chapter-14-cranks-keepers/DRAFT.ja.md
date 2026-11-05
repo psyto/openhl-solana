@@ -152,7 +152,7 @@ def liquidator_loop():
 **競合条件。** 複数の bot が同じ清算可能ポジションを見る。最初に tx をランディングした 1 つが勝つ。残りは失敗 tx の手数料を払う（オンチェーン `Liquidate` はすでにクローズされたポジションを拒否する）。Bot が競う方法:
 
 - **事前構築 tx。** ポジションが閾値を割った瞬間に `Liquidate` tx を構築する。提出時に新鮮な blockhash と署名だけを取る。ミリ秒節約。
-- **Jito 経由か直接リーダー RPC への提出。** Public RPC には計測可能な遅延がある。専門インフラがそれを削る。
+- **バンドルのサービス経由か直接リーダー RPC への提出。** Public RPC には計測可能な遅延がある。専門インフラがそれを削る。
 - **Priority fee。** 競合 slot で最初にランドするため追加で支払う。利益を残したまま最高 priority fee を払う清算者が勝つ。
 
 **収益性。** 清算は `notional × LIQUIDATION_PENALTY_BPS / 10000 = notional × 0.01`（第 11 章の値）を支払う。清算者は収益 > (tx コスト + RPC コスト + インフラ コスト + bot 運営に縛られる資本の機会コスト) を必要とする。$0.001 / Solana tx で、$1000 notional ポジションの清算成功は $10 を支払う — 楽に収益性。$10 notional ポジションは $0.10 を支払い、ほとんどの運用閾値以下 — 小さな水没ポジションは競争が少なくなり、水没のままより長く座り、（担保がすでにゼロなら）清算するのは正味マイナスだ。本番設計は時にこれを避けるためポジションあたり最小サイズを加える。
@@ -172,7 +172,7 @@ def liquidator_loop():
    清算候補キュー (期待収益でソート)
               │
               ▼
-   Tx ビルダ + 提出者 (Jito MEV searcher か直接リーダー RPC)
+   Tx ビルダ + 提出者 (バンドルのサービスか直接リーダー RPC)
 ```
 
 複数の競合清算者が本質的に同一のスタックを走らせる。差別化はレイテンシ、priority fee チューニング、小さなアルゴリズム的優位性（例: 次のオラクル tick でどのポジションが清算可能になるかを予測し、それらの tx を事前構築する）にある。
@@ -201,7 +201,7 @@ def liquidator_loop():
 - **オラクル staleness ドリフト。** オラクルが更新されていないなら、`compute_equity` で使うマークが古い。同じ修正: NAV 更新前にオラクルを refresh する。
 - **未実現 vs 実現。** オープン ポジションを持つ vault には未実現 PnL があり、マーク価格に依存する。大部分をクローズした vault には現金に座る実現 PnL がある。Keeper は両方を正しく計算し、部分クローズを二重カウントしてはならない。
 
-ここが本番でしばしばマネージャが keeper を**外注**する部分（Squads マルチシグ + 自動 NAV スクリプト、あるいは Lulo や Kamino の vault SDK のような vault 管理プラットフォーム）。自分でやるには運用信頼性問題を所有することが必要だ — keeper 停止 = 古い NAV = 不幸な預金者。
+ここが本番でしばしばマネージャが keeper を**外注**する部分（Squads のようなマルチシグ + 自動 NAV スクリプト、あるいは vault 管理のサービス）。自分でやるには運用信頼性問題を所有することが必要だ — keeper 停止 = 古い NAV = 不幸な預金者。
 
 ---
 
@@ -238,7 +238,7 @@ def claim_loop():
 
 **(1) Geyser プラグイン。** Geyser は Solana のバリデータ側ストリーミング インターフェース。Geyser プラグインはバリデータ内部で走り、すべてのアカウント変更、トランザクション、slot イベントをリアルタイム、チェーン commit から sub-millisecond レイテンシで受け取る。利点: 最低レイテンシ、完全なデータ。欠点: 自前バリデータを走らせる必要（あるいはプラグインを走らせるノード オペレータと提携する）、運用の複雑さ、ハードウェア コスト。
 
-大型 DEX の本番 indexer はほぼ常に Geyser を使う。Helius、Triton、その他 Solana-RPC プロバイダがバリデータ運用負担を避けるため Geyser-as-a-service を提供している。
+バリデータを自分で動かさずに済むよう、RPC プロバイダがこのストリームを売っている。Triton の Dragon's Mouth は Geyser から流す gRPC([Triton](https://docs.triton.one/project-yellowstone/dragons-mouth-grpc-subscriptions))、Helius の LaserStream は同じ Yellowstone gRPC のプロトコルを話す([Helius](https://www.helius.dev/docs/laserstream))。
 
 **(2) RPC pubsub。** WebSocket ベース RPC pubsub インターフェース（`accountSubscribe`、`programSubscribe`、`logsSubscribe`）でアカウント変更を購読する。利点: セットアップ簡単、WebSocket クライアント以外のインフラ不要。欠点: レイテンシが高い（数百 ms）、接続が落ちる、再接続中に一部のイベントが取り逃される可能性がある。
 
