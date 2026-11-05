@@ -26,7 +26,7 @@ Solana 上の標準的な答えは **Pyth Network**（よく副として **Switc
 
 ## §9.1  形だけの Pyth、要約
 
-本物の Pyth v1 価格アカウントは約 3 KiB の構造体で、小さなヘッダ（magic + version + type + size）、製品紐付け、最近の価格観測の配列を含む。実際に必要なフィールドは 24 バイトに収まる。
+本物の Pyth v1 価格アカウントは約 3 KiB の構造体で([pyth-sdk-solana](https://github.com/pyth-network/pyth-sdk-rs/blob/4b309c9b6bf5229723470bee1c3ab581482c4421/pyth-sdk-solana/src/state.rs) の `GenericPriceAccount<32, ()>`)、小さなヘッダ（magic + version + type + size）、製品紐付け、最近の価格観測の配列を含む。実際に必要なフィールドは 24 バイトに収まる。
 
 ```text
 price:        i64    // 符号付きマンティッサ
@@ -152,7 +152,7 @@ fn read_fresh_oracle(
 価格を信用する前に 4 つのチェック。
 
 1. **Discriminator チェック**（`oracle.discriminator != ORACLE_DISCRIMINATOR`）: 初期化されていないオラクルアカウントを拒否する。本物の Pyth では magic 定数 + version 一致がこれにあたる。
-2. **価格正値チェック**（`oracle.price <= 0`）: 非正価格のオラクル状態を拒否する。本物の Pyth は時折 `0` を「今は良い価格がない」シグナルとして publish する — 読み手はそれを扱わねばならない。
+2. **価格正値チェック**（`oracle.price <= 0`）: 非正価格のオラクル状態を拒否する。Pyth の価格は符号つきの `i64` なので、0 と負の値はリーダーが自分で拒否する。
 3. **Staleness チェック**（`age > MAX_ORACLE_STALENESS_SLOTS`）: 25 slot（約 10 秒）より古い価格を拒否する。これが本章の中心だ。鮮度をチェックできない価格は信用できない価格だ — publisher を止められる攻撃者（あるいは単にネットワーク障害を利用する者）が、それを盲信するプログラムを古い価格でゲームできるからだ。
 4. **所有者チェック**（1969 行、`oracle_ai.owner != program_id`）: 異なるプログラム由来のアカウントを拒否する。本物の Pyth では `oracle_ai.owner == &pyth_program::ID`。
 
@@ -160,7 +160,7 @@ fn read_fresh_oracle(
 
 `read_fresh_oracle` 内の借用は自然にヘルパ本体にスコープされる — 関数が返ったときにドロップし、呼び出し側が book を変更する前に解放される。これが重要なのは、オラクルと book の両方が `AccountInfo` として渡され、ランタイムは同じアカウントメモリの 2 つの可変借用が共存しないことを要求するからだ。本書のオラクルと book は別アカウントだとしても、借用をタイトにスコープするパターンは良い衛生だ — ハンドラが大きくなったときの微妙な aliasing バグを防ぐ。
 
-**SDK が隠していること:** `pyth-sdk-solana::load_price_feed_from_account_info` は discriminator チェック、所有者チェック、型付き `PriceFeed` へのデシリアライズを行う。staleness チェックは**行わない** — それは常にあなたの仕事だ。明示的な staleness ゲートなしに Pyth を使うプログラムは、DeFi における最大のオラクルバグ群の 1 つに属して出荷される。
+**SDK が隠していること:** `pyth-sdk-solana::load_price_feed_from_account_info` は magic・version・アカウント種別を確かめ、型付き `PriceFeed` へデシリアライズする。アカウントの所有者と価格の古さは確かめない。どちらもあなたの仕事だ([pyth-sdk-solana](https://github.com/pyth-network/pyth-sdk-rs/blob/4b309c9b6bf5229723470bee1c3ab581482c4421/pyth-sdk-solana/src/lib.rs))。
 
 > **演習 §9.3.** スロット N でオラクル価格を設定せよ（`oracle --set --price 100 ...` を実行し、出力からスロットを控える）。30 slot 待つ（約 12 秒、`solana confirm` を適当な tx に当てればスロットがわかる）。フラグなしで `oracle` を実行する。`age (slots)` が 25 を超えるはずだ。`place-order-checked` を実行する（配線しているとして）— `oracle stale` で失敗するはずだ。
 
@@ -225,7 +225,7 @@ offset | size | field                       | チェックする内容
  232   |  8   | agg.pub_slot (u64)          | clock.slot - pub_slot <= MAX_ORACLE_STALENESS_SLOTS
 ```
 
-（`agg` はそのスロットでのパブリッシャネットワークの集約価格。Pyth は最大 32 パブリッシャを持ち、オンチェーン集約は毎スロット走る; `agg.status` がそれらが同意したかを反映する。）
+（`agg` はそのスロットでのパブリッシャネットワークの集約価格。v1 の価格アカウントは最大 32 個のパブリッシャの値を持つ([pyth-sdk-solana](https://github.com/pyth-network/pyth-sdk-rs/blob/4b309c9b6bf5229723470bee1c3ab581482c4421/pyth-sdk-solana/src/state.rs));`agg.status` が集約値を使えるかを示す。）
 
 オフセットは `crates/state/src/lib.rs` から `PYTH_V1_OFFSET_*` 定数としてエクスポートされる。完全な ~3 KiB の `PriceAccount` を Pod 構造体としてミラーするのは意図的に避ける — バイトの大半は本書が読まない publisher ごとの `comp[]` エントリだ。6 オフセットをハードコードするのはコードバイトが少なく、監査しやすく、本章の「バイトレイアウトが**契約**」のスタンスに一致する。
 
@@ -263,11 +263,11 @@ fn read_fresh_pyth_v1_oracle(oracle_ai: &AccountInfo) -> Result<u64, ProgramErro
 
 フラグすべき設計判断 4 つ:
 
-**1. リーダーはバイトを確かめ、ハンドラはどのアカウントかを確かめる。** モックパスは `oracle_ai.owner == program_id` を要求するが、ここのリーダーには所有者の検査がない。この章の最初の版は、検査は要らないと書いていた。「magic+version+atype ガントレットがすでにアカウントが Pyth v1 PriceAccount であることを構造的に保証する」からだ、と。保証しない。誰でも自分が所有するアカウントを作り、magic、version、account type、Trading の status、好きな価格を書き込んで渡せる。`programs/openhl-core/tests/pyth_binding.rs` のテスト `pyth_v1_reads_only_the_pinned_price_account` はまさにそれをやり、呼び出し側が選んだ価格に対して注文が通った。Pyth プログラム ID をハードコードすると mainnet 対 devnet の選択を最初から強いる(mainnet は `FsJ3...epH`、devnet は `gSbE...92s`)ので、代わりに市場が両方を保存する。市場の authority が `SetPythFeeds`(タグ 34)で設定する、期待する Pyth アカウントの**pubkey**(`Market.pyth_v1_price_account`)と、それを所有しなければならないプログラム(`Market.pyth_v1_program`)だ。`PlaceOrderCheckedPyth` は呼び出しのたびに両方を確かめ、何も固定されていない間は無条件に拒否する。アドレスだけでは足りない。そのアドレスのアカウントが閉じられ、別の誰かに作り直されることがありうる。テストの `recreated` の場合が、所有者の検査がそれを拒否するのを示す。アドレスを固定すれば、資産を取り違える問題も片づく。別の組の本物のフィードは別のアドレスだからだ。それでもプログラムが信じているのは authority の設定だ。間違ったアカウントと所有者を固定すれば、それを読む。
+**1. リーダーはバイトを確かめ、ハンドラはどのアカウントかを確かめる。** モックパスは `oracle_ai.owner == program_id` を要求するが、ここのリーダーには所有者の検査がない。この章の最初の版は、検査は要らないと書いていた。「magic+version+atype ガントレットがすでにアカウントが Pyth v1 PriceAccount であることを構造的に保証する」からだ、と。保証しない。誰でも自分が所有するアカウントを作り、magic、version、account type、Trading の status、好きな価格を書き込んで渡せる。`programs/openhl-core/tests/pyth_binding.rs` のテスト `pyth_v1_reads_only_the_pinned_price_account` はまさにそれをやり、呼び出し側が選んだ価格に対して注文が通った。Pyth プログラム ID をハードコードすると mainnet 対 devnet の選択を最初から強いる(mainnet は `FsJ3...epH`、devnet は `gSbE...92s`。[pyth-client-js](https://github.com/pyth-network/pyth-client-js/blob/f37e2d94dcc3043fff4973480b86378e4e623344/src/cluster.ts) による)ので、代わりに市場が両方を保存する。市場の authority が `SetPythFeeds`(タグ 34)で設定する、期待する Pyth アカウントの**pubkey**(`Market.pyth_v1_price_account`)と、それを所有しなければならないプログラム(`Market.pyth_v1_program`)だ。`PlaceOrderCheckedPyth` は呼び出しのたびに両方を確かめ、何も固定されていない間は無条件に拒否する。アドレスだけでは足りない。そのアドレスのアカウントが閉じられ、別の誰かに作り直されることがありうる。テストの `recreated` の場合が、所有者の検査がそれを拒否するのを示す。アドレスを固定すれば、資産を取り違える問題も片づく。別の組の本物のフィードは別のアドレスだからだ。それでもプログラムが信じているのは authority の設定だ。間違ったアカウントと所有者を固定すれば、それを読む。
 
 **2. `expo` は読みログするが適用しない。** Pyth 価格は `(mantissa, expo)` ペアで来る — 本物の価格は `mantissa × 10^expo`。USD ペアでは `expo` は典型的に `-8`。モック側に expo はない（本書 `Oracle.price` は market が使うスケールでの u64）ので、本章で 2 パスを相互運用可能に保つため、mantissa を価格として扱い `expo` を観測性のためにログする。本番デプロイは正規化する: 単一サポート `expo` を固定し他を拒否するか、その場でプログラムの固定小数点規約に翻訳するか。これがマイグレーションで本物のバグを書く可能性が最も高い場所; 本章はそれを呼び出して TODO を自分で置けるようにする。
 
-**3. status == Trading でも `price <= 0` は拒否する。** Pyth は時々 0 を publish する — 集約が非負だが degenerate な publisher ネットワークのコーナーケース。モックパスも同じく拒否する; Pyth パスも合わせる。
+**3. status == Trading でも `price <= 0` は拒否する。** 価格のフィールドは符号つきで、0 も負の値と同じく使える価格ではない。モックパスも同じく拒否する; Pyth パスも合わせる。
 
 **4. `agg.status != Trading` はハード拒否、フォールバックではない。** Switchboard フォールバック付きの本物の本番リーダーは、ここでエラーを返さずに他のオラクルを試すだろう。本章はフォールバックを出荷しない、教材例が v1 単一オラクルマイグレーションだからだ; フォールバックパターン（try-A-then-B 不一致許容付き）は上に乗せるのは簡単 — §9.5 の closing ノートが配置する。
 
@@ -289,7 +289,7 @@ fn read_fresh_pyth_v1_oracle(oracle_ai: &AccountInfo) -> Result<u64, ProgramErro
 
 その 2 層を混同したら（本セクションの初期ドラフトはした）、v2 はあなたの側に ~2000 行の暗号コードが必要だと結論するだろう。そうではない。Wormhole 作業は Pyth のプログラムに住み、それは共有インフラだ; perp DEX で出荷するのは構造的に v1 リーダーと同じ、ただし異なるアカウント レイアウトに対するもの。
 
-`PlaceOrderCheckedPythV2`（タグ 33）がコンシューマ側を出荷する。リーダーの前に、ハンドラが 2 つの検査をする。リーダーにはできない検査だ。アカウントは市場が固定した receiver プログラムが所有していなければならず(`Market.pyth_v2_receiver`。その ID はクラスタごとに違うので、定数ではなくデータにする)、その `feed_id` は `Market.pyth_v2_feed_id` と等しくなければならない。1 つ目がなければ、誰でも自分のプログラムから、discriminator まで含めて `PriceUpdateV2` の形のアカウントを書ける。2 つ目がなければ、別の資産の本物の更新が通る。ハンドラはさらに、更新が完全に検証されていること(`VerificationLevel::Full`)を求める。Partial の更新は Wormhole の定足数より少ない guardian の署名で確かめられたもので、Pyth 自身の SDK も価格としては拒否する。`pyth_v2_reads_only_the_pinned_receiver_and_feed` は 3 つすべてを試し、署名 0 と 13 の Partial の更新も含む。リーダー:
+`PlaceOrderCheckedPythV2`（タグ 33）がコンシューマ側を出荷する。リーダーの前に、ハンドラが 2 つの検査をする。リーダーにはできない検査だ。アカウントは市場が固定した receiver プログラムが所有していなければならず(`Market.pyth_v2_receiver`。その ID はクラスタごとに違うので、定数ではなくデータにする)、その `feed_id` は `Market.pyth_v2_feed_id` と等しくなければならない。1 つ目がなければ、誰でも自分のプログラムから、discriminator まで含めて `PriceUpdateV2` の形のアカウントを書ける。2 つ目がなければ、別の資産の本物の更新が通る。ハンドラはさらに、更新が完全に検証されていること(`VerificationLevel::Full`)を求める。Partial の更新は Wormhole の定足数より少ない guardian の署名で確かめられたもので、Pyth 自身の SDK も `get_price_no_older_than` で拒否する([price_update.rs](https://github.com/pyth-network/pyth-crosschain/blob/ec40e5f1705a3f6c7818b0f2f1e96a4ac75a7454/target_chains/solana/pyth_solana_receiver_sdk/src/price_update.rs))。`pyth_v2_reads_only_the_pinned_receiver_and_feed` は 3 つすべてを試し、署名 0 と 13 の Partial の更新も含む。リーダー:
 
 ```rust
 fn read_fresh_pyth_v2_oracle(oracle_ai: &AccountInfo) -> Result<u64, ProgramError> {
@@ -343,16 +343,16 @@ offset | size | field                            | 何に使うか
 
 ### 2 命令 トランザクション パターン
 
-v2 リーダーが前提とするアーキテクチャの一片: トレード命令が走るとき `PriceUpdateV2` アカウントが*fresh*でなければならない。実際にはコンシューマ トランザクションは receiver の `post_update_v2` 命令を最初の命令として、トレード命令を 2 番目として含めることでこれを行う:
+v2 リーダーが前提とするアーキテクチャの一片: トレード命令が走るとき `PriceUpdateV2` アカウントが*fresh*でなければならない。実際にはコンシューマ トランザクションは receiver の `post_update_atomic` 命令(Wormhole の core bridge が VAA を検証してアカウントに置いた後なら `post_update`)を最初の命令として、トレード命令を 2 番目として含めることでこれを行う:
 
 ```text
 tx = [
-  pyth-solana-receiver::post_update_v2(vaa_data, update_data, …),  // VAA 検証、アカウント書き込み
+  pyth-solana-receiver::post_update_atomic(vaa, merkle_price_update, …),  // 署名と proof を確かめ、アカウントに書く
   openhl::place_order_checked_pyth_v2(side, price, size),          // 今書かれたアカウントを読む
 ]
 ```
 
-`post_update_v2` は per-(feed_id, write_authority) `PriceUpdateV2` PDA を書き、`place_order_checked_pyth_v2` がそれを読む。クライアントは Pyth の price-update service（パブリッシャ署名を VAA に集約する HTTP エンドポイント）から最新 VAA を fetch し、最初の命令にバンドルし、staleness ガントレットがすべてを同期させる。本書のハンドラから receiver へのオンチェーン CPI はない: アカウント経由で通信し、直接ではない。
+`post_update_atomic` はクライアントが渡すアカウントに `PriceUpdateV2` を書き(PDA ではない。初回に作られ、その `write_authority` だけが上書きできる keypair のアカウント。[receiver](https://github.com/pyth-network/pyth-crosschain/blob/ec40e5f1705a3f6c7818b0f2f1e96a4ac75a7454/target_chains/solana/programs/pyth-solana-receiver/src/lib.rs))、`place_order_checked_pyth_v2` がそれを読む。クライアントは guardian 署名つきの VAA と価格の Merkle proof を Pyth の価格サービス Hermes([Hermes](https://github.com/pyth-network/pyth-crosschain/tree/ec40e5f1705a3f6c7818b0f2f1e96a4ac75a7454/apps/hermes))から取り、最初の命令にバンドルし、staleness ガントレットがすべてを同期させる。本書のハンドラから receiver へのオンチェーン CPI はない: アカウント経由で通信し、直接ではない。
 
 これはまた、本書の v2 ハンドラが「post」命令や Wormhole アカウントを取らない理由でもある: コンシューマ トランザクションが配線、プログラムは単に読む。
 
@@ -368,7 +368,7 @@ tx = [
 2. ハンドラがそれぞれを読み、完全な検証パターン（discriminator/magic + status + 価格正値 + staleness）を行う。
 3. どちらかが通れば使う。両方失敗なら呼び出し拒否。
 
-これを行うプログラムは典型的に、両方が fresh のときは 2 つを**比較**もする — ある許容（例: 50 bp）を超えて不一致なら呼び出し拒否。Pyth と Switchboard の 50 bp 不一致は通常どちらかが誤っており、ユーザに安い方を選ぶだけのプログラムはゲームされてきた。
+これを行うプログラムは典型的に、両方が fresh のときは 2 つを**比較**もする — ある許容（例: 50 bp）を超えて不一致なら呼び出し拒否。大きな不一致はどちらかが誤っていることを意味しうる。ユーザに安い方を選ぶだけのプログラムはゲームされる余地を作る。
 
 > **演習 §9.5.** 本物の Pyth v1 mainnet PriceAccount を選べ（SOL/USD は執筆時点で `H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG` — Pyth の price-feed-ids ページで検証せよ）。ローカル validator の `clone` 機能を使ってそのアカウントをテストクラスタにミラーし、市場の authority の署名で `SetPythFeeds` によりそれを市場に固定してから、それに対して `PlaceOrderCheckedPyth` を invoke せよ。次に、設計判断 1 が述べる攻撃を試せ。アカウントのバイトを自分が所有するアカウントに写して、そちらを渡す。`oracle is not the market's pinned Pyth v1 feed` で失敗するはずだ。ログされた `expo` を SOL/USD product と比較せよ（`-8` のはず）。Staleness ガントレットをアカウントの古いスロットをアーカイブから再生して確認せよ。
 

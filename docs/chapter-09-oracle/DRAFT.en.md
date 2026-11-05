@@ -26,7 +26,7 @@ For the worked example, we build our own `Oracle` account type that mirrors the 
 
 ## §9.1  Pyth in shape, in summary
 
-A real Pyth v1 price account is a ~3 KiB struct that includes a small header (magic + version + type + size), product association, and an array of recent price observations. The fields we actually need fit in 24 bytes:
+A real Pyth v1 price account is a ~3 KiB struct (`GenericPriceAccount<32, ()>` in [pyth-sdk-solana](https://github.com/pyth-network/pyth-sdk-rs/blob/4b309c9b6bf5229723470bee1c3ab581482c4421/pyth-sdk-solana/src/state.rs)) that includes a small header (magic + version + type + size), product association, and an array of recent price observations. The fields we actually need fit in 24 bytes:
 
 ```text
 price:        i64    // signed mantissa
@@ -152,7 +152,7 @@ fn read_fresh_oracle(
 Four checks before the price is trusted:
 
 1. **Discriminator check** (`oracle.discriminator != ORACLE_DISCRIMINATOR`): refuses an oracle account that isn't initialized. In real Pyth this is the magic constant + version match.
-2. **Price-positivity check** (`oracle.price <= 0`): refuses oracle states with non-positive prices. Real Pyth occasionally publishes `0` to signal "no good price right now" — your reader must handle that.
+2. **Price-positivity check** (`oracle.price <= 0`): refuses oracle states with non-positive prices. Pyth's price is a signed `i64`, so a reader has to refuse zero and negative values itself.
 3. **Staleness check** (`age > MAX_ORACLE_STALENESS_SLOTS`): refuses prices older than 25 slots (~10 sec). This is the heart of the chapter. A price you cannot freshness-check is a price you cannot trust — because an attacker who can pause the publisher (or just exploit a network outage) can use a stale price to game any program that trusts it blindly.
 4. **Owner check** (line 1969, `oracle_ai.owner != program_id`): refuses an account from a different program. In real Pyth this is `oracle_ai.owner == &pyth_program::ID`.
 
@@ -160,7 +160,7 @@ Four checks before the price is trusted:
 
 The borrow inside `read_fresh_oracle` is naturally scoped to the helper's body — it drops when the function returns, before the caller mutates the book. This matters because both the oracle and the book are passed as `AccountInfo`, and the runtime requires that no two mutable borrows of the same underlying account memory coexist. Even though our oracle and book are different accounts, the pattern of scoping borrows tightly is good hygiene — it prevents subtle aliasing bugs when handlers grow.
 
-**What the SDK hides:** `pyth-sdk-solana::load_price_feed_from_account_info` does the discriminator check, the owner check, and a deserialization into a typed `PriceFeed`. It does *not* do the staleness check — that is always your job. Programs that use Pyth without an explicit staleness gate ship with one of the largest classes of oracle bugs in DeFi.
+**What the SDK hides:** `pyth-sdk-solana::load_price_feed_from_account_info` checks the magic, version and account type and deserializes into a typed `PriceFeed`. It does *not* check the account's owner or the price's age; both are your job ([pyth-sdk-solana](https://github.com/pyth-network/pyth-sdk-rs/blob/4b309c9b6bf5229723470bee1c3ab581482c4421/pyth-sdk-solana/src/lib.rs)).
 
 > **Exercise §9.3.** Set the oracle price at slot N (run `oracle --set --price 100 ...` and note the slot from the output). Wait 30 slots (about 12 seconds; just count slots in `solana confirm` against any tx). Now run `oracle` with no flags. The reported `age (slots)` should exceed 25. Run `place-order-checked` (assuming you wire one) — it should fail with `oracle stale`.
 
@@ -225,7 +225,7 @@ offset | size | field                       | what we check
  232   |  8   | agg.pub_slot (u64)          | clock.slot - pub_slot <= MAX_ORACLE_STALENESS_SLOTS
 ```
 
-(`agg` is the publisher network's aggregated price for the slot. Pyth has up to 32 publishers; the on-chain aggregation runs every slot and `agg.status` reflects whether they agreed.)
+(`agg` is the publisher network's aggregated price for the slot. A v1 price account holds up to 32 publisher components ([pyth-sdk-solana](https://github.com/pyth-network/pyth-sdk-rs/blob/4b309c9b6bf5229723470bee1c3ab581482c4421/pyth-sdk-solana/src/state.rs)); `agg.status` says whether the aggregate is usable.)
 
 Offsets are exported as `PYTH_V1_OFFSET_*` constants from `crates/state/src/lib.rs`. We deliberately don't mirror the full ~3 KiB `PriceAccount` as a Pod struct — the bulk of the bytes are per-publisher `comp[]` entries we don't read. Hardcoding the six offsets is fewer bytes of code, easier to audit, and matches the chapter's "the byte layout *is* the contract" stance.
 
@@ -263,11 +263,11 @@ The check order mirrors the mock path: structural validation first (magic / vers
 
 Four design decisions worth flagging:
 
-**1. The reader checks bytes; the handler checks which account.** The mock path requires `oracle_ai.owner == program_id`; the reader here has no owner check, and the first version of this chapter said it did not need one, because "the magic+version+atype gauntlet already structurally guarantees the account is a Pyth v1 PriceAccount." It does not. Anyone can create an account they own, write the magic, version, account type, a Trading status and any price they like into it, and pass it in; the test `pyth_v1_reads_only_the_pinned_price_account` in `programs/openhl-core/tests/pyth_binding.rs` did exactly that, and the order went through against a price the caller chose. Hardcoding the Pyth program ID would force a mainnet-vs-devnet choice up front (`FsJ3...epH` for mainnet, `gSbE...92s` for devnet), so the market stores both instead, set by the market authority with `SetPythFeeds` (tag 34): the expected Pyth account *pubkey* (`Market.pyth_v1_price_account`) and the program that must own it (`Market.pyth_v1_program`). `PlaceOrderCheckedPyth` checks both on every call, and refuses outright while nothing is pinned. The address alone is not enough: an account at that address could be closed and recreated by someone else, and the test's `recreated` case shows the owner check refusing it. Pinning the address also settles the wrong-asset question, since a genuine feed for another pair is a different address. What the program still trusts is the authority's configuration: pin the wrong account and owner, and it will read them.
+**1. The reader checks bytes; the handler checks which account.** The mock path requires `oracle_ai.owner == program_id`; the reader here has no owner check, and the first version of this chapter said it did not need one, because "the magic+version+atype gauntlet already structurally guarantees the account is a Pyth v1 PriceAccount." It does not. Anyone can create an account they own, write the magic, version, account type, a Trading status and any price they like into it, and pass it in; the test `pyth_v1_reads_only_the_pinned_price_account` in `programs/openhl-core/tests/pyth_binding.rs` did exactly that, and the order went through against a price the caller chose. Hardcoding the Pyth program ID would force a mainnet-vs-devnet choice up front (`FsJ3...epH` for mainnet, `gSbE...92s` for devnet, per [pyth-client-js](https://github.com/pyth-network/pyth-client-js/blob/f37e2d94dcc3043fff4973480b86378e4e623344/src/cluster.ts)), so the market stores both instead, set by the market authority with `SetPythFeeds` (tag 34): the expected Pyth account *pubkey* (`Market.pyth_v1_price_account`) and the program that must own it (`Market.pyth_v1_program`). `PlaceOrderCheckedPyth` checks both on every call, and refuses outright while nothing is pinned. The address alone is not enough: an account at that address could be closed and recreated by someone else, and the test's `recreated` case shows the owner check refusing it. Pinning the address also settles the wrong-asset question, since a genuine feed for another pair is a different address. What the program still trusts is the authority's configuration: pin the wrong account and owner, and it will read them.
 
 **2. `expo` is read and logged, not applied.** Pyth prices come as `(mantissa, expo)` pairs — the real price is `mantissa × 10^expo`. For USD pairs `expo` is typically `-8`. The mock side has no expo (our `Oracle.price` is a u64 in whatever scale the market uses), so to keep the two paths interoperable in our chapter we treat the mantissa as the price and log `expo` for observability. A production deployment would normalize: either pin a single supported `expo` and reject anything else, or translate the price into the program's fixed-point convention on the fly. This is the most likely place to write a real bug in the migration; the chapter calls it out so you can put a TODO there yourself.
 
-**3. We refuse `price <= 0` even when status == Trading.** Pyth occasionally publishes zero — a publisher-network corner case where the aggregate is non-negative but degenerate. The mock path refuses the same; the Pyth path matches.
+**3. We refuse `price <= 0` even when status == Trading.** The price field is signed, and zero is no more a usable price than a negative one. The mock path refuses the same; the Pyth path matches.
 
 **4. `agg.status != Trading` is a hard refusal, not a fallback.** A real production reader with a Switchboard fallback would try the other oracle here rather than returning an error. We don't ship the fallback because the *worked example* is the v1 single-oracle migration; the fallback pattern (try-A-then-B with disagreement tolerance) is straightforward to add on top — the §9.5 closing notes lay it out.
 
@@ -289,7 +289,7 @@ The "v1" in `read_fresh_pyth_v1_oracle` matters. Pyth's v1 model — publishers 
 
 If you confused those two layers (and an earlier draft of this section did), you'd conclude that v2 needs ~2000 lines of cryptographic code on your side. It doesn't. The Wormhole work lives in Pyth's program, which is shared infrastructure; what you ship on the perp DEX is structurally the same as the v1 reader, just against a different account layout.
 
-`PlaceOrderCheckedPythV2` (tag 33) ships the consumer side. Two checks come before the reader, in the handler, because the reader cannot make them: the account must be owned by the receiver program the market pinned (`Market.pyth_v2_receiver`; its ID differs between clusters, so it is data, not a constant), and its `feed_id` must equal `Market.pyth_v2_feed_id`. Without the first, anyone can write a `PriceUpdateV2`-shaped account, discriminator and all, from their own program; without the second, a genuine update for another asset passes. The handler also requires the update to be fully verified (`VerificationLevel::Full`): a Partial update was checked against fewer guardian signatures than Wormhole's quorum, and Pyth's own SDK refuses one for prices. `pyth_v2_reads_only_the_pinned_receiver_and_feed` tries all three, including Partial updates with 0 and 13 signatures. The reader:
+`PlaceOrderCheckedPythV2` (tag 33) ships the consumer side. Two checks come before the reader, in the handler, because the reader cannot make them: the account must be owned by the receiver program the market pinned (`Market.pyth_v2_receiver`; its ID differs between clusters, so it is data, not a constant), and its `feed_id` must equal `Market.pyth_v2_feed_id`. Without the first, anyone can write a `PriceUpdateV2`-shaped account, discriminator and all, from their own program; without the second, a genuine update for another asset passes. The handler also requires the update to be fully verified (`VerificationLevel::Full`): a Partial update was checked against fewer guardian signatures than Wormhole's quorum, and Pyth's own SDK refuses one in `get_price_no_older_than` ([price_update.rs](https://github.com/pyth-network/pyth-crosschain/blob/ec40e5f1705a3f6c7818b0f2f1e96a4ac75a7454/target_chains/solana/pyth_solana_receiver_sdk/src/price_update.rs)). `pyth_v2_reads_only_the_pinned_receiver_and_feed` tries all three, including Partial updates with 0 and 13 signatures. The reader:
 
 ```rust
 fn read_fresh_pyth_v2_oracle(oracle_ai: &AccountInfo) -> Result<u64, ProgramError> {
@@ -343,16 +343,16 @@ The offsets are exported as `PYTH_V2_OFFSET_*` from `crates/state/src/lib.rs`. T
 
 ### The two-instruction transaction pattern
 
-There's one piece of architecture the v2 reader assumes: the `PriceUpdateV2` account has to be *fresh* when the trade instruction runs. In practice the consumer transaction does this by including the receiver's `post_update_v2` instruction as the first instruction, and the trade instruction as the second:
+There's one piece of architecture the v2 reader assumes: the `PriceUpdateV2` account has to be *fresh* when the trade instruction runs. In practice the consumer transaction does this by including the receiver's `post_update_atomic` instruction as the first instruction (or `post_update`, once Wormhole's core bridge has verified the VAA into an account), and the trade instruction as the second:
 
 ```text
 tx = [
-  pyth-solana-receiver::post_update_v2(vaa_data, update_data, …),  // verifies VAA, writes account
+  pyth-solana-receiver::post_update_atomic(vaa, merkle_price_update, …),  // checks signatures + proof, writes account
   openhl::place_order_checked_pyth_v2(side, price, size),          // reads the just-written account
 ]
 ```
 
-`post_update_v2` writes a per-(feed_id, write_authority) `PriceUpdateV2` PDA that `place_order_checked_pyth_v2` then reads. The client fetches the latest VAA from Pyth's price-update service (an HTTP endpoint that aggregates publisher signatures into VAAs ready to submit), bundles it into the first instruction, and lets the staleness gauntlet enforce that everything stays in sync. There is no on-chain CPI from our handler into the receiver — they communicate through the account, not directly.
+`post_update_atomic` writes the `PriceUpdateV2` into an account the client supplies (not a PDA: a keypair account, created on first use, that only its `write_authority` may overwrite; [receiver](https://github.com/pyth-network/pyth-crosschain/blob/ec40e5f1705a3f6c7818b0f2f1e96a4ac75a7454/target_chains/solana/programs/pyth-solana-receiver/src/lib.rs)), and `place_order_checked_pyth_v2` reads it. The client fetches the guardian-signed VAA and the price's Merkle proof from Hermes, Pyth's price service ([Hermes](https://github.com/pyth-network/pyth-crosschain/tree/ec40e5f1705a3f6c7818b0f2f1e96a4ac75a7454/apps/hermes)), bundles it into the first instruction, and lets the staleness gauntlet enforce that everything stays in sync. There is no on-chain CPI from our handler into the receiver — they communicate through the account, not directly.
 
 This is also why our v2 handler doesn't take a "post" instruction or any Wormhole accounts: the consumer transaction is the wiring; the program just reads.
 
@@ -368,7 +368,7 @@ A single oracle is a single point of failure: if its feed stops updating, the st
 2. The handler reads each, doing the full validation pattern (discriminator/magic + status + price-positive + staleness).
 3. If either passes, use it. If both fail, refuse the call.
 
-Programs that do this also typically *compare* the two when both are fresh — refuse the call if they disagree by more than some tolerance (e.g., 50 bps). A 50-bp disagreement between Pyth and Switchboard usually means one of them is wrong, and a program that just picks the cheaper price for the user has been gamed.
+Programs that do this also typically *compare* the two when both are fresh — refuse the call if they disagree by more than some tolerance (e.g., 50 bps). A wide disagreement can mean one of them is wrong, and a program that just picks the cheaper price for the user invites being gamed.
 
 > **Exercise §9.5.** Pick a real Pyth v1 mainnet PriceAccount (SOL/USD is `H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG` at the time of writing — verify via Pyth's price-feed-ids page). Use the local validator's `clone` feature to mirror that account into your test cluster, pin it on your market with `SetPythFeeds` (signed by the market authority), then invoke `PlaceOrderCheckedPyth` against it. Then try the attack decision 1 describes: copy the account's bytes into an account you own and pass that instead. It should fail with `oracle is not the market's pinned Pyth v1 feed`. Compare the logged `expo` to the SOL/USD product (should be `-8`). Confirm the staleness gauntlet by replaying a stale slot of the account from an archive.
 

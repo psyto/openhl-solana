@@ -452,7 +452,7 @@ timeout -s INT 60 crucible run openhl_slab_fuzz invariant_ch15 \
 This is an implementation chapter, not a comparison chapter. We didn't write:
 
 - A benchmark beyond the `grid` test in `fuzz/slab` (§15.6): production depth, settlement CPIs, and cancel on the slab.
-- A side-by-side of Serum's slab vs Phoenix's slab vs ours. Both production slabs have features ours doesn't (Serum's leaves carry the owner's slot and a client order id; Phoenix requires each trader to hold a seat on the market), and a fair comparison would be its own chapter.
+- A side-by-side of Serum's book vs Phoenix's book vs ours. Both production books have features ours doesn't (Serum's leaves carry the owner's slot and a client order id; Phoenix requires each trader to hold a seat on the market), and a fair comparison would be its own chapter.
 - A migration guide from flat books to slab books. The two account types are independent — there's no on-chain conversion. A market built on `OrderBook` (Chapter 7) and a market built on `Slab` (this chapter) can coexist on the same program.
 
 If you got this far and want more, the §8.4 pseudocode's "3-4 day exercise" framing was accurate: spend the days, write the variants, measure the results.

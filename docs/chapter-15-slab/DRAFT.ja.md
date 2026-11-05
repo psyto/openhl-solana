@@ -454,7 +454,7 @@ timeout -s INT 60 crucible run openhl_slab_fuzz invariant_ch15 \
 これは実装章であり比較章ではない。書かなかったもの:
 
 - `fuzz/slab` の `grid` テスト(§15.6)を超えるベンチマーク: 本番の深さ、settlement の CPI、slab での cancel。
-- Serum の slab vs Phoenix の slab vs 本書のサイドバイサイド。両方の本番 slab は本書が持たない機能を持つ（Serum の葉は所有者のスロットと client order id を持つ; Phoenix はトレーダーごとに market の seat を要求する）、公平な比較はそれ自体の章になる。
+- Serum の板 vs Phoenix の板 vs 本書のサイドバイサイド。両方の本番の板 は本書が持たない機能を持つ（Serum の葉は所有者のスロットと client order id を持つ; Phoenix はトレーダーごとに market の seat を要求する）、公平な比較はそれ自体の章になる。
 - フラット板から slab 板への移行ガイド。2 つのアカウント型は独立 — オンチェーン変換はない。`OrderBook`（第 7 章）の上に建てた market と `Slab`（本章）の上に建てた market は同じプログラムで共存できる。
 
 ここまで来てもっと欲しいなら、§8.4 の擬似コードの「3-4 日の練習」フレーミングは正確だった: 日々を使い、バリアントを書き、結果を測れ。

@@ -92,7 +92,7 @@ Three fields are load-bearing.
 
 The other fields are mechanical: discriminator for the standard check, bump for the PDA, market pubkey for traceability, window_seconds for callers that need to know the configured funding window, and 32 bytes of forward-compat slack.
 
-> **Exercise §10.2.** Convert a funding rate of "0.01% per 8 hours" (Binance's default for most USDⓈ-M perps: a 0.03% daily interest rate paid every 8 hours, which is the whole rate while the premium stays inside the clamp; [Binance FAQ](https://www.binance.com/en/support/faq/introduction-to-binance-futures-funding-rates-360033525031)) into the scaled-1e9 `current_rate_per_sec` format used here. Show your arithmetic.
+> **Exercise §10.2.** Convert a funding rate of "0.01% per 8 hours" (Binance's default for most USDⓈ-M perps: a 0.03% daily interest rate paid every 8 hours, which is the whole rate while the premium index is within 0.05% of it; [Binance FAQ](https://www.binance.com/en/support/faq/introduction-to-binance-futures-funding-rates-360033525031)) into the scaled-1e9 `current_rate_per_sec` format used here. Show your arithmetic.
 
 ---
 
