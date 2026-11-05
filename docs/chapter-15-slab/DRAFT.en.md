@@ -350,7 +350,7 @@ The CU shapes, measured in LiteSVM with `fuzz/slab`'s `grid` test (size-1 bids; 
 | op | flat (ch.7/8) | slab (ch.15) |
 |---|---|---|
 | place, empty book | 2,357 | 1,788 |
-| place, full-ish book | 2,446 (31 orders) | 1,954 (1,023 orders, 128 levels); 2,008 (a new level after 126) |
+| place, full-ish book | 2,446 (31 orders) | 1,954 (1,023 orders, 128 levels); 2,008 (a new level after 126 levels) |
 | match, 10 fills | 22,250 (32 orders) | 14,553 (10 orders) to 15,818 (128 orders, one per level); 14,284 (1,024 orders at 128 levels), 13,921 (1,024 at 8 levels) |
 | match, 4 fills | 8,147 (4 orders), 8,500 (8), 9,276 (16) | 6,597 (4), 6,784 (8), 6,793 (16) |
 | cancel | 1,994 (first slot) – 2,174 (last of 32) | not built (Exercise §15.6) |
