@@ -32,6 +32,7 @@ name = "invariant_test"
 path = "src/main.rs"
 
 [features]
+invariant_ch2 = []
 invariant_ch3 = []
 invariant_ch3_reader = []
 invariant_ch4 = []

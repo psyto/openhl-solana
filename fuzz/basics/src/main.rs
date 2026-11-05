@@ -7,6 +7,8 @@
 //! quote mint (`CreateVault`). A and B each hold quote tokens. One
 //! invariant test per chapter, each behind its own cargo feature:
 //!
+//! - `invariant_ch2`: owner-skip on `Initialize` (Chapter 2): the market account
+//!   replaced by a copy owned by another program (§2.3).
 //! - `invariant_ch3`: signer-skip and account-swap on `CreateMarket` (a
 //!   market address that is not the PDA, a program that is not System).
 //! - `invariant_ch3_reader`: a two-step check for §3.7's exercise. It makes
@@ -124,6 +126,8 @@ struct BasicsFixture {
     bench: (u32, u32),
     /// An address that is not a PDA of this program.
     stranger: Pubkey,
+    /// A zeroed, program-owned 256-byte account for `Initialize`.
+    blank: Pubkey,
 }
 
 impl BasicsFixture {
@@ -241,11 +245,14 @@ impl BasicsFixture {
             mint2: Keypair::new().pubkey(),
             bench: (0, 0),
             stranger: Keypair::new().pubkey(),
+            blank: Keypair::new().pubkey(),
         };
 
         let (market, aa, ba, mint2) = (f.market, f.a_ata, f.b_ata, f.mint2);
         f.put(quote, token(), mint_data(6));
         f.put(mint2, token(), mint_data(6));
+        let blank = f.blank;
+        f.put(blank, CORE_ID, vec![0u8; MARKET_LEN]);
         f.put(aa, token(), token_account_data(&quote, &a.pubkey(), START_BALANCE));
         f.put(ba, token(), token_account_data(&quote, &b.pubkey(), START_BALANCE));
 
@@ -385,8 +392,21 @@ impl HasInstructionSet for BasicsFixture {
             vec![SYSTEM_ID],   // a program that is not SPL Token
         ];
 
-        vec![create_market, bench, create_vault, deposit]
+        // Chapter 2: Initialize into a fresh program-owned 256-byte account.
+        let mut d = market_payload(&a, &self.base2, &self.quote);
+        d[0] = IX_INITIALIZE;
+        let mut initialize = spec("initialize", vec![AccountMeta::new(self.blank, false)], d, Arc::clone(&self.payer));
+        initialize.signer_indices = vec![];
+        initialize.signers = vec![];
+        initialize.expected_owners = vec![c];
+
+        vec![create_market, bench, create_vault, deposit, initialize]
     }
+}
+
+#[invariant_test]
+fn invariant_ch2(fixture: &mut BasicsFixture) {
+    solinv_core::invariants::owner_skip::check(fixture);
 }
 
 #[invariant_test]
@@ -546,6 +566,26 @@ mod tests {
                 };
                 println!("GRID heap={heap} rounds={rounds} cu={cu}");
             }
+        }
+    }
+
+    /// Chapter 2 §2.3: Initialize into an account this program does not own.
+    /// Prints how it ended (`cargo test -- --ignored --nocapture ch2_probe`).
+    #[test]
+    #[ignore]
+    fn ch2_probe() {
+        let f0 = BasicsFixture::setup();
+        let spec = f0.instructions().into_iter().find(|s| s.name == "initialize").unwrap();
+        for owner in [SYSTEM_ID, token(), Pubkey::new_unique()] {
+            let mut f = f0.clone();
+            let key = Keypair::new().pubkey();
+            f.put(key, owner, vec![0u8; MARKET_LEN]);
+            let ix = Instruction { program_id: CORE_ID, accounts: vec![AccountMeta::new(key, false)], data: spec.data_sample.clone() };
+            let (ok, out) = f.send_logged(ix, Arc::clone(&f.payer));
+            let lines: Vec<&str> = out.split("\", \"").collect();
+            let log = lines.iter().rev().find(|l| l.starts_with("Program log:")).copied().unwrap_or("-");
+            let fail = lines.iter().rev().find(|l| l.contains(" failed: ")).map(|l| l.split(" failed: ").last().unwrap_or("")).unwrap_or("-");
+            println!("CH2 owner {owner}: ok={ok} | {} | {}", log.chars().take(90).collect::<String>(), fail.split('"').next().unwrap_or(""));
         }
     }
 

@@ -1,4 +1,4 @@
-# Fuzzes the Chapter 3 and 6 handlers (CreateMarket, CreateVault, Deposit)
+# Fuzzes the Chapter 2, 3 and 6 handlers (Initialize, CreateMarket, CreateVault, Deposit)
 # with solinv on every pull request that touches the program, its crates or
 # the harness: signer-skip, owner-skip and account-swap. Fails on any
 # finding. invariant_ch4 (a cu-dos cap Bench is meant to exceed) and
@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        feature: [invariant_ch3, invariant_ch6]
+        feature: [invariant_ch2, invariant_ch3, invariant_ch6]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
