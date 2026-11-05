@@ -163,7 +163,7 @@ while remaining > 0 and fills_done < max_fills:
     fills_done += 1
 ```
 
-Per-fill cost is `O(log N)` instead of `O(N)`. For N = 1024, that's ~10 vs ~1000 inspections per fill. The matcher fits in budget for realistic books.
+Per-fill cost is `O(log N)` instead of `O(N)` when prices are spread out: for N = 1024, ~10 vs ~1000 inspections per fill. A critbit is not self-balancing, though. Its depth follows the bits of the prices, up to the key's 64 bits, and a maker who picks prices can make it that deep (Chapter 15 §15.7 measures this). The matcher fits in budget for realistic books, and a cap on `max_fills` keeps it there for adversarial ones.
 
 **Cost:** Significant implementation effort. A correct critbit + node pool + FIFO is roughly 1,500 lines of careful Rust with strong invariants (every node either lives in the tree+queue or on the free-list; every level either has ≥1 order or is gone from the tree). Audit cost is correspondingly higher. The whole thing is `bytemuck::Pod`-friendly but requires care: the tree nodes carry indices into the pool, not pointers.
 
@@ -179,7 +179,7 @@ A minimum slab structure, in pseudo-Rust:
 
 ```rust
 const POOL_CAPACITY: usize = 1024;
-const TREE_CAPACITY: usize = 256;   // unique price levels
+const TREE_CAPACITY: usize = 256;   // tree nodes: about 128 price levels per side (leaves + inner nodes)
 
 #[repr(C, Pod)]
 struct Slab {
@@ -279,7 +279,8 @@ Match on slab (Chapter 15, pseudocoded above):
 
   Per fill:    O(log N) tree walk + O(1) FIFO advance  →  O(K × log N) total
   Per K=16 on a 1,024-order slab:          22 KCU (measured, §15.6)
-  Failure mode:  pool exhaustion (handle with separate place_order rejection)
+  Failure mode:  pool exhaustion (handle with separate place_order rejection);
+                 CU on long matches over deep price keys (§15.7)
 
 
 Three responses to CU pressure:

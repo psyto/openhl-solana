@@ -6,9 +6,10 @@
 //! books: the flat `OrderBook` (32 slots) and the slab (1,024 orders,
 //! critbit trees of price levels). The `grid` test measures §15.6's table.
 //! The cu-dos spec is a `SlabMatch` whose `max_fills` the fuzzer picks,
-//! with a cap of `SLAB_MATCH_CU_CAP`, on the slab's costliest shape: 128
-//! bids at 128 prices, so every fill also removes a price level. (A side's
-//! tree holds about 128 levels; more orders per level cost less per fill.)
+//! with a cap of `SLAB_MATCH_CU_CAP`, on the costliest shape we could
+//! build: 128 bids at 128 prices (a side's tree holds at most 128 levels),
+//! one order per level so every fill also removes a level, with prices
+//! chosen so the best bid sits deep in the critbit (`deep_prices`).
 
 use crucible_fuzzer::*;
 use solana_account::Account;
@@ -123,6 +124,23 @@ impl SlabFixture {
         }
     }
 
+    /// The deepest critbit we could build, at 128 levels: `u64::MAX` and
+    /// `u64::MAX - 2^k` for k < 63 (each next-best bid sits one level
+    /// deeper on a spine), plus 64 contiguous levels below.
+    fn deep_prices() -> Vec<u64> {
+        std::iter::once(u64::MAX)
+            .chain((0..63).map(|k| u64::MAX - (1u64 << k)))
+            .chain((0..64u64).map(|i| 1_000 + i))
+            .collect()
+    }
+
+    /// One size-1 bid at each of `prices`.
+    fn fill_slab_at(&mut self, prices: &[u64]) {
+        for (i, &p) in prices.iter().enumerate() {
+            assert!(self.place_slab(BID, p, 1).is_some(), "slab bid {i} at {p}");
+        }
+    }
+
     fn empty() -> Self {
         let mut ctx = TestContext::new();
         ctx.add_program(&CORE_ID, CORE_SO)
@@ -180,10 +198,10 @@ impl SlabFixture {
 
 #[fuzz_fixture]
 impl SlabFixture {
-    /// 128 size-1 bids, one per price level.
+    /// 128 size-1 bids, one per price level, at `deep_prices`.
     pub fn setup() -> Self {
         let mut f = Self::empty();
-        f.fill_slab(128, 128);
+        f.fill_slab_at(&Self::deep_prices());
         f
     }
 
@@ -266,7 +284,7 @@ mod tests {
             f.place_flat(BID, 100 + i, 1);
         }
         println!("GRID flat place into 31: {:?}", f.place_flat(BID, 200, 1));
-        for id in [0u64, 1, 31] {
+        for id in [1u64, 32] {
             let (m, b) = (Arc::clone(&f.maker), f.book);
             let mut d = vec![IX_CANCEL_ORDER];
             d.extend_from_slice(&id.to_le_bytes());
@@ -277,7 +295,7 @@ mod tests {
         println!("GRID slab place into 0: {:?}", s.place_slab(BID, 100, 1));
         println!("GRID slab place, same level: {:?}", s.place_slab(BID, 100, 1));
         s.fill_slab(126, 126);
-        println!("GRID slab place, new level among 127: {:?}", s.place_slab(BID, 999, 1));
+        println!("GRID slab place, a new level after 126 levels: {:?}", s.place_slab(BID, 999, 1));
         let mut s = SlabFixture::empty();
         s.fill_slab(1_023, 128);
         println!("GRID slab place into 1,023 (128 levels): {:?}", s.place_slab(BID, 105, 1));
@@ -321,6 +339,22 @@ mod tests {
         let mut s = SlabFixture::empty();
         s.fill_slab(SLAB_POOL_CAPACITY, 128);
         println!("GRID slab match 16 on 1,024 / 128 levels: {:?}", s.match_slab(16));
+        // A deep critbit: u64::MAX and u64::MAX - 2^k, so the best price
+        // sits at the bottom of a spine as long as the key's bits allow.
+        let spine: Vec<u64> = std::iter::once(u64::MAX).chain((0..63).map(|k| u64::MAX - (1u64 << k))).collect();
+        for mf in [1u8, 10, 32, 64] {
+            let mut s = SlabFixture::empty();
+            s.fill_slab_at(&spine);
+            println!("GRID spine {} levels, match {mf}: {:?}", spine.len(), s.match_slab(mf));
+        }
+        // The spine plus 64 contiguous levels below it: 128 levels.
+        let mut both = spine.clone();
+        both.extend((0..64u64).map(|i| 1_000 + i));
+        for mf in [29u8, 30, 31, 32, 48, 56, 60, 64, 69, 128] {
+            let mut s = SlabFixture::empty();
+            s.fill_slab_at(&both);
+            println!("GRID spine+64 ({} levels), match {mf}: {:?}", both.len(), s.match_slab(mf));
+        }
         // Worst cases on a full slab.
         for mf in [32u8, 64, 128, 255] {
             let mut s = SlabFixture::empty();

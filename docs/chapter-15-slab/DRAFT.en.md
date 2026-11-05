@@ -11,7 +11,7 @@
 
 Chapter 7 shipped a flat-array `OrderBook` — 32 slots, linear-scan for an empty slot on insert, linear-scan for a price-match in `Match`. Chapter 8 measured the cost: a `K = 10` fill loop against a `N = 32` book runs ~`O(K × N)` and spends about 22 KCU (re-measured; §8.2) just on book bookkeeping before any settlement runs. That works *as a teaching baseline*. It does not work as a production book — the scan dominates for any realistic depth.
 
-The Hyperliquid and Serum / Phoenix answer is a **slab**: a self-balancing tree over price levels, with each leaf holding a FIFO of orders at that price. Insert is O(log N) by price level. Best-price is O(log N) — walk root toward the side you want. Pop-the-best is O(log N) in the worst case (a level empties and the leaf has to be removed; an inner node above it goes redundant and collapses with it). The §8.4 pseudocode promised this chapter; here it is.
+The Hyperliquid and Serum / Phoenix answer is a **slab**: a tree over price levels (ours is a critbit, which is not self-balancing: its depth follows the bits of the prices, about log₂ N when they are spread out and up to 64 when a maker picks them adversarially; §15.7), with each leaf holding a FIFO of orders at that price. Insert is O(log N) by price level. Best-price is O(log N) — walk root toward the side you want. Pop-the-best is O(log N) in the worst case (a level empties and the leaf has to be removed; an inner node above it goes redundant and collapses with it). The §8.4 pseudocode promised this chapter; here it is.
 
 The chapter ships three new instructions, parallel to Chapter 7's `CreateOrderBook` / `PlaceOrder` / `Match`:
 
@@ -351,13 +351,13 @@ The CU shapes, measured in LiteSVM with `fuzz/slab`'s `grid` test (size-1 bids; 
 |---|---|---|
 | place, empty book | 2,357 | 1,788 |
 | place, full-ish book | 2,446 (31 orders) | 1,954 (1,023 orders, 128 levels); 2,008 (a new level among 127) |
-| match, 10 fills | 22,250 (32 orders) | 14,553 (10 orders) to 15,818 (128 orders, one per level); 14,284 (1,024 orders) |
+| match, 10 fills | 22,250 (32 orders) | 14,553 (10 orders) to 15,818 (128 orders, one per level); 14,284 (1,024 orders at 128 levels), 13,921 (1,024 at 8 levels) |
 | match, 4 fills | 8,147 (4 orders), 8,500 (8), 9,276 (16) | 6,597 (4), 6,784 (8), 6,793 (16) |
-| cancel | 1,994–2,169 | not built (Exercise §15.6) |
+| cancel | 1,994 (first slot) – 2,174 (last of 32) | not built (Exercise §15.6) |
 
-An earlier draft of this table, written before measuring, said the slab costs more per place (about 3–4 KCU against 1 KCU) and that the flat book wins `Match` below about 8 orders. Neither held. The slab was cheaper per place; we did not break the difference down, but the flat insert scans the slots for a free one. And it was cheaper on `Match` at every size we tried, down to 4 orders. What does hold is the shape: 10 fills cost about the same on 10 orders as on 1,024, because each fill walks a tree of at most about 128 levels (log₂ 128 = 7), not every order.
+An earlier draft of this table, written before measuring, said the slab costs more per place (about 3–4 KCU against 1 KCU) and that the flat book wins `Match` below about 8 orders. Neither held. The slab was cheaper per place; we did not break the difference down, but the flat insert scans the slots for a free one. And it was cheaper on `Match` at every size we tried, down to 4 orders. What does hold is the shape: 10 fills cost about the same on 10 orders as on 1,024, because each fill walks one path down a tree of price levels, not every order. That path is short for prices like these (consecutive integers); §15.7 shows how long it can be made.
 
-The cost does depend on one thing the depth does not show: how many orders share a level. When each fill empties a level, the leaf removal (§15.5) runs every time: 64 fills cost 92,122 CU on 128 orders at 128 prices, against 83,871 on 1,024 orders at 128 prices (8 per level).
+The cost does depend on two things the depth does not show. One is the prices' bits (§15.7). The other is how many orders share a level. When each fill empties a level, the leaf removal (§15.5) runs every time: 64 fills cost 92,122 CU on 128 orders at 128 prices, against 83,871 on 1,024 orders at 128 prices (8 per level).
 
 > **Exercise §15.6.** Add a `SlabCancelOrder` instruction that takes `(order_id, side, price)` and removes a specific order from a specific price level. Hint: the slab as built doesn't index orders by `order_id`, so you'll need to walk the level's FIFO to find the right one. Why is the `price` argument important — what does it save you over walking the whole tree?
 
@@ -421,14 +421,14 @@ Match BID-taker, limit=110, size=25, max_fills=3:
 
 ### Three things to verify yourself
 
-1. **The pool exhausts gracefully.** Insert 1024 orders at distinct prices. Try a 1025th — `pool_alloc_node` should fail with `AccountDataTooSmall` (no pool slot left), the place should fail, and `active_count` should stay at 1024.
+1. **The pool exhausts gracefully.** Insert 1024 orders (a side's tree holds at most 128 distinct prices, so spread them over 128 or fewer levels). Try a 1025th — `pool_alloc_node` should fail with `AccountDataTooSmall` (no pool slot left), the place should fail, and `active_count` should stay at 1024.
 2. **A drained level removes its leaf cleanly.** Insert two orders at price 100 (same level). Cross-match both via `SlabMatch`. The slab dump should show 0 active orders, the bid leaf at 100 should be gone (`describe_best` returns `(empty)`), and the tree's `free_head` should have advanced (a leaf and its parent inner went back on the free list — except when 100 was the only level, in which case only the leaf returns and the parent didn't exist).
 3. **`active_count` invariant.** After any sequence of place + match + cancel, `active_count` should equal the actual count of `nodes[i].size > 0` (i.e., live orders). The slab dump prints `active_count` directly; counting from the pool walk takes one extra script pass. Catching a divergence here means a counter wasn't updated somewhere — a latent bug.
 
 
 ### Now let a tool look for the expensive match
 
-Chapter 8 §8.6 capped the flat matcher's `max_fills` so a full book stays under a CU cap, and showed why that cap must shrink as the book grows. [`fuzz/slab/`](../../fuzz/slab) asks the same question of `SlabMatch`, with a cap of 100,000 CU (`SLAB_MATCH_CU_CAP`), on the slab's costliest shape for its size: 128 bids at 128 prices, so every fill also removes a level. (A side's tree holds about 128 levels; more orders per level cost less per fill.) Set up as in Chapter 3 §3.7, then:
+Chapter 8 §8.6 capped the flat matcher's `max_fills` so a full book stays under a CU cap, and showed why that cap must shrink as the book grows. [`fuzz/slab/`](../../fuzz/slab) asks the same question of `SlabMatch`, with a cap of 100,000 CU (`SLAB_MATCH_CU_CAP`), on the costliest shape we could build: 128 bids at 128 prices (a side's tree holds at most 128 levels), one order per level so every fill also removes a level, and prices chosen so the best bid sits deep in the critbit. Those prices are `u64::MAX` and `u64::MAX - 2^k` for k < 63, plus 64 ordinary ones below: each next-best bid differs from the last in one lower bit, so the path to it gets one node longer, down to the 64 bits of the key. Set up as in Chapter 3 §3.7, then:
 
 ```bash
 cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
@@ -439,15 +439,11 @@ timeout -s INT 60 crucible run openhl_slab_fuzz invariant_ch15 \
     --binary-in target/release/invariant_test --timeout 45
 ```
 
-> **Exercise §15.7.** Run it. You should see lines like
+> **Exercise §15.7.** Run it. You should see `[FUZZ_FINDING] [cu-dos:…] ix slab_match consumed … CU (cap 100000)` lines. As in Chapter 8, the bound is the program's to set. From the `grid` numbers, what is the largest `max_fills` that keeps every shape you can think of under 100,000? Add the check to `process_slab_match`, rebuild, and run again.
 >
-> ```
-> [FUZZ_FINDING] [cu-dos:…] ix slab_match consumed 179643 CU (cap 100000)
-> ```
+> Our first answer was wrong, and the way it was wrong is the lesson. We measured contiguous prices (100, 101, …) at one order per level and found 69 fills at 99,037 CU, so we capped at 69. A reviewer pointed out that a critbit is not self-balancing: its depth follows the bits of the prices, not the number of levels. On the deep prices above, 10 fills cost 35,819 CU (against about 14,500 on contiguous prices), 32 cost 100,222, and with the cap at 69 the fuzzer reported 157,245. The makers choose those prices, so the makers set how expensive the taker's match is. The largest cap that fits the deep shape is 31 (97,678 CU); with `if max_fills > 31` the fuzzer found nothing in 45 seconds.
 >
-> As in Chapter 8, the bound is the program's to set. From the `grid` numbers, what is the largest `max_fills` for which this shape stays under 100,000? Add the check to `process_slab_match`, rebuild, and run again.
->
-> We measured 99,037 CU at 69 fills and 100,469 at 70, so 69, and with `if max_fills > 69` the fuzzer found nothing in 45 seconds. The difference from Chapter 8 is what the number depends on. The flat book's cap had to come down every time `ORDER_CAPACITY` went up, because every fill scans every slot. The slab's 69 does not depend on how many orders the pool holds, only on the cost of a fill that empties a level, and the tree's depth, which is bounded by the roughly 128 levels a side can hold. On a 1,024-order slab with 8 orders per level, 69 fills cost less (76 fit under 100,000). And a match past the default budget is still possible without a cap: 255 fills on a full slab did not fit in 200,000.
+> 31 is a measurement on the deepest shape we found, not a proof. The bound it rests on is real (a path is at most as long as the key has bits), and the cap still does not depend on how many orders the pool holds, which is what Chapter 8's cap could not say. What it does depend on is that worst path, and on the price of removing a level. A match past the default budget is still possible without a cap: 128 fills on the deep shape did not fit in 200,000.
 
 ---
 
