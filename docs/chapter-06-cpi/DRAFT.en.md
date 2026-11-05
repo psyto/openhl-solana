@@ -1,7 +1,7 @@
 # Chapter 6 — CPI Internals via Vault Deposits
 
 > Status: draft (v0.1).
-> Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_vault` at lines 881–990, `process_deposit` at lines 997–1065), [`scripts/create-vault/src/main.rs`](../../scripts/create-vault/src/main.rs), [`scripts/deposit/src/main.rs`](../../scripts/deposit/src/main.rs), [`fuzz/basics/src/main.rs`](../../fuzz/basics/src/main.rs) (the solinv harness for §6.6).
+> Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_vault` at lines 892–1001, `process_deposit` at lines 1008–1076), [`scripts/create-vault/src/main.rs`](../../scripts/create-vault/src/main.rs), [`scripts/deposit/src/main.rs`](../../scripts/deposit/src/main.rs), [`fuzz/basics/src/main.rs`](../../fuzz/basics/src/main.rs) (the solinv harness for §6.6).
 > Tested against: solana-cpi 2.2.1, solana-program 2.3.0, SPL Token program (TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA).
 
 ---
@@ -77,11 +77,11 @@ Both mechanisms — outer-tx propagation and PDA seeds — live in the same `inv
 
 ## §6.3  Walking CreateVault — two consecutive CPIs
 
-CreateVault is the place where both flavors of CPI appear in the same handler. From `programs/openhl-core/src/lib.rs:881–990`.
+CreateVault is the place where both flavors of CPI appear in the same handler. From `programs/openhl-core/src/lib.rs:892–1001`.
 
-**The PDA derivation** (lines 921–943) sets up two pubkeys: `vault_token_account` at `[VAULT_SEED, market.key, mint.key]` and `vault_authority` at `[VAULT_AUTH_SEED, market.key]`. Same find_program_address mechanic as Chapter 3. The bumps are returned and the vault bump is used below; the authority bump we don't need yet (it will matter when we add withdrawals in a later chapter and the program must sign as the vault authority).
+**The PDA derivation** (lines 932–954) sets up two pubkeys: `vault_token_account` at `[VAULT_SEED, market.key, mint.key]` and `vault_authority` at `[VAULT_AUTH_SEED, market.key]`. Same find_program_address mechanic as Chapter 3. The bumps are returned and the vault bump is used below; the authority bump we don't need yet (it will matter when we add withdrawals in a later chapter and the program must sign as the vault authority).
 
-**CPI 1 — System::create_account** at lines 945–964:
+**CPI 1 — System::create_account** at lines 956–975:
 
 ```rust
 let create_ix = system_instruction::create_account(
@@ -107,7 +107,7 @@ This is `invoke_signed` because the new account is a PDA we own and System requi
 
 Note the AccountInfo array: `[payer_ai, vault_ai, system_ai]`. These are the only three accounts the System program needs to see for `create_account` (the rest of our handler's accounts — market, mint, vault_authority, token_program — aren't passed because System doesn't need them).
 
-**CPI 2 — SPL Token InitializeAccount3** at lines 966–986:
+**CPI 2 — SPL Token InitializeAccount3** at lines 977–997:
 
 ```rust
 let mut init_data = Vec::with_capacity(1 + 32);
@@ -136,7 +136,7 @@ Two CPIs, one handler, both kinds of signing. The pattern repeats throughout the
 
 ## §6.4  Walking Deposit — user signs at the outer level
 
-Deposit is the simpler case. From `programs/openhl-core/src/lib.rs:997–1065`.
+Deposit is the simpler case. From `programs/openhl-core/src/lib.rs:1008–1076`.
 
 The instruction data:
 
@@ -256,7 +256,7 @@ openhl-core CPI map:
 ### Three things to verify yourself
 
 1. **`invoke` is `invoke_signed` with no seeds.** Open `solana-cpi-2.2.1/src/lib.rs:137` and read the three-line body. Internalize that the only difference between the two is "did we pass PDA seeds." Everything else is the same syscall.
-2. **AccountInfo for the callee program.** In both CPIs in CreateVault, the `accounts` slice passed to `invoke[_signed]` includes the callee program's AccountInfo — `system_ai` for CPI 1, `token_ai` for CPI 2. Omitting them is one of the most common early-Solana mistakes; the runtime returns a confusing `AccountNotFound`-flavored error. Verify by reading [`lib.rs:955, 986`](../../programs/openhl-core/src/lib.rs#L955).
+2. **AccountInfo for the callee program.** In both CPIs in CreateVault, the `accounts` slice passed to `invoke[_signed]` includes the callee program's AccountInfo — `system_ai` for CPI 1, `token_ai` for CPI 2. Omitting them is one of the most common early-Solana mistakes; the runtime returns a confusing `AccountNotFound`-flavored error. Verify by reading [`lib.rs:966, 997`](../../programs/openhl-core/src/lib.rs#L966).
 3. **User signs once, used by SPL Token.** Run `deposit` against your validator. The user keypair signs the outer transaction; SPL Token receives a `Transfer` instruction with `is_signer = true` on the user; the transfer commits. There is no second signature anywhere. One signature, propagated.
 
 

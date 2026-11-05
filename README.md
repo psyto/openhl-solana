@@ -109,7 +109,7 @@ behaves on Solana against an EVM perp by running scenarios rather than reading c
 
 `openhl-solana` ships:
 
-- A single Solana program (`programs/openhl-core`) holding every instruction: `Initialize`, `CreateMarket`, `OpenPosition`, `Match`, `Liquidate`, `UpdateFunding`, oracle ingestion, vault deposit/withdraw, builder codes, insurance fund, plus a Pyth V2 checked variant. 34 instructions total.
+- A single Solana program (`programs/openhl-core`) holding every instruction: `Initialize`, `CreateMarket`, `OpenPosition`, `Match`, `Liquidate`, `UpdateFunding`, oracle ingestion, vault deposit/withdraw, builder codes, insurance fund, plus Pyth v1 and v2 checked variants against feeds the market pins. 35 instructions total.
 - A shared `crates/state` defining every account layout as `repr(C) + bytemuck::Pod` Pod structs — the byte layout *is* the contract.
 - The parts above under `crates/`, which the program calls for matching, oracle checks, margin, funding, fees and vault shares.
 - 15 per-scenario scripts under `scripts/` that each `cargo run -p X` and exercise one slice of the program against a local validator, with CU cost measurement and account-state dumps.

@@ -1,7 +1,7 @@
 # 第8章 — CU 圧の下のマッチングエンジン
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_match` 1354–1482 行）、[`scripts/match/src/main.rs`](../../scripts/match/src/main.rs)、[`fuzz/matching/src/main.rs`](../../fuzz/matching/src/main.rs)（§8.6 の solinv ハーネス）。
+> 教材コード: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_match` 1365–1493 行）、[`scripts/match/src/main.rs`](../../scripts/match/src/main.rs)、[`fuzz/matching/src/main.rs`](../../fuzz/matching/src/main.rs)（§8.6 の solinv ハーネス）。
 > 第 7 章の `OrderBook` データ構造の上に立つ。
 
 ---
@@ -21,7 +21,7 @@
 
 ## §8.1  フラット book 上の Match アルゴリズム
 
-`programs/openhl-core/src/lib.rs:1354–1482` から。ハンドラはペイロードの 4 フィールドを取る。
+`programs/openhl-core/src/lib.rs:1365–1493` から。ハンドラはペイロードの 4 フィールドを取る。
 
 ```text
 [side u8][limit_price u64 LE][size u64 LE][max_fills u8]
@@ -29,7 +29,7 @@
 
 `side` は**taker** 側だ（bid の taker は ask に対して買う、ask の taker は bid に対して売る）。`limit_price` は taker が受け入れる最悪価格。`size` は取りたい総 base 単位。`max_fills` は 1 命令あたりに交差する resting maker 注文数の上限 — ページングつまみだ。
 
-マッチングループ、1413–1472 行。
+マッチングループ、1424–1483 行。
 
 ```rust
 let mut fills_done: u8 = 0;

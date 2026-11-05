@@ -1,7 +1,7 @@
 # Chapter 8 — Matching Engine Under CU Pressure
 
 > Status: draft (v0.1).
-> Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_match` at lines 1354–1482), [`scripts/match/src/main.rs`](../../scripts/match/src/main.rs), [`fuzz/matching/src/main.rs`](../../fuzz/matching/src/main.rs) (the solinv harness for §8.6).
+> Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_match` at lines 1365–1493), [`scripts/match/src/main.rs`](../../scripts/match/src/main.rs), [`fuzz/matching/src/main.rs`](../../fuzz/matching/src/main.rs) (the solinv harness for §8.6).
 > Builds on Chapter 7's `OrderBook` data structure.
 
 ---
@@ -21,7 +21,7 @@ So this chapter:
 
 ## §8.1  The Match algorithm on a flat book
 
-From `programs/openhl-core/src/lib.rs:1354–1482`. The handler takes four payload fields:
+From `programs/openhl-core/src/lib.rs:1365–1493`. The handler takes four payload fields:
 
 ```text
 [side u8][limit_price u64 LE][size u64 LE][max_fills u8]
@@ -29,7 +29,7 @@ From `programs/openhl-core/src/lib.rs:1354–1482`. The handler takes four paylo
 
 `side` is the *taker's* side (a bid taker buys against asks, an ask taker sells against bids). `limit_price` is the worst price the taker will accept. `size` is total base units to take. `max_fills` is the per-instruction cap on how many resting maker orders to cross — the pagination knob.
 
-The matching loop at lines 1413–1472:
+The matching loop at lines 1424–1483:
 
 ```rust
 let mut fills_done: u8 = 0;

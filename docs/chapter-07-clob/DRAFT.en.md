@@ -1,7 +1,7 @@
 # Chapter 7 — On-Chain CLOB Data Structures
 
 > Status: draft (v0.1).
-> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Order` + `OrderBook`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_order_book` at 1080–1144, `process_place_order` at 1151–1242, `process_cancel_order` at 1249–1316), [`scripts/book/src/main.rs`](../../scripts/book/src/main.rs).
+> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Order` + `OrderBook`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_order_book` at 1091–1155, `process_place_order` at 1162–1253, `process_cancel_order` at 1260–1327), [`scripts/book/src/main.rs`](../../scripts/book/src/main.rs).
 
 ---
 
@@ -90,7 +90,7 @@ Why `size == 0` and not a separate `is_active: bool`?
 - A boolean field would cost a byte plus padding to maintain alignment. The `size` field already exists and a real order always has `size > 0`. Repurposing it as the active sentinel saves the extra field.
 - Zero-initialization on account creation makes the convention work for free: a newly allocated `OrderBook`'s slots are all "empty" without any explicit setup pass.
 
-The cost is a one-line invariant the program must respect: never write an `Order` with `size == 0`. `place_order` rejects `size == 0` in the payload as its first guard (`cancel_order` takes only an order id, and writes an all-zero `Order` on purpose to empty the slot). From `process_place_order` (lib.rs:1172–1175):
+The cost is a one-line invariant the program must respect: never write an `Order` with `size == 0`. `place_order` rejects `size == 0` in the payload as its first guard (`cancel_order` takes only an order id, and writes an all-zero `Order` on purpose to empty the slot). From `process_place_order` (lib.rs:1183–1186):
 
 ```rust
 if price == 0 || size == 0 {
@@ -107,11 +107,11 @@ That's the price of repurposing the field. Anchor's `#[derive(BorshSerialize)]` 
 
 ## §7.3  Walking `place_order`
 
-From `programs/openhl-core/src/lib.rs:1151–1242`. The handler decomposes into three parts.
+From `programs/openhl-core/src/lib.rs:1162–1253`. The handler decomposes into three parts.
 
-**Validation** (lines 1156–1199): payload size, side byte (must be 0 or 1), price and size non-zero, user is a signer, book owner matches our program, book size matches `OrderBook::LEN`, book discriminator matches.
+**Validation** (lines 1167–1210): payload size, side byte (must be 0 or 1), price and size non-zero, user is a signer, book owner matches our program, book size matches `OrderBook::LEN`, book discriminator matches.
 
-**The linear scan** at lines 1205–1211:
+**The linear scan** at lines 1216–1222:
 
 ```rust
 let mut chosen_slot: Option<usize> = None;
@@ -138,9 +138,9 @@ The CU cost shape, measured (whole instruction, LiteSVM, with `fuzz/matching`'s 
 
 The scan is linear, and cheap: 89 CU from an empty book to 31 orders, about 3 CU per slot visited. (An earlier draft estimated about 50 CU per slot, 1,550 CU at 31 orders; it was more than ten times too high.) Almost all of the 2,357 is the fixed cost of an instruction: entry, validation, the two `sol_log_compute_units` calls and the `msg!` lines. So the *shape* is the lesson here more than the size: O(N) means the cost grows with the data, but at 32 slots and a few CU per slot it hardly shows. It shows in Chapter 8, where the scan runs once per fill, and with a bigger book. For comparison, Chapter 15's slab places an order into 1,023 others for 1,954 CU, less than this array charges at 16.
 
-**The write** (lines 1217–1231): increment `next_order_id`, increment `active_count`, copy the user pubkey into `owner`, construct an `Order` literal, drop it into the chosen slot. All O(1) once the slot is found.
+**The write** (lines 1228–1242): increment `next_order_id`, increment `active_count`, copy the user pubkey into `owner`, construct an `Order` literal, drop it into the chosen slot. All O(1) once the slot is found.
 
-The CU brackets at lines 1192 (before scan) and 1239 (after write) let you read the cost from the validator log. Two `sol_log_compute_units` calls, subtract, get the CU consumed between them: the scan and the write, plus the data borrow, the discriminator check and the logging in that range.
+The CU brackets at lines 1203 (before scan) and 1250 (after write) let you read the cost from the validator log. Two `sol_log_compute_units` calls, subtract, get the CU consumed between them: the scan and the write, plus the data borrow, the discriminator check and the logging in that range.
 
 > **Exercise §7.3.** Pre-populate the book with N orders for various N (say 0, 8, 16, 24, 31) and then place a single new order. Record the CU consumed (between the two log calls) for each N. Plot it. It should be linear in N, with a slope of a few CU per order: compare your numbers with the table above.
 
@@ -148,9 +148,9 @@ The CU brackets at lines 1192 (before scan) and 1239 (after write) let you read 
 
 ## §7.4  Walking `cancel_order`
 
-`process_cancel_order` (lines 1249–1316) is structurally the same as `place_order` — linear scan, then mutation — but with a different match key and a different mutation.
+`process_cancel_order` (lines 1260–1327) is structurally the same as `place_order` — linear scan, then mutation — but with a different match key and a different mutation.
 
-**The scan** at lines 1284–1290:
+**The scan** at lines 1295–1301:
 
 ```rust
 let mut found: Option<usize> = None;
@@ -164,7 +164,7 @@ for (i, slot) in book.slots.iter().enumerate() {
 
 `slot.size != 0` skips empty slots; `slot.order_id == order_id` selects by ID. Worst case is "order is in the last slot" or "order not found" — both pay full O(N).
 
-**The authorization check** at lines 1296–1300:
+**The authorization check** at lines 1307–1311:
 
 ```rust
 if book.slots[slot_idx].owner != *user_ai.key.as_ref() {
@@ -175,7 +175,7 @@ if book.slots[slot_idx].owner != *user_ai.key.as_ref() {
 
 Only the order's original placer may cancel it. The `owner` field on the slot is the cancel-authorization mechanism. This is a per-slot check, not a per-book check — there is no single "operator can cancel anything" path, which is appropriate for an open CLOB but would be different for a vault-managed strategy.
 
-**The zero** at line 1304:
+**The zero** at line 1315:
 
 ```rust
 book.slots[slot_idx] = <Order as bytemuck::Zeroable>::zeroed();
@@ -183,7 +183,7 @@ book.slots[slot_idx] = <Order as bytemuck::Zeroable>::zeroed();
 
 `Order::zeroed()` returns the all-zeros `Order`. The `<Order as bytemuck::Zeroable>::zeroed()` qualified-syntax is needed because `Order::zeroed` is not in scope as an inherent method — it comes from the `bytemuck::Zeroable` trait. Once written, the slot's `size` is 0 and the next `place_order` scanning for an empty slot will see this position as available.
 
-The CU cost is symmetric to `place_order`: best case is "matched at slot 0" (1 iteration); worst case is "not found" (N iterations + error). We measured 1,994 CU for the order in the first slot of a full book and 2,177 for the one in the last, about 6 CU per slot visited (the "not found" path fails, and we did not measure failed calls). The brackets at lines 1273 and 1313 let you measure.
+The CU cost is symmetric to `place_order`: best case is "matched at slot 0" (1 iteration); worst case is "not found" (N iterations + error). We measured 1,994 CU for the order in the first slot of a full book and 2,177 for the one in the last, about 6 CU per slot visited (the "not found" path fails, and we did not measure failed calls). The brackets at lines 1284 and 1324 let you measure.
 
 > **Exercise §7.4.** Place 10 orders, then cancel order_id 5. Then place another order. Which slot does the new order land in? Trace the slot allocation through the dump output of `book` (no flags) before and after each operation.
 

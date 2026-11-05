@@ -1,7 +1,7 @@
 # Chapter 9 — Oracle Ingestion: Pyth Internals
 
 > Status: draft (v0.1).
-> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Oracle`, plus the Pyth v1 and v2 layout constants for §9.5), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_oracle`, `process_set_oracle_price`, `process_place_order_checked`, `process_place_order_checked_pyth`, `process_place_order_checked_pyth_v2`, and the `read_fresh_oracle` / `read_fresh_pyth_v1_oracle` / `read_fresh_pyth_v2_oracle` helpers), [`scripts/oracle/src/main.rs`](../../scripts/oracle/src/main.rs).
+> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Oracle`, plus the Pyth v1 and v2 layout constants for §9.5), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_oracle`, `process_set_oracle_price`, `process_place_order_checked`, `process_place_order_checked_pyth`, `process_place_order_checked_pyth_v2`, and the `read_fresh_oracle` / `read_fresh_pyth_v1_oracle` / `read_fresh_pyth_v2_oracle` helpers), [`scripts/oracle/src/main.rs`](../../scripts/oracle/src/main.rs), [`programs/openhl-core/tests/pyth_binding.rs`](../../programs/openhl-core/tests/pyth_binding.rs) (the feed-pinning tests for §9.5).
 > Reference targets: Pyth Network mainnet program (`FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH`), Switchboard On-Demand.
 >
 > Since the parts split, the logic this chapter walks through lives in [`crates/oracle/src/lib.rs`](../../crates/oracle/src/lib.rs) (`openhl-oracle`); the program calls it. The code quoted below is the pre-split version from `programs/openhl-core/src/lib.rs`, and its line numbers are not kept in sync.
@@ -263,7 +263,7 @@ The check order mirrors the mock path: structural validation first (magic / vers
 
 Four design decisions worth flagging:
 
-**1. No owner check on the Pyth account.** The mock path requires `oracle_ai.owner == program_id`; we deliberately *don't* require `oracle_ai.owner == &pyth_program::ID` here. Hardcoding the Pyth program ID would force a mainnet-vs-devnet choice up front (`FsJ3...epH` for mainnet, `gSbE...92s` for devnet), and the magic+version+atype gauntlet already structurally guarantees the account is a Pyth v1 PriceAccount. A production deployment would either (a) pin the expected Pyth program ID on the `Market` struct, or (b) pin the expected Pyth account *pubkey* on the `Market` — option (b) is tighter because it prevents a caller from swapping in a Pyth feed for the wrong asset.
+**1. The reader checks bytes; the handler checks which account.** The mock path requires `oracle_ai.owner == program_id`; the reader here has no owner check, and the first version of this chapter said it did not need one, because "the magic+version+atype gauntlet already structurally guarantees the account is a Pyth v1 PriceAccount." It does not. Anyone can create an account they own, write the magic, version, account type, a Trading status and any price they like into it, and pass it in; the test `pyth_v1_reads_only_the_pinned_price_account` in `programs/openhl-core/tests/pyth_binding.rs` did exactly that, and the order went through against a price the caller chose. Hardcoding the Pyth program ID would force a mainnet-vs-devnet choice up front (`FsJ3...epH` for mainnet, `gSbE...92s` for devnet), so the program takes the tighter of the two options instead: the market pins the expected Pyth account *pubkey* (`Market.pyth_v1_price_account`, set by the market authority with `SetPythFeeds`, tag 34), and `PlaceOrderCheckedPyth` refuses any other account, and refuses outright while nothing is pinned. A pinned address is the real Pyth account, owned by Pyth, so the owner question is settled with it, and so is the wrong-asset question: a correctly-owned feed for another pair is a different address.
 
 **2. `expo` is read and logged, not applied.** Pyth prices come as `(mantissa, expo)` pairs — the real price is `mantissa × 10^expo`. For USD pairs `expo` is typically `-8`. The mock side has no expo (our `Oracle.price` is a u64 in whatever scale the market uses), so to keep the two paths interoperable in our chapter we treat the mantissa as the price and log `expo` for observability. A production deployment would normalize: either pin a single supported `expo` and reject anything else, or translate the price into the program's fixed-point convention on the fly. This is the most likely place to write a real bug in the migration; the chapter calls it out so you can put a TODO there yourself.
 
@@ -276,7 +276,7 @@ Four design decisions worth flagging:
 The peer instruction. Same payload as `PlaceOrderChecked` (`[side u8][price u64 LE][size u64 LE]`), same eight prefix accounts modulo two changes:
 
 - Slot 2 is a Pyth v1 PriceAccount, not our mock `Oracle`. (The oracle-PDA-from-market cross-check is dropped; Pyth accounts aren't ours to PDA-derive.)
-- The oracle-side gauntlet calls `read_fresh_pyth_v1_oracle` instead of `read_fresh_oracle`.
+- The oracle-side gauntlet calls `read_fresh_pyth_v1_oracle` instead of `read_fresh_oracle`, and before it the handler requires slot 2 to be the market's pinned `pyth_v1_price_account` (decision 1 above).
 
 Everything downstream — sanity-band, fee escrow, book write — is identical to the mock path. Both handlers share the same `SANITY_BAND_BPS`, `PROTOCOL_FEE_BPS`, and the same `spl_token_transfer_user_signed` Transfer at the end. The migration's surface is exactly what §9.5 promised: localized.
 
@@ -289,7 +289,7 @@ The "v1" in `read_fresh_pyth_v1_oracle` matters. Pyth's v1 model — publishers 
 
 If you confused those two layers (and an earlier draft of this section did), you'd conclude that v2 needs ~2000 lines of cryptographic code on your side. It doesn't. The Wormhole work lives in Pyth's program, which is shared infrastructure; what you ship on the perp DEX is structurally the same as the v1 reader, just against a different account layout.
 
-`PlaceOrderCheckedPythV2` (tag 33) ships the consumer side. The reader:
+`PlaceOrderCheckedPythV2` (tag 33) ships the consumer side. Two checks come before the reader, in the handler, because the reader cannot make them: the account must be owned by the receiver program the market pinned (`Market.pyth_v2_receiver`; its ID differs between clusters, so it is data, not a constant), and its `feed_id` must equal `Market.pyth_v2_feed_id`. Without the first, anyone can write a `PriceUpdateV2`-shaped account, discriminator and all, from their own program; without the second, a genuine update for another asset passes (`pyth_v2_reads_only_the_pinned_receiver_and_feed` tries both). The reader:
 
 ```rust
 fn read_fresh_pyth_v2_oracle(oracle_ai: &AccountInfo) -> Result<u64, ProgramError> {
@@ -327,7 +327,7 @@ offset | size | field                            | what we do with it
    8   | 32   | write_authority (Pubkey)         | (ignored — receiver's signing PDA)
   40   |  1   | verification_level tag           | log; 0=Partial, 1=Full
   41   |  1   | verification_level.num_signatures| log (only when tag==Partial)
-  42   | 32   | price_message.feed_id            | (caller pins the expected feed off-chain)
+  42   | 32   | price_message.feed_id            | == `Market.pyth_v2_feed_id` (checked by the handler)
   74   |  8   | price_message.price (i64)        | > 0; returned as u64 mark
   82   |  8   | price_message.conf  (u64)        | log
   90   |  4   | price_message.exponent (i32)     | log; production normalizes by 10^expo
@@ -370,7 +370,7 @@ A single oracle is a single point of failure. Pyth has been down. Switchboard ha
 
 Programs that do this also typically *compare* the two when both are fresh — refuse the call if they disagree by more than some tolerance (e.g., 50 bps). A 50-bp disagreement between Pyth and Switchboard usually means one of them is wrong, and a program that just picks the cheaper price for the user has been gamed.
 
-> **Exercise §9.5.** Pick a real Pyth v1 mainnet PriceAccount (SOL/USD is `H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG` at the time of writing — verify via Pyth's price-feed-ids page). Use the local validator's `clone` feature to mirror that account into your test cluster, then invoke `PlaceOrderCheckedPyth` against it. Compare the logged `expo` to the SOL/USD product (should be `-8`). Confirm the staleness gauntlet by replaying a stale slot of the account from an archive.
+> **Exercise §9.5.** Pick a real Pyth v1 mainnet PriceAccount (SOL/USD is `H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG` at the time of writing — verify via Pyth's price-feed-ids page). Use the local validator's `clone` feature to mirror that account into your test cluster, pin it on your market with `SetPythFeeds` (signed by the market authority), then invoke `PlaceOrderCheckedPyth` against it. Then try the attack decision 1 describes: copy the account's bytes into an account you own and pass that instead. It should fail with `oracle is not the market's pinned Pyth v1 feed`. Compare the logged `expo` to the SOL/USD product (should be `-8`). Confirm the staleness gauntlet by replaying a stale slot of the account from an archive.
 
 ---
 

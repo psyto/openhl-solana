@@ -1,7 +1,7 @@
 # 第7章 — オンチェーン CLOB データ構造
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Order` + `OrderBook`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_order_book` 1080–1144 行、`process_place_order` 1151–1242 行、`process_cancel_order` 1249–1316 行）、[`scripts/book/src/main.rs`](../../scripts/book/src/main.rs)。
+> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Order` + `OrderBook`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_order_book` 1091–1155 行、`process_place_order` 1162–1253 行、`process_cancel_order` 1260–1327 行）、[`scripts/book/src/main.rs`](../../scripts/book/src/main.rs)。
 
 ---
 
@@ -90,7 +90,7 @@ pub struct Order {
 - bool フィールドは 1 バイト + アラインメント維持のパディングのコストがかかる。`size` フィールドはすでに存在し、本物の注文は常に `size > 0` だ。アクティブ判定の番兵としてこのフィールドを再利用すれば、追加フィールドのコストを省ける。
 - アカウント作成時のゼロ初期化により、規約は無料で機能する: 新規確保された `OrderBook` のスロットはすべて、明示的なセットアップなしに「空」になる。
 
-コストは、プログラムが守るべき不変条件 1 行だ: `size == 0` の `Order` を絶対に書かない。`place_order` はペイロード中の `size == 0` を最初のガードで拒否する(`cancel_order` が取るのは注文の id だけで、スロットを空けるために全ゼロの `Order` をわざと書く)。`process_place_order`（lib.rs:1172–1175）から。
+コストは、プログラムが守るべき不変条件 1 行だ: `size == 0` の `Order` を絶対に書かない。`place_order` はペイロード中の `size == 0` を最初のガードで拒否する(`cancel_order` が取るのは注文の id だけで、スロットを空けるために全ゼロの `Order` をわざと書く)。`process_place_order`（lib.rs:1183–1186）から。
 
 ```rust
 if price == 0 || size == 0 {
@@ -107,11 +107,11 @@ if price == 0 || size == 0 {
 
 ## §7.3  `place_order` を歩く
 
-`programs/openhl-core/src/lib.rs:1151–1242` から。ハンドラは 3 部分に分解できる。
+`programs/openhl-core/src/lib.rs:1162–1253` から。ハンドラは 3 部分に分解できる。
 
-**検証**（1156–1199 行）: ペイロードサイズ、side バイト（0 か 1）、price と size 非ゼロ、user は署名者、book の所有者が本書のプログラムと一致、book サイズが `OrderBook::LEN` と一致、book のディスクリミネータが一致。
+**検証**（1167–1210 行）: ペイロードサイズ、side バイト（0 か 1）、price と size 非ゼロ、user は署名者、book の所有者が本書のプログラムと一致、book サイズが `OrderBook::LEN` と一致、book のディスクリミネータが一致。
 
-**線形走査**、1205–1211 行。
+**線形走査**、1216–1222 行。
 
 ```rust
 let mut chosen_slot: Option<usize> = None;
@@ -138,9 +138,9 @@ CU コストの形を測った(命令全体、LiteSVM、`fuzz/matching` の `ch7
 
 走査は線形で、しかも安い。空の book から 31 注文までで 89 CU、見るスロット 1 つあたり約 3 CU だ。(以前の版は 1 スロットあたり約 50 CU、31 注文で 1,550 CU と見積もっていた。10 倍以上高すぎた。)2,357 のほとんどは命令の固定費で、入口、検証、2 つの `sol_log_compute_units`、`msg!` の行だ。だからここでの教訓は大きさより**形**だ。O(N) はコストがデータとともに増えることを意味するが、32 スロットで 1 スロット数 CU ではほとんど見えない。見えてくるのは、fill ごとに走査する第 8 章と、もっと大きな book だ。比べると、第 15 章の slab は 1,023 の注文があるところへ 1,954 CU で置ける。この配列が 16 で取る値段より安い。
 
-**書き込み**（1217–1231 行）: `next_order_id` をインクリメント、`active_count` をインクリメント、user の pubkey を `owner` にコピー、`Order` リテラルを構築、選んだスロットに投入。スロットが決まれば全部 O(1)。
+**書き込み**（1228–1242 行）: `next_order_id` をインクリメント、`active_count` をインクリメント、user の pubkey を `owner` にコピー、`Order` リテラルを構築、選んだスロットに投入。スロットが決まれば全部 O(1)。
 
-1192 行（走査前）と 1239 行（書き込み後）の CU ブラケットがあれば、バリデータログからコストを読める。2 つの `sol_log_compute_units` を呼んで差を取れば、その間で消費された CU が出る。走査と書き込みに加え、その範囲のデータ借用、ディスクリミネータの検査、ログも含む。
+1203 行（走査前）と 1250 行（書き込み後）の CU ブラケットがあれば、バリデータログからコストを読める。2 つの `sol_log_compute_units` を呼んで差を取れば、その間で消費された CU が出る。走査と書き込みに加え、その範囲のデータ借用、ディスクリミネータの検査、ログも含む。
 
 > **演習 §7.3.** book にいろんな N（たとえば 0、8、16、24、31）の注文を事前投入し、その後新しい注文を 1 つ置け。各 N について 2 つのログ呼び出しの間で消費された CU を記録せよ。プロットせよ。N に対して線形で、傾きは 1 注文あたり数 CU のはずだ。上の表と比べよ。
 
@@ -148,9 +148,9 @@ CU コストの形を測った(命令全体、LiteSVM、`fuzz/matching` の `ch7
 
 ## §7.4  `cancel_order` を歩く
 
-`process_cancel_order`（1249–1316 行）は構造的には `place_order` と同じだ — 線形走査、次に変更 — がマッチキーと変更内容が異なる。
+`process_cancel_order`（1260–1327 行）は構造的には `place_order` と同じだ — 線形走査、次に変更 — がマッチキーと変更内容が異なる。
 
-**走査**、1284–1290 行。
+**走査**、1295–1301 行。
 
 ```rust
 let mut found: Option<usize> = None;
@@ -164,7 +164,7 @@ for (i, slot) in book.slots.iter().enumerate() {
 
 `slot.size != 0` で空スロットを飛ばす、`slot.order_id == order_id` で ID 選択。最悪ケースは「注文が最後のスロットにある」または「見つからない」 — どちらも O(N) を払う。
 
-**認可チェック**、1296–1300 行。
+**認可チェック**、1307–1311 行。
 
 ```rust
 if book.slots[slot_idx].owner != *user_ai.key.as_ref() {
@@ -175,7 +175,7 @@ if book.slots[slot_idx].owner != *user_ai.key.as_ref() {
 
 注文を置いた本人だけがキャンセルできる。スロットの `owner` フィールドがキャンセル認可の仕組みだ。これはスロット単位のチェックで、book 単位ではない — 「オペレータが何でもキャンセルできる」パスは存在しない。これはオープン CLOB として適切だが、vault 管理戦略では別になる。
 
-**ゼロ化**、1304 行。
+**ゼロ化**、1315 行。
 
 ```rust
 book.slots[slot_idx] = <Order as bytemuck::Zeroable>::zeroed();
@@ -183,7 +183,7 @@ book.slots[slot_idx] = <Order as bytemuck::Zeroable>::zeroed();
 
 `Order::zeroed()` は全ゼロの `Order` を返す。`<Order as bytemuck::Zeroable>::zeroed()` の修飾構文が必要なのは、`Order::zeroed` が固有メソッドとしてスコープに入っていないからだ — `bytemuck::Zeroable` トレイトから来る。書き込まれた後、スロットの `size` は 0、次の `place_order` が空スロット走査でこの位置を見つけて利用可能だと認識する。
 
-CU コストは `place_order` と対称: 最良ケースは「スロット 0 で一致」（1 反復）、最悪ケースは「見つからない」（N 反復 + エラー）。満杯の book で、最初のスロットの注文は 1,994 CU、最後のスロットの注文は 2,177 で、見るスロット 1 つあたり約 6 CU だった(「見つからない」経路は失敗し、失敗した呼び出しは測っていない)。1273 行と 1313 行のブラケットで計測できる。
+CU コストは `place_order` と対称: 最良ケースは「スロット 0 で一致」（1 反復）、最悪ケースは「見つからない」（N 反復 + エラー）。満杯の book で、最初のスロットの注文は 1,994 CU、最後のスロットの注文は 2,177 で、見るスロット 1 つあたり約 6 CU だった(「見つからない」経路は失敗し、失敗した呼び出しは測っていない)。1284 行と 1324 行のブラケットで計測できる。
 
 > **演習 §7.4.** 注文を 10 個置き、order_id 5 をキャンセルせよ。その後さらに 1 個置け。新しい注文はどのスロットに着地するか。各操作の前後で `book`（フラグなし）のダンプ出力からスロット配分を辿れ。
 

@@ -151,6 +151,10 @@
 //!                           pyth-solana-receiver program after VAA
 //!                           verification — we don't verify, we
 //!                           just consume).
+//!  34  SetPythFeeds           — Chapter 9 §9.5. The market authority
+//!                           pins the Pyth v1 account and the v2
+//!                           receiver + feed id that tags 32 and 33
+//!                           accept; until then they refuse.
 //!
 //! The entire program is one file on purpose. Splitting it into the usual
 //! `instruction.rs` / `processor.rs` / `state.rs` modules buys nothing
@@ -391,6 +395,7 @@ pub fn process_instruction(
         31 => process_slab_match(program_id, accounts, payload),
         32 => process_place_order_checked_pyth(program_id, accounts, payload),
         33 => process_place_order_checked_pyth_v2(program_id, accounts, payload),
+        34 => process_set_pyth_feeds(program_id, accounts, payload),
         unknown => {
             msg!("unknown instruction tag: {}", unknown);
             Err(ProgramError::InvalidInstructionData)
@@ -506,7 +511,10 @@ fn process_initialize(
     market.quote_mint = quote_mint;
     market.tick_size = tick_size;
     market.lot_size = lot_size;
-    market._reserved = [0u8; 128];
+    market.pyth_v1_price_account = [0u8; 32];
+    market.pyth_v2_receiver = [0u8; 32];
+    market.pyth_v2_feed_id = [0u8; 32];
+    market._reserved = [0u8; 32];
 
     msg!("market initialized");
     Ok(())
@@ -650,7 +658,10 @@ fn process_create_market(
     market.quote_mint = quote_mint;
     market.tick_size = tick_size;
     market.lot_size = lot_size;
-    market._reserved = [0u8; 128];
+    market.pyth_v1_price_account = [0u8; 32];
+    market.pyth_v2_receiver = [0u8; 32];
+    market.pyth_v2_feed_id = [0u8; 32];
+    market._reserved = [0u8; 32];
 
     msg!("market created at PDA (bump {})", bump);
     Ok(())
@@ -1807,11 +1818,10 @@ fn process_place_order_checked(
 /// Identical handler shape to `process_place_order_checked` except:
 ///   - The oracle account at slot 2 is a Pyth v1 PriceAccount, not our
 ///     mock `Oracle`. Validated via `read_fresh_pyth_v1_oracle`.
-///   - The oracle ↔ market PDA cross-check is dropped (Pyth accounts
-///     aren't ours to PDA). The trade-off is that the caller is
-///     trusted to pass the right Pyth feed; in production you'd pin
-///     the expected Pyth account pubkey on the `Market` struct so the
-///     handler can refuse mismatches.
+///   - The oracle ↔ market PDA cross-check is replaced by the pin: Pyth
+///     accounts aren't ours to PDA, so the oracle must be the account the
+///     market authority pinned with `SetPythFeeds` (tag 34). The reader
+///     checks only bytes, which anyone can write into an account they own.
 ///
 /// Payload (same as PlaceOrderChecked): [side u8][price u64 LE][size u64 LE]
 ///
@@ -1886,6 +1896,17 @@ fn process_place_order_checked_pyth(
             return Err(ProgramError::UninitializedAccount);
         }
         if market.quote_mint != *mint_ai.key.as_ref() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        // The feed must be the one the market pinned (SetPythFeeds): the
+        // reader below checks only the bytes, and anyone can write Pyth-
+        // shaped bytes into an account they own.
+        if market.pyth_v1_price_account == [0u8; 32] {
+            msg!("place_order_checked_pyth: market has no Pyth v1 feed pinned");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if *pyth_ai.key.as_ref() != market.pyth_v1_price_account {
+            msg!("place_order_checked_pyth: oracle is not the market's pinned Pyth v1 feed");
             return Err(ProgramError::InvalidAccountData);
         }
     }
@@ -2044,6 +2065,27 @@ fn process_place_order_checked_pyth_v2(
         }
         if market.quote_mint != *mint_ai.key.as_ref() {
             return Err(ProgramError::InvalidAccountData);
+        }
+        // The update must come from the receiver program the market pinned
+        // and carry the market's feed id (SetPythFeeds): the discriminator
+        // proves only the shape, and anyone can write that shape.
+        if market.pyth_v2_receiver == [0u8; 32] {
+            msg!("place_order_checked_pyth_v2: market has no Pyth v2 feed pinned");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if *pyth_ai.owner.as_ref() != market.pyth_v2_receiver {
+            msg!("place_order_checked_pyth_v2: price update not owned by the pinned receiver");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let data = pyth_ai.try_borrow_data()?;
+        match openhl_oracle::pyth_v2::parse(&data) {
+            Ok(u) if u.feed_id == market.pyth_v2_feed_id => {}
+            Ok(_) => {
+                msg!("place_order_checked_pyth_v2: price update is for another feed");
+                return Err(ProgramError::InvalidAccountData);
+            }
+            // The reader below reports a malformed update.
+            Err(_) => {}
         }
     }
     verify_fee_vault_token_account(fee_vault_ai, mint_ai.key, program_id)?;
@@ -4914,5 +4956,49 @@ fn process_slab_match(
         remaining,
         slab.active_count
     );
+    Ok(())
+}
+
+// =============================================================================
+// SetPythFeeds — pin a market's Pyth feeds (Chapter 9 §9.5).
+// =============================================================================
+
+const SET_PYTH_FEEDS_PAYLOAD_LEN: usize = 32 + 32 + 32;
+
+/// Payload: [v1 price account 32][v2 receiver program 32][v2 feed id 32].
+/// All-zero clears a pin.
+///
+/// Accounts:
+///   0. `[SIGNER]` authority — must equal `market.authority`
+///   1. `[WRITE]`  market
+fn process_set_pyth_feeds(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    if payload.len() != SET_PYTH_FEEDS_PAYLOAD_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let authority_ai = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let market_ai = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    if !authority_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if market_ai.owner != program_id || market_ai.data_len() != Market::LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let mut data = market_ai.try_borrow_mut_data()?;
+    let market: &mut Market = bytemuck::from_bytes_mut(&mut data[..Market::LEN]);
+    if market.discriminator != MARKET_DISCRIMINATOR {
+        return Err(ProgramError::UninitializedAccount);
+    }
+    if market.authority != *authority_ai.key.as_ref() {
+        msg!("set_pyth_feeds: caller is not the market authority");
+        return Err(ProgramError::IllegalOwner);
+    }
+    market.pyth_v1_price_account.copy_from_slice(&payload[0..32]);
+    market.pyth_v2_receiver.copy_from_slice(&payload[32..64]);
+    market.pyth_v2_feed_id.copy_from_slice(&payload[64..96]);
+    msg!("set_pyth_feeds: pinned for market {}", market_ai.key);
     Ok(())
 }

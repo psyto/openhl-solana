@@ -107,6 +107,7 @@ pub(crate) fn run_instruction_dispatch_demo_structured() -> InstructionDispatchD
         entry(31, "SlabMatch",                     "order",     "Cross Slab resting orders with a market order"),
         entry(32, "PlaceOrderCheckedPyth",         "order",     "Place an order checked against legacy Pyth oracle"),
         entry(33, "PlaceOrderCheckedPythV2",       "order",     "Place an order checked against Pyth V2 PriceUpdate"),
+        entry(34, "SetPythFeeds",                  "bring-up",  "Pin the market's Pyth v1 account and v2 receiver + feed id"),
     ];
     InstructionDispatchDemoResult { entries }
 }
@@ -150,7 +151,7 @@ pub(crate) fn run_instruction_dispatch_demo_cli() {
     }
     println!();
     println!("    Takeaway: openhl-core packs a complete perp DEX into a single");
-    println!("    34-instruction program. Half are bring-up; the rest are the");
+    println!("    35-instruction program. Half are bring-up; the rest are the");
     println!("    operational surface a perp trader actually touches.");
     println!();
 }
@@ -160,9 +161,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dispatch_table_has_thirty_four_entries() {
+    fn dispatch_table_has_thirty_five_entries() {
         let r = run_instruction_dispatch_demo_structured();
-        assert_eq!(r.total_instructions(), 34);
+        assert_eq!(r.total_instructions(), 35);
     }
 
     #[test]
@@ -172,12 +173,12 @@ mod tests {
     }
 
     #[test]
-    fn tags_are_contiguous_zero_to_thirty_three() {
+    fn tags_are_contiguous_zero_to_thirty_four() {
         let r = run_instruction_dispatch_demo_structured();
-        for i in 0..=33u8 {
+        for i in 0..=34u8 {
             assert!(r.find_tag(i).is_some(), "missing tag {i}");
         }
-        assert_eq!(r.max_tag(), 33);
+        assert_eq!(r.max_tag(), 34);
     }
 
     #[test]
@@ -190,6 +191,7 @@ mod tests {
         assert_eq!(r.find_tag(18).unwrap().name, "Liquidate");
         assert_eq!(r.find_tag(31).unwrap().name, "SlabMatch");
         assert_eq!(r.find_tag(33).unwrap().name, "PlaceOrderCheckedPythV2");
+        assert_eq!(r.find_tag(34).unwrap().name, "SetPythFeeds");
     }
 
     #[test]

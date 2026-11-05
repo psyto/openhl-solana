@@ -1,7 +1,7 @@
 # 第9章 — オラクル取り込み: Pyth 内部
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Oracle`、加えて §9.5 のための Pyth v1 と v2 のレイアウト定数）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_oracle`、`process_set_oracle_price`、`process_place_order_checked`、`process_place_order_checked_pyth`、`process_place_order_checked_pyth_v2`、ヘルパ `read_fresh_oracle` / `read_fresh_pyth_v1_oracle` / `read_fresh_pyth_v2_oracle`）、[`scripts/oracle/src/main.rs`](../../scripts/oracle/src/main.rs)。
+> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Oracle`、加えて §9.5 のための Pyth v1 と v2 のレイアウト定数）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_oracle`、`process_set_oracle_price`、`process_place_order_checked`、`process_place_order_checked_pyth`、`process_place_order_checked_pyth_v2`、ヘルパ `read_fresh_oracle` / `read_fresh_pyth_v1_oracle` / `read_fresh_pyth_v2_oracle`）、[`scripts/oracle/src/main.rs`](../../scripts/oracle/src/main.rs)、[`programs/openhl-core/tests/pyth_binding.rs`](../../programs/openhl-core/tests/pyth_binding.rs)（§9.5 のフィード固定のテスト）。
 > 参照対象: Pyth Network mainnet プログラム（`FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH`）、Switchboard On-Demand。
 >
 > 部品化に伴い、この章で読むロジックは [`crates/oracle/src/lib.rs`](../../crates/oracle/src/lib.rs)(`openhl-oracle`)に移り、プログラムはそれを呼び出す。以下に引用するコードは分割前の `programs/openhl-core/src/lib.rs` の版で、行番号は追従していない。
@@ -263,7 +263,7 @@ fn read_fresh_pyth_v1_oracle(oracle_ai: &AccountInfo) -> Result<u64, ProgramErro
 
 フラグすべき設計判断 4 つ:
 
-**1. Pyth アカウントに所有者チェックなし。** モックパスは `oracle_ai.owner == program_id` を要求するが、ここでは意図的に `oracle_ai.owner == &pyth_program::ID` を**要求しない**。Pyth プログラム ID をハードコードすると mainnet 対 devnet の選択を最初から強いる（mainnet は `FsJ3...epH`、devnet は `gSbE...92s`）、加えて magic+version+atype ガントレットがすでにアカウントが Pyth v1 PriceAccount であることを構造的に保証する。本番デプロイでは (a) 期待される Pyth プログラム ID を `Market` 構造体に固定するか、(b) 期待される Pyth アカウントの**pubkey** を `Market` に固定する — 選択 (b) は呼び出し側が間違った資産の Pyth フィードを差し替えるのを防ぐので、より tight だ。
+**1. リーダーはバイトを確かめ、ハンドラはどのアカウントかを確かめる。** モックパスは `oracle_ai.owner == program_id` を要求するが、ここのリーダーには所有者の検査がない。この章の最初の版は、検査は要らないと書いていた。「magic+version+atype ガントレットがすでにアカウントが Pyth v1 PriceAccount であることを構造的に保証する」からだ、と。保証しない。誰でも自分が所有するアカウントを作り、magic、version、account type、Trading の status、好きな価格を書き込んで渡せる。`programs/openhl-core/tests/pyth_binding.rs` のテスト `pyth_v1_reads_only_the_pinned_price_account` はまさにそれをやり、呼び出し側が選んだ価格に対して注文が通った。Pyth プログラム ID をハードコードすると mainnet 対 devnet の選択を最初から強いる(mainnet は `FsJ3...epH`、devnet は `gSbE...92s`)ので、プログラムは 2 つの選択肢のうち厳しい方を取る。市場が期待する Pyth アカウントの**pubkey** を固定し(`Market.pyth_v1_price_account`。市場の authority が `SetPythFeeds`、タグ 34 で設定する)、`PlaceOrderCheckedPyth` はそれ以外のアカウントを拒否し、何も固定されていない間は無条件に拒否する。固定したアドレスは本物の Pyth アカウントで、Pyth が所有しているので、所有者の問題もそれで片づく。資産を取り違える問題も同じだ。正しく所有された別の組のフィードは、別のアドレスだからだ。
 
 **2. `expo` は読みログするが適用しない。** Pyth 価格は `(mantissa, expo)` ペアで来る — 本物の価格は `mantissa × 10^expo`。USD ペアでは `expo` は典型的に `-8`。モック側に expo はない（本書 `Oracle.price` は market が使うスケールでの u64）ので、本章で 2 パスを相互運用可能に保つため、mantissa を価格として扱い `expo` を観測性のためにログする。本番デプロイは正規化する: 単一サポート `expo` を固定し他を拒否するか、その場でプログラムの固定小数点規約に翻訳するか。これがマイグレーションで本物のバグを書く可能性が最も高い場所; 本章はそれを呼び出して TODO を自分で置けるようにする。
 
@@ -276,7 +276,7 @@ fn read_fresh_pyth_v1_oracle(oracle_ai: &AccountInfo) -> Result<u64, ProgramErro
 ピア命令。`PlaceOrderChecked` と同じペイロード（`[side u8][price u64 LE][size u64 LE]`）、同じ 8 先頭アカウント、2 変更を除く:
 
 - スロット 2 は Pyth v1 PriceAccount、モック `Oracle` ではない（market から oracle PDA クロスチェックはドロップ; Pyth アカウントは PDA 導出対象ではない）。
-- オラクル側ガントレットは `read_fresh_oracle` ではなく `read_fresh_pyth_v1_oracle` を呼ぶ。
+- オラクル側ガントレットは `read_fresh_oracle` ではなく `read_fresh_pyth_v1_oracle` を呼び、その前にハンドラは、スロット 2 が市場の固定した `pyth_v1_price_account` であることを求める(上の設計判断 1)。
 
 下流すべて — サニティバンド、手数料エスクロー、book write — はモックパスと同一。両ハンドラは同じ `SANITY_BAND_BPS`、`PROTOCOL_FEE_BPS`、末尾の同じ `spl_token_transfer_user_signed` Transfer を共有する。マイグレーションの surface は §9.5 が約束したとおり: 局所的。
 
@@ -289,7 +289,7 @@ fn read_fresh_pyth_v1_oracle(oracle_ai: &AccountInfo) -> Result<u64, ProgramErro
 
 その 2 層を混同したら（本セクションの初期ドラフトはした）、v2 はあなたの側に ~2000 行の暗号コードが必要だと結論するだろう。そうではない。Wormhole 作業は Pyth のプログラムに住み、それは共有インフラだ; perp DEX で出荷するのは構造的に v1 リーダーと同じ、ただし異なるアカウント レイアウトに対するもの。
 
-`PlaceOrderCheckedPythV2`（タグ 33）がコンシューマ側を出荷する。リーダー:
+`PlaceOrderCheckedPythV2`（タグ 33）がコンシューマ側を出荷する。リーダーの前に、ハンドラが 2 つの検査をする。リーダーにはできない検査だ。アカウントは市場が固定した receiver プログラムが所有していなければならず(`Market.pyth_v2_receiver`。その ID はクラスタごとに違うので、定数ではなくデータにする)、その `feed_id` は `Market.pyth_v2_feed_id` と等しくなければならない。1 つ目がなければ、誰でも自分のプログラムから、discriminator まで含めて `PriceUpdateV2` の形のアカウントを書ける。2 つ目がなければ、別の資産の本物の更新が通る(`pyth_v2_reads_only_the_pinned_receiver_and_feed` が両方を試す)。リーダー:
 
 ```rust
 fn read_fresh_pyth_v2_oracle(oracle_ai: &AccountInfo) -> Result<u64, ProgramError> {
@@ -327,7 +327,7 @@ offset | size | field                            | 何に使うか
    8   | 32   | write_authority (Pubkey)         | （無視 — receiver の署名 PDA）
   40   |  1   | verification_level tag           | ログ; 0=Partial、1=Full
   41   |  1   | verification_level.num_signatures| ログ（tag==Partial のときのみ）
-  42   | 32   | price_message.feed_id            | （呼び出し側がオフチェーンで期待 feed を固定）
+  42   | 32   | price_message.feed_id            | == `Market.pyth_v2_feed_id`(ハンドラが確かめる)
   74   |  8   | price_message.price (i64)        | > 0; u64 mark として返す
   82   |  8   | price_message.conf  (u64)        | ログ
   90   |  4   | price_message.exponent (i32)     | ログ; 本番は 10^expo で正規化
@@ -370,7 +370,7 @@ tx = [
 
 これを行うプログラムは典型的に、両方が fresh のときは 2 つを**比較**もする — ある許容（例: 50 bp）を超えて不一致なら呼び出し拒否。Pyth と Switchboard の 50 bp 不一致は通常どちらかが誤っており、ユーザに安い方を選ぶだけのプログラムはゲームされてきた。
 
-> **演習 §9.5.** 本物の Pyth v1 mainnet PriceAccount を選べ（SOL/USD は執筆時点で `H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG` — Pyth の price-feed-ids ページで検証せよ）。ローカル validator の `clone` 機能を使ってそのアカウントをテストクラスタにミラーし、それに対して `PlaceOrderCheckedPyth` を invoke せよ。ログされた `expo` を SOL/USD product と比較せよ（`-8` のはず）。Staleness ガントレットをアカウントの古いスロットをアーカイブから再生して確認せよ。
+> **演習 §9.5.** 本物の Pyth v1 mainnet PriceAccount を選べ（SOL/USD は執筆時点で `H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG` — Pyth の price-feed-ids ページで検証せよ）。ローカル validator の `clone` 機能を使ってそのアカウントをテストクラスタにミラーし、市場の authority の署名で `SetPythFeeds` によりそれを市場に固定してから、それに対して `PlaceOrderCheckedPyth` を invoke せよ。次に、設計判断 1 が述べる攻撃を試せ。アカウントのバイトを自分が所有するアカウントに写して、そちらを渡す。`oracle is not the market's pinned Pyth v1 feed` で失敗するはずだ。ログされた `expo` を SOL/USD product と比較せよ（`-8` のはず）。Staleness ガントレットをアカウントの古いスロットをアーカイブから再生して確認せよ。
 
 ---
 

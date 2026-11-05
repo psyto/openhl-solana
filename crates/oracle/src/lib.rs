@@ -138,7 +138,8 @@ pub mod pyth_v1 {
 pub mod pyth_v2 {
     use super::{u32_at, u64_at};
     use openhl_state::{
-        PYTH_V2_MIN_LEN, PYTH_V2_OFFSET_CONF, PYTH_V2_OFFSET_EXPONENT, PYTH_V2_OFFSET_POSTED_SLOT,
+        PYTH_V2_MIN_LEN, PYTH_V2_OFFSET_CONF, PYTH_V2_OFFSET_EXPONENT, PYTH_V2_OFFSET_FEED_ID,
+        PYTH_V2_OFFSET_POSTED_SLOT,
         PYTH_V2_OFFSET_PRICE, PYTH_V2_OFFSET_PUBLISH_TIME, PYTH_V2_OFFSET_VERIFICATION_LEVEL,
         PYTH_V2_OFFSET_VERIFICATION_NUM_SIGS, PYTH_V2_PRICE_UPDATE_DISCRIMINATOR,
         PYTH_V2_VERIFICATION_FULL, PYTH_V2_VERIFICATION_PARTIAL,
@@ -155,6 +156,9 @@ pub mod pyth_v2 {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct PriceUpdate {
         pub verification_level: VerificationLevel,
+        /// Which price this is (one id per asset pair); a reader should
+        /// compare it with the feed it expects.
+        pub feed_id: [u8; 32],
         /// Mantissa; the value is `price * 10^exponent`.
         pub price: i64,
         pub conf: u64,
@@ -198,8 +202,12 @@ pub mod pyth_v2 {
         } else {
             return Err(Error::UnknownVerificationLevel(tag));
         };
+        let mut feed_id = [0u8; 32];
+        let at = PYTH_V2_OFFSET_FEED_ID - shift;
+        feed_id.copy_from_slice(&data[at..at + 32]);
         Ok(PriceUpdate {
             verification_level,
+            feed_id,
             price: u64_at(data, PYTH_V2_OFFSET_PRICE - shift) as i64,
             conf: u64_at(data, PYTH_V2_OFFSET_CONF - shift),
             exponent: u32_at(data, PYTH_V2_OFFSET_EXPONENT - shift) as i32,
@@ -286,7 +294,8 @@ mod tests {
             d[at + 1] = 13;
             at += 2;
         }
-        at += 32; // feed_id
+        d[at..at + 32].copy_from_slice(&[0xab; 32]); // feed_id
+        at += 32;
         d[at..at + 8].copy_from_slice(&6_000_000i64.to_le_bytes());
         d[at + 8..at + 16].copy_from_slice(&1_500u64.to_le_bytes());
         d[at + 16..at + 20].copy_from_slice(&(-8i32).to_le_bytes());
@@ -310,6 +319,7 @@ mod tests {
                 u,
                 pyth_v2::PriceUpdate {
                     verification_level: level,
+                    feed_id: [0xab; 32],
                     price: 6_000_000,
                     conf: 1_500,
                     exponent: -8,
