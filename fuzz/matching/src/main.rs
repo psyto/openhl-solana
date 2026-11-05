@@ -6,6 +6,10 @@
 //! `max_fills` the fuzzer picks, with a CU cap of `MATCH_CU_CAP` (cu-dos):
 //! how much can one taker make a match cost? (cu-dos restores the book
 //! after each attempt, so every attempt sees the same full book.)
+//!
+//! Its tests also measure Chapter 7's `place_order` and `cancel_order` on
+//! the same book (`ch7_grid`) and pin the cancel owner rule, which an account
+//! swap cannot reach (`cancel_refuses_another_users_order`).
 
 use crucible_fuzzer::*;
 use solana_instruction::{AccountMeta, Instruction};
@@ -25,6 +29,7 @@ const SYSTEM_ID: Pubkey = Pubkey::new_from_array([0u8; 32]);
 const IX_CREATE_MARKET: u8 = 1;
 const IX_CREATE_ORDER_BOOK: u8 = 7;
 const IX_PLACE_ORDER: u8 = 8;
+const IX_CANCEL_ORDER: u8 = 9;
 const IX_MATCH: u8 = 10;
 
 const BID: u8 = 0;
@@ -255,6 +260,61 @@ mod tests {
         let a = f.try_cu(8);
         let b = f.try_cu(8);
         println!("GRID book=32 two pages of 8: {a:?} + {b:?}");
+    }
+
+    /// Only the order's placer may cancel it (Chapter 7 §7.4). The order is
+    /// named by its id in the instruction data, not by an account, so an
+    /// account swap cannot reach this check; this test does.
+    #[test]
+    fn cancel_refuses_another_users_order() {
+        let mut f = MatchingFixture::with_bids(1);
+        let other = Arc::clone(&f.taker);
+        let book = f.book;
+        let ix = Instruction {
+            program_id: CORE_ID,
+            accounts: vec![AccountMeta::new_readonly(other.pubkey(), true), AccountMeta::new(book, false)],
+            data: cancel_data(1),
+        };
+        let payer = Arc::clone(&f.payer);
+        let out = f.ctx.raw_call(ix).fee_payer(&*payer).signers(&[&*payer, &*other]).send().expect("send");
+        let text = format!("{out:?}");
+        assert!(!out.is_success(), "the taker cancelled the maker's order");
+        assert!(text.contains("caller is not the order owner"), "refused for another reason: {text}");
+    }
+
+    /// Prints the numbers in Chapter 7 §7.3–7.5
+    /// (`cargo test -- --ignored --nocapture ch7_grid`).
+    #[test]
+    #[ignore]
+    fn ch7_grid() {
+        for n in [0usize, 8, 16, 24, 31, 32] {
+            let mut f = MatchingFixture::with_bids(n);
+            let maker = Arc::clone(&f.maker);
+            let ix = Instruction {
+                program_id: CORE_ID,
+                accounts: vec![AccountMeta::new_readonly(maker.pubkey(), true), AccountMeta::new(f.book, false)],
+                data: order_data(BID, 500, 1),
+            };
+            println!("CH7 place into {n}: {:?}", f.cu(ix, maker));
+        }
+        for (n, id, what) in [(32usize, 1u64, "first slot"), (32, 32, "last slot"), (32, 99, "not found")] {
+            let mut f = MatchingFixture::with_bids(n);
+            let maker = Arc::clone(&f.maker);
+            let ix = Instruction {
+                program_id: CORE_ID,
+                accounts: vec![AccountMeta::new_readonly(maker.pubkey(), true), AccountMeta::new(f.book, false)],
+                data: cancel_data(id),
+            };
+            println!("CH7 cancel {what} of {n}: {:?}", f.cu(ix, maker));
+        }
+        println!("CH7 match 5 fills on 32: {:?}", MatchingFixture::with_bids(32).try_cu(5));
+        println!("CH7 match 10 fills on 32: {:?}", MatchingFixture::with_bids(32).try_cu(10));
+    }
+
+    fn cancel_data(id: u64) -> Vec<u8> {
+        let mut d = vec![IX_CANCEL_ORDER];
+        d.extend_from_slice(&id.to_le_bytes());
+        d
     }
 
     impl MatchingFixture {
