@@ -1,7 +1,7 @@
 # 第15章 — Slab 板
 
 > 状態: ドラフト (v0.1)。
-> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Slab`、`OrderNode`、`CritbitTree`、`TreeNode`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（slab ヘルパ + `process_create_slab`、`process_slab_place_order`、`process_slab_match`）、[`scripts/slab/src/main.rs`](../../scripts/slab/src/main.rs)。
+> 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)（`Slab`、`OrderNode`、`CritbitTree`、`TreeNode`）、[`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（slab ヘルパ + `process_create_slab`、`process_slab_place_order`、`process_slab_match`）、[`scripts/slab/src/main.rs`](../../scripts/slab/src/main.rs)、[`fuzz/slab/src/main.rs`](../../fuzz/slab/src/main.rs)（§15.6〜15.7 の solinv ハーネス）。
 >
 > 部品化に伴い、この章で読むロジックは [`crates/slab/src/lib.rs`](../../crates/slab/src/lib.rs)(`openhl-slab`)に移り、プログラムはそれを呼び出す。以下に引用するコードは分割前の `programs/openhl-core/src/lib.rs` の版で、行番号は追従していない。
 
@@ -9,7 +9,7 @@
 
 ## §15.0  はじめに — slab が何を買い、なぜ独立章に値するか
 
-第 7 章はフラット配列の `OrderBook` を出荷した — 32 スロット、insert で空きスロットを線形スキャン、`Match` で価格マッチを線形スキャン。第 8 章はコストを測った: `K = 10` の fill ループで `N = 32` の板に対して概ね `O(K × N)` を走り、settlement の前に板の簿記だけで ~30 KCU を費やす。これは**教育用のベースラインとして**機能する。本番の板としては機能しない — どんな現実的な深さでもスキャンが支配する。
+第 7 章はフラット配列の `OrderBook` を出荷した — 32 スロット、insert で空きスロットを線形スキャン、`Match` で価格マッチを線形スキャン。第 8 章はコストを測った: `K = 10` の fill ループで `N = 32` の板に対して概ね `O(K × N)` を走り、settlement の前に板の簿記だけで約 22 KCU を費やす(測り直した値。§8.2)。これは**教育用のベースラインとして**機能する。本番の板としては機能しない — どんな現実的な深さでもスキャンが支配する。
 
 Hyperliquid と Serum / Phoenix の答えは **slab** だ: 価格水準の上で自己バランスする木で、各葉がその価格水準のオーダの FIFO を持つ。Insert は価格水準ごとに O(log N)。Best-price は O(log N) — 求める側に向かって root から歩く。Best を pop するのは最悪 O(log N)（水準が空になり葉を木から削除する必要がある場合。葉の上の inner が冗長になり、葉と一緒に折りたたまれる）。§8.4 の擬似コードがこの章を約束した。これがそれだ。
 
@@ -25,7 +25,7 @@ Hyperliquid と Serum / Phoenix の答えは **slab** だ: 価格水準の上で
 
 - **Match エンジン外科手術の章ではない。** slab の `SlabMatch` は第 8 章と同じ fill-loop の形を走る — 変わったのは maker 側にどう到達するか（O(N) でなく O(log N)）だけで、fill がどう会計されるかは変わらない。Settlement、手数料、builder split — どれもここには住まない。
 - **すべての critbit バリアントのガイドではない。** Serum の slab は葉と inner を識別子ビット付きで同じノードプールにパックする; Phoenix はわずかに違うレイアウトを per-level FIFO 会計構造で使う。本章は §8.4 の分割 — OrderNode プール 1 つ、TreeNode プール side ごとに 1 つ — に従う。それが教育的議論を最もクリーンに保つからだ。他のレイアウトはヘッダの数百バイトとアクセスのわずかな高速化を取引する。
-- **ベンチマークではない。** 第 8 章はフラット板を測った; 現実的な深さ（>100 水準）で slab をそれに対してベンチするのはフォローアップに属する。§8.4 の擬似コードは N ≈ 8 を超えるとあらゆる次元で slab が勝つと予測する。
+- **完全なベンチマークではない。** §15.6 に、このプログラムで許される大きさでの両方の板の実測値を載せた。本番の深さや settlement の CPI を含めた調査はフォローアップに属する。
 
 ---
 
@@ -345,15 +345,21 @@ fn critbit_remove_leaf(tree: &mut CritbitTree, leaf_idx: u16) -> ProgramResult {
 
 `process_slab_match`（タグ 31）は `[taker_side u8][price u64 LE][size u64 LE][max_fills u8]` を読む — 第 8 章の `Match` と同一。検証、上の fill ループ実行、`fills` + `remaining` をログしてページング cap を可視にする。第 8 章が導入した同じ `max_fills` セマンティクスがここでもそのまま適用される: slab は依然として CU で境界される、はるかに高い実効 N で。
 
-CU 形状（概ね、ログオーバーヘッドについての通常の警告付き）:
+CU 形状(実測):
 
-| op             | フラット (ch.7/8) | slab (ch.15)  |
-|----------------|---------------|---------------|
-| place          | ~1 KCU        | ~3–4 KCU      |
-| match (10 fill)| ~30 KCU       | ~15–20 KCU    |
-| cancel         | ~1 KCU        | ~3–5 KCU      |
+| op | フラット (ch.7/8) | slab (ch.15) |
+|---|---|---|
+| place、空の板 | 2,357 | 1,788 |
+| place、ほぼ満杯の板 | 2,446(31 注文) | 1,954(1,023 注文、128 水準)。2,008(127 水準に新しい水準を足す) |
+| match、10 fill | 22,250(32 注文) | 14,553(10 注文)〜15,818(128 注文、1 水準に 1 つ)。14,284(1,024 注文) |
+| match、4 fill | 8,147(4 注文)、8,500(8)、9,276(16) | 6,597(4)、6,784(8)、6,793(16) |
+| cancel | 1,994〜2,169 | 未実装(演習 §15.6) |
 
-Slab は place ごと**より**高価だ、木歩き + node alloc が線形スキャンより多くのコードだから。Match は**より**安い、maker-find がフラット板のコストを支配するから。`Match` の crossover はおよそ `N ≈ 8` 付近 — それ以下では生 CU でフラット板が勝つ、それ以上では slab がますます大きなマージンで勝つ。
+(`fuzz/slab` の `grid` テストで、LiteSVM 上で測った。注文はサイズ 1 の買い。LiteSVM が `solana-test-validator` と同じに数えることは第 4 章 §4.5 で確かめた。)
+
+この表の以前の版は測る前に書かれていて、slab は place あたり高い(1 KCU に対して約 3〜4 KCU)、`Match` は約 8 注文未満ならフラット板が勝つ、と書いていた。どちらも成り立たなかった。slab は place あたり安かった。差の内訳は分けていないが、フラット板の insert は空きスロットを探してスロットを走査する。`Match` でも、試したどの大きさでも、4 注文まで下げても slab が安かった。成り立つのは形のほうだ。10 fill は 10 注文でも 1,024 注文でもほぼ同じ値段で、各 fill がたどるのは全注文ではなく、高々約 128 水準の木(log₂ 128 = 7)だからだ。
+
+ただし深さからは見えないことが 1 つ値段を左右する。1 つの水準にいくつの注文があるかだ。fill のたびに水準が空になると、葉の削除(§15.5)が毎回走る。64 fill は、128 価格に 128 注文で 92,122 CU、128 価格に 1,024 注文(1 水準に 8 つ)で 83,871 だった。
 
 > **演習 §15.6.** `SlabCancelOrder` 命令を追加せよ。`(order_id, side, price)` を取り、特定の価格水準から特定のオーダを取り除く。ヒント: 構築したままの slab は `order_id` でオーダをインデックスしないので、正しいものを見つけるには水準の FIFO を歩く必要がある。`price` 引数が重要な理由は何か — それは木全体を歩くことに対して何を節約するか?
 
@@ -421,13 +427,37 @@ BID-taker、limit=110、size=25、max_fills=3 を Match:
 2. **枯れた水準がその葉を綺麗に取り除く。** 価格 100 で 2 オーダを insert（同じ水準）。`SlabMatch` で両方 cross-match。Slab dump はアクティブオーダ 0 を、bid 100 の葉はなくなったことを示すはず（`describe_best` は `(empty)` を返す）。木の `free_head` は進んでいるはず（葉とその親 inner が free list に戻った — 100 が唯一の水準だった場合を除く。その場合は葉だけが戻り親は存在しなかった）。
 3. **`active_count` 不変条件。** Place + match + cancel の任意のシーケンス後、`active_count` は `nodes[i].size > 0` の実際の count（ライブオーダ）に等しいはず。Slab dump が `active_count` を直接 print する; プール歩きでカウントするのは追加スクリプトパス 1 つ。ここで乖離を見つけることはどこかでカウンタが更新されなかったことを意味する — 潜在バグ。
 
+
+### 高くつくマッチを道具に探させる
+
+第 8 章 §8.6 では、満杯の板が CU の上限に収まるようフラットなマッチャの `max_fills` を制限し、その上限は板が大きくなるほど下げなければならない理由を示した。[`fuzz/slab/`](../../fuzz/slab) は `SlabMatch` に同じ問いを投げる。上限は 100,000 CU(`SLAB_MATCH_CU_CAP`)で、slab がその大きさで最も高くつく形、つまり 128 価格に 128 の買い注文を置き、fill のたびに水準も 1 つ消えるようにする。(片側の木が持てる水準は約 128 で、1 水準の注文が多いほど fill あたりは安い。)第 3 章 §3.7 のとおり準備してから:
+
+```bash
+cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
+cd fuzz/slab
+cargo build --release --features invariant_ch15
+cargo test --release --features invariant_ch15      # 10 fill は 32 注文でも 1,024 注文でも同じ値段
+timeout -s INT 60 crucible run openhl_slab_fuzz invariant_ch15 \
+    --binary-in target/release/invariant_test --timeout 45
+```
+
+> **演習 §15.7.** 走らせよ。次のような行が出るはずだ:
+>
+> ```
+> [FUZZ_FINDING] [cu-dos:…] ix slab_match consumed 179643 CU (cap 100000)
+> ```
+>
+> 第 8 章と同じく、上限を決めるのはプログラムだ。`grid` の数値から、この形が 100,000 に収まる `max_fills` の最大はいくつか。その検査を `process_slab_match` に足し、作り直してもう一度走らせよ。
+>
+> 私たちの測定では 69 fill で 99,037 CU、70 fill で 100,469 だったので 69。`if max_fills > 69` を入れると、fuzzer は 45 秒で何も見つけなかった。第 8 章との違いは、その数が何に依存するかだ。フラット板の上限は、`ORDER_CAPACITY` を上げるたびに下げなければならなかった。fill のたびに全スロットを走査するからだ。slab の 69 は、プールが何注文を持つかには依存せず、水準を空にする fill の値段と、片側が持てる約 128 水準で上限のある木の深さにだけ依存する。1 水準に 8 注文の 1,024 注文の slab なら、69 fill はもっと安い(100,000 に 76 まで収まる)。そして上限がなければ、既定のバジェットを超えるマッチは今もありうる。満杯の slab で 255 fill は 200,000 に収まらなかった。
+
 ---
 
 ## ここにない（意図的に）
 
 これは実装章であり比較章ではない。書かなかったもの:
 
-- 異なる N で slab vs flat の真っ向対決ベンチマーク。N ≈ 8 でのコスト crossover は本物; 正確に測るのはフォローアップ。
+- `fuzz/slab` の `grid` テスト(§15.6)を超えるベンチマーク: 本番の深さ、settlement の CPI、slab での cancel。
 - Serum の slab vs Phoenix の slab vs 本書のサイドバイサイド。両方の本番 slab は本書が持たない機能を持つ（Serum のオーダブックは cancel-on-disconnect タグを保存する; Phoenix は独自の market-maker reservation スロットを持つ）、公平な比較はそれ自体の章になる。
 - フラット板から slab 板への移行ガイド。2 つのアカウント型は独立 — オンチェーン変換はない。`OrderBook`（第 7 章）の上に建てた market と `Slab`（本章）の上に建てた market は同じプログラムで共存できる。
 

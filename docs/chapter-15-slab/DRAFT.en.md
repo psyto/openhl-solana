@@ -1,7 +1,7 @@
 # Chapter 15 — Slab Order Book
 
 > Status: draft (v0.1).
-> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Slab`, `OrderNode`, `CritbitTree`, `TreeNode`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (slab helpers + `process_create_slab`, `process_slab_place_order`, `process_slab_match`), [`scripts/slab/src/main.rs`](../../scripts/slab/src/main.rs).
+> Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs) (`Slab`, `OrderNode`, `CritbitTree`, `TreeNode`), [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (slab helpers + `process_create_slab`, `process_slab_place_order`, `process_slab_match`), [`scripts/slab/src/main.rs`](../../scripts/slab/src/main.rs), [`fuzz/slab/src/main.rs`](../../fuzz/slab/src/main.rs) (the solinv harness for §15.6–15.7).
 >
 > Since the parts split, the logic this chapter walks through lives in [`crates/slab/src/lib.rs`](../../crates/slab/src/lib.rs) (`openhl-slab`); the program calls it. The code quoted below is the pre-split version from `programs/openhl-core/src/lib.rs`, and its line numbers are not kept in sync.
 
@@ -9,7 +9,7 @@
 
 ## §15.0  Framing — what the slab buys, and why it deserved its own chapter
 
-Chapter 7 shipped a flat-array `OrderBook` — 32 slots, linear-scan for an empty slot on insert, linear-scan for a price-match in `Match`. Chapter 8 measured the cost: a `K = 10` fill loop against a `N = 32` book runs ~`O(K × N)` and spends ~30 KCU just on book bookkeeping before any settlement runs. That works *as a teaching baseline*. It does not work as a production book — the scan dominates for any realistic depth.
+Chapter 7 shipped a flat-array `OrderBook` — 32 slots, linear-scan for an empty slot on insert, linear-scan for a price-match in `Match`. Chapter 8 measured the cost: a `K = 10` fill loop against a `N = 32` book runs ~`O(K × N)` and spends about 22 KCU (re-measured; §8.2) just on book bookkeeping before any settlement runs. That works *as a teaching baseline*. It does not work as a production book — the scan dominates for any realistic depth.
 
 The Hyperliquid and Serum / Phoenix answer is a **slab**: a self-balancing tree over price levels, with each leaf holding a FIFO of orders at that price. Insert is O(log N) by price level. Best-price is O(log N) — walk root toward the side you want. Pop-the-best is O(log N) in the worst case (a level empties and the leaf has to be removed; an inner node above it goes redundant and collapses with it). The §8.4 pseudocode promised this chapter; here it is.
 
@@ -25,7 +25,7 @@ Three things this chapter is *not* about:
 
 - **It is not a Match-engine surgery chapter.** The slab's `SlabMatch` runs the same fill-loop shape as Chapter 8 — the change is in how the maker side is reached (O(log N) instead of O(N)), not in how a fill is accounted. Settlement, fees, builder splits — none of that lives here.
 - **It is not a guide to every critbit variant.** Serum's slab packs leaves and inners into the same node pool with discriminator bits; Phoenix uses a slightly different layout with a separate per-level FIFO accounting struct. Ours follows §8.4's split — one OrderNode pool, one TreeNode pool per side — because the split makes the pedagogical argument cleanest. Other layouts trade a few hundred bytes of header for slightly faster access.
-- **It is not a benchmark.** Chapter 8 measured the flat book; benchmarking the slab against it under realistic depth (>100 levels) belongs in a follow-up. The pseudocode in §8.4 predicts the slab wins on every dimension above N ≈ 8.
+- **It is not a full benchmark.** §15.6 gives measured numbers for both books at the sizes this program allows; a study at production depth and with settlement CPIs is a follow-up.
 
 ---
 
@@ -345,15 +345,19 @@ The single-leaf root case in step 1 is the only "shape-different" branch. For ev
 
 `process_slab_match` (tag 31) reads `[taker_side u8][price u64 LE][size u64 LE][max_fills u8]` — identical to ch.8's `Match`. Validates, runs the fill loop above, logs `fills` + `remaining` so the pagination cap is visible. The same `max_fills` semantics ch.8 introduced apply here unchanged: the slab is still bounded by CU, just at a much higher effective N.
 
-The CU shapes (rough envelope, with all the usual caveats about logging overhead):
+The CU shapes, measured in LiteSVM with `fuzz/slab`'s `grid` test (size-1 bids; Chapter 4 §4.5 checked that LiteSVM counts like `solana-test-validator`):
 
-| op             | flat (ch.7/8) | slab (ch.15)  |
-|----------------|---------------|---------------|
-| place          | ~1 KCU        | ~3–4 KCU      |
-| match (10 fill)| ~30 KCU       | ~15–20 KCU    |
-| cancel         | ~1 KCU        | ~3–5 KCU      |
+| op | flat (ch.7/8) | slab (ch.15) |
+|---|---|---|
+| place, empty book | 2,357 | 1,788 |
+| place, full-ish book | 2,446 (31 orders) | 1,954 (1,023 orders, 128 levels); 2,008 (a new level among 127) |
+| match, 10 fills | 22,250 (32 orders) | 14,553 (10 orders) to 15,818 (128 orders, one per level); 14,284 (1,024 orders) |
+| match, 4 fills | 8,147 (4 orders), 8,500 (8), 9,276 (16) | 6,597 (4), 6,784 (8), 6,793 (16) |
+| cancel | 1,994–2,169 | not built (Exercise §15.6) |
 
-The slab is *more* expensive per place because the tree walk + node alloc is more code than a linear scan. It's *less* expensive on match because the maker-find dominates the flat book's cost. The crossover for `Match` is around `N ≈ 8` — below that, the flat book wins on raw CU; above, the slab wins by an ever-increasing margin.
+An earlier draft of this table, written before measuring, said the slab costs more per place (about 3–4 KCU against 1 KCU) and that the flat book wins `Match` below about 8 orders. Neither held. The slab was cheaper per place; we did not break the difference down, but the flat insert scans the slots for a free one. And it was cheaper on `Match` at every size we tried, down to 4 orders. What does hold is the shape: 10 fills cost about the same on 10 orders as on 1,024, because each fill walks a tree of at most about 128 levels (log₂ 128 = 7), not every order.
+
+The cost does depend on one thing the depth does not show: how many orders share a level. When each fill empties a level, the leaf removal (§15.5) runs every time: 64 fills cost 92,122 CU on 128 orders at 128 prices, against 83,871 on 1,024 orders at 128 prices (8 per level).
 
 > **Exercise §15.6.** Add a `SlabCancelOrder` instruction that takes `(order_id, side, price)` and removes a specific order from a specific price level. Hint: the slab as built doesn't index orders by `order_id`, so you'll need to walk the level's FIFO to find the right one. Why is the `price` argument important — what does it save you over walking the whole tree?
 
@@ -421,13 +425,37 @@ Match BID-taker, limit=110, size=25, max_fills=3:
 2. **A drained level removes its leaf cleanly.** Insert two orders at price 100 (same level). Cross-match both via `SlabMatch`. The slab dump should show 0 active orders, the bid leaf at 100 should be gone (`describe_best` returns `(empty)`), and the tree's `free_head` should have advanced (a leaf and its parent inner went back on the free list — except when 100 was the only level, in which case only the leaf returns and the parent didn't exist).
 3. **`active_count` invariant.** After any sequence of place + match + cancel, `active_count` should equal the actual count of `nodes[i].size > 0` (i.e., live orders). The slab dump prints `active_count` directly; counting from the pool walk takes one extra script pass. Catching a divergence here means a counter wasn't updated somewhere — a latent bug.
 
+
+### Now let a tool look for the expensive match
+
+Chapter 8 §8.6 capped the flat matcher's `max_fills` so a full book stays under a CU cap, and showed why that cap must shrink as the book grows. [`fuzz/slab/`](../../fuzz/slab) asks the same question of `SlabMatch`, with a cap of 100,000 CU (`SLAB_MATCH_CU_CAP`), on the slab's costliest shape for its size: 128 bids at 128 prices, so every fill also removes a level. (A side's tree holds about 128 levels; more orders per level cost less per fill.) Set up as in Chapter 3 §3.7, then:
+
+```bash
+cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
+cd fuzz/slab
+cargo build --release --features invariant_ch15
+cargo test --release --features invariant_ch15      # 10 fills cost the same at 32 and 1,024 orders
+timeout -s INT 60 crucible run openhl_slab_fuzz invariant_ch15 \
+    --binary-in target/release/invariant_test --timeout 45
+```
+
+> **Exercise §15.7.** Run it. You should see lines like
+>
+> ```
+> [FUZZ_FINDING] [cu-dos:…] ix slab_match consumed 179643 CU (cap 100000)
+> ```
+>
+> As in Chapter 8, the bound is the program's to set. From the `grid` numbers, what is the largest `max_fills` for which this shape stays under 100,000? Add the check to `process_slab_match`, rebuild, and run again.
+>
+> We measured 99,037 CU at 69 fills and 100,469 at 70, so 69, and with `if max_fills > 69` the fuzzer found nothing in 45 seconds. The difference from Chapter 8 is what the number depends on. The flat book's cap had to come down every time `ORDER_CAPACITY` went up, because every fill scans every slot. The slab's 69 does not depend on how many orders the pool holds, only on the cost of a fill that empties a level, and the tree's depth, which is bounded by the roughly 128 levels a side can hold. On a 1,024-order slab with 8 orders per level, 69 fills cost less (76 fit under 100,000). And a match past the default budget is still possible without a cap: 255 fills on a full slab did not fit in 200,000.
+
 ---
 
 ## What's not here (intentionally)
 
 This is an implementation chapter, not a comparison chapter. We didn't write:
 
-- A heads-up benchmark of slab vs flat at varying N. The cost crossover at N ≈ 8 is real; measuring it precisely is a follow-up.
+- A benchmark beyond the `grid` test in `fuzz/slab` (§15.6): production depth, settlement CPIs, and cancel on the slab.
 - A side-by-side of Serum's slab vs Phoenix's slab vs ours. Both production slabs have features ours doesn't (Serum's order book stores cancel-on-disconnect tags; Phoenix has its own market-maker reservation slots), and a fair comparison would be its own chapter.
 - A migration guide from flat books to slab books. The two account types are independent — there's no on-chain conversion. A market built on `OrderBook` (Chapter 7) and a market built on `Slab` (this chapter) can coexist on the same program.
 

@@ -278,7 +278,7 @@ Match on flat book (this chapter):
 Match on slab (Chapter 15, pseudocoded above):
 
   Per fill:    O(log N) tree walk + O(1) FIFO advance  →  O(K × log N) total
-  Per K=16 on ~1024-order book:           ~30 KCU
+  Per K=16 on a 1,024-order slab:          22 KCU (measured, §15.6)
   Failure mode:  pool exhaustion (handle with separate place_order rejection)
 
 
