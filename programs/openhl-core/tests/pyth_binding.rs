@@ -94,15 +94,24 @@ fn pyth_v1_bytes() -> Vec<u8> {
     d
 }
 
-/// A Pyth `PriceUpdateV2`'s bytes (Partial verification) for `feed_id`.
-fn pyth_v2_bytes(feed_id: [u8; 32]) -> Vec<u8> {
+/// A Pyth `PriceUpdateV2`'s bytes for `feed_id`. `full`: Full
+/// verification, otherwise Partial with `sigs` signatures (a Full update is
+/// one byte shorter before the price message).
+fn pyth_v2_bytes(feed_id: [u8; 32], full: bool, sigs: u8) -> Vec<u8> {
     let mut d = vec![0u8; PYTH_V2_MIN_LEN];
     d[0..8].copy_from_slice(&PYTH_V2_PRICE_UPDATE_DISCRIMINATOR);
-    d[PYTH_V2_OFFSET_VERIFICATION_LEVEL] = PYTH_V2_VERIFICATION_PARTIAL;
-    d[PYTH_V2_OFFSET_VERIFICATION_NUM_SIGS] = 13;
-    d[PYTH_V2_OFFSET_FEED_ID..PYTH_V2_OFFSET_FEED_ID + 32].copy_from_slice(&feed_id);
-    put_u64(&mut d, PYTH_V2_OFFSET_PRICE, PRICE as u64);
-    put_u64(&mut d, PYTH_V2_OFFSET_POSTED_SLOT, NOW_SLOT);
+    let shift = if full {
+        d[PYTH_V2_OFFSET_VERIFICATION_LEVEL] = PYTH_V2_VERIFICATION_FULL;
+        1
+    } else {
+        d[PYTH_V2_OFFSET_VERIFICATION_LEVEL] = PYTH_V2_VERIFICATION_PARTIAL;
+        d[PYTH_V2_OFFSET_VERIFICATION_NUM_SIGS] = sigs;
+        0
+    };
+    let at = PYTH_V2_OFFSET_FEED_ID - shift;
+    d[at..at + 32].copy_from_slice(&feed_id);
+    put_u64(&mut d, PYTH_V2_OFFSET_PRICE - shift, PRICE as u64);
+    put_u64(&mut d, PYTH_V2_OFFSET_POSTED_SLOT - shift, NOW_SLOT);
     d
 }
 
@@ -113,9 +122,10 @@ struct Setup {
     market: Pubkey,
     mint: Pubkey,
     authority: Pubkey,
-    /// The Pyth v1 price account and the v2 receiver + feed id the market
-    /// trusts.
+    /// The Pyth v1 price account and its owner, and the v2 receiver + feed
+    /// id, the market trusts.
     v1_feed: Pubkey,
+    pyth_program: Pubkey,
     receiver: Pubkey,
     feed_id: [u8; 32],
 }
@@ -129,6 +139,7 @@ impl Setup {
             mint: Pubkey::new_unique(),
             authority: Pubkey::new_unique(),
             v1_feed: Pubkey::new_unique(),
+            pyth_program: Pubkey::new_unique(),
             receiver: Pubkey::new_unique(),
             feed_id: [7u8; 32],
         }
@@ -141,6 +152,7 @@ impl Setup {
         m.quote_mint = self.mint.to_bytes();
         if pinned {
             m.pyth_v1_price_account = self.v1_feed.to_bytes();
+            m.pyth_v1_program = self.pyth_program.to_bytes();
             m.pyth_v2_receiver = self.receiver.to_bytes();
             m.pyth_v2_feed_id = self.feed_id;
         }
@@ -185,15 +197,17 @@ impl Setup {
 fn pyth_v1_reads_only_the_pinned_price_account() {
     program_stubs::set_syscall_stubs(Box::new(Stubs));
     let s = Setup::new();
-    // The pinned account is owned by Pyth in production; the handler pins
-    // its address, so its owner does not matter here.
-    let real = acc(s.v1_feed, Pubkey::new_unique(), pyth_v1_bytes());
+    let real = acc(s.v1_feed, s.pyth_program, pyth_v1_bytes());
     assert_eq!(s.place(32, real, true), Ok(()));
     // Same bytes, written into an account an attacker owns.
     let fake = acc(Pubkey::new_unique(), Pubkey::new_unique(), pyth_v1_bytes());
     assert_eq!(s.place(32, fake, true), Err(ProgramError::InvalidAccountData));
+    // The pinned address, but owned by someone else: what a closed and
+    // recreated account would look like.
+    let recreated = acc(s.v1_feed, Pubkey::new_unique(), pyth_v1_bytes());
+    assert_eq!(s.place(32, recreated, true), Err(ProgramError::InvalidAccountData));
     // No feed pinned yet: refuse rather than trust any account.
-    let real = acc(s.v1_feed, Pubkey::new_unique(), pyth_v1_bytes());
+    let real = acc(s.v1_feed, s.pyth_program, pyth_v1_bytes());
     assert_eq!(s.place(32, real, false), Err(ProgramError::InvalidAccountData));
 }
 
@@ -201,16 +215,17 @@ fn pyth_v1_reads_only_the_pinned_price_account() {
 fn pyth_v2_reads_only_the_pinned_receiver_and_feed() {
     program_stubs::set_syscall_stubs(Box::new(Stubs));
     let s = Setup::new();
-    let real = acc(Pubkey::new_unique(), s.receiver, pyth_v2_bytes(s.feed_id));
-    assert_eq!(s.place(33, real, true), Ok(()));
+    let v2 = |owner: Pubkey, feed: [u8; 32], full: bool, sigs: u8| acc(Pubkey::new_unique(), owner, pyth_v2_bytes(feed, full, sigs));
+    assert_eq!(s.place(33, v2(s.receiver, s.feed_id, true, 0), true), Ok(()));
     // A PriceUpdateV2-shaped account written by some other program.
-    let other_owner = acc(Pubkey::new_unique(), Pubkey::new_unique(), pyth_v2_bytes(s.feed_id));
-    assert_eq!(s.place(33, other_owner, true), Err(ProgramError::InvalidAccountData));
+    assert_eq!(s.place(33, v2(Pubkey::new_unique(), s.feed_id, true, 0), true), Err(ProgramError::InvalidAccountData));
     // A real receiver account, but for another asset's feed.
-    let other_feed = acc(Pubkey::new_unique(), s.receiver, pyth_v2_bytes([9u8; 32]));
-    assert_eq!(s.place(33, other_feed, true), Err(ProgramError::InvalidAccountData));
-    let real = acc(Pubkey::new_unique(), s.receiver, pyth_v2_bytes(s.feed_id));
-    assert_eq!(s.place(33, real, false), Err(ProgramError::InvalidAccountData));
+    assert_eq!(s.place(33, v2(s.receiver, [9u8; 32], true, 0), true), Err(ProgramError::InvalidAccountData));
+    // Partially verified updates, with no or some guardian signatures.
+    for sigs in [0u8, 13] {
+        assert_eq!(s.place(33, v2(s.receiver, s.feed_id, false, sigs), true), Err(ProgramError::InvalidAccountData));
+    }
+    assert_eq!(s.place(33, v2(s.receiver, s.feed_id, true, 0), false), Err(ProgramError::InvalidAccountData));
 }
 
 #[test]
@@ -219,6 +234,7 @@ fn only_the_market_authority_pins_feeds() {
     let s = Setup::new();
     let mut payload = vec![34u8];
     payload.extend_from_slice(s.v1_feed.as_ref());
+    payload.extend_from_slice(s.pyth_program.as_ref());
     payload.extend_from_slice(s.receiver.as_ref());
     payload.extend_from_slice(&s.feed_id);
     for (signer, want) in [
@@ -235,6 +251,7 @@ fn only_the_market_authority_pins_feeds() {
         assert_eq!(run(&s.program_id, &mut accs, &payload), want);
         let m: &Market = bytemuck::from_bytes(&accs[1].data);
         let pinned = m.pyth_v1_price_account == s.v1_feed.to_bytes()
+            && m.pyth_v1_program == s.pyth_program.to_bytes()
             && m.pyth_v2_receiver == s.receiver.to_bytes()
             && m.pyth_v2_feed_id == s.feed_id;
         assert_eq!(pinned, want.is_ok());

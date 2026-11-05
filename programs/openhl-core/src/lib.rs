@@ -152,9 +152,9 @@
 //!                           verification — we don't verify, we
 //!                           just consume).
 //!  34  SetPythFeeds           — Chapter 9 §9.5. The market authority
-//!                           pins the Pyth v1 account and the v2
-//!                           receiver + feed id that tags 32 and 33
-//!                           accept; until then they refuse.
+//!                           pins the Pyth v1 account and its owner,
+//!                           and the v2 receiver + feed id, that tags
+//!                           32 and 33 accept; until then they refuse.
 //!
 //! The entire program is one file on purpose. Splitting it into the usual
 //! `instruction.rs` / `processor.rs` / `state.rs` modules buys nothing
@@ -512,9 +512,9 @@ fn process_initialize(
     market.tick_size = tick_size;
     market.lot_size = lot_size;
     market.pyth_v1_price_account = [0u8; 32];
+    market.pyth_v1_program = [0u8; 32];
     market.pyth_v2_receiver = [0u8; 32];
     market.pyth_v2_feed_id = [0u8; 32];
-    market._reserved = [0u8; 32];
 
     msg!("market initialized");
     Ok(())
@@ -659,9 +659,9 @@ fn process_create_market(
     market.tick_size = tick_size;
     market.lot_size = lot_size;
     market.pyth_v1_price_account = [0u8; 32];
+    market.pyth_v1_program = [0u8; 32];
     market.pyth_v2_receiver = [0u8; 32];
     market.pyth_v2_feed_id = [0u8; 32];
-    market._reserved = [0u8; 32];
 
     msg!("market created at PDA (bump {})", bump);
     Ok(())
@@ -1820,8 +1820,9 @@ fn process_place_order_checked(
 ///     mock `Oracle`. Validated via `read_fresh_pyth_v1_oracle`.
 ///   - The oracle ↔ market PDA cross-check is replaced by the pin: Pyth
 ///     accounts aren't ours to PDA, so the oracle must be the account the
-///     market authority pinned with `SetPythFeeds` (tag 34). The reader
-///     checks only bytes, which anyone can write into an account they own.
+///     market authority pinned with `SetPythFeeds` (tag 34), still owned
+///     by the pinned Pyth program. The reader checks only bytes, which
+///     anyone can write into an account they own.
 ///
 /// Payload (same as PlaceOrderChecked): [side u8][price u64 LE][size u64 LE]
 ///
@@ -1907,6 +1908,13 @@ fn process_place_order_checked_pyth(
         }
         if *pyth_ai.key.as_ref() != market.pyth_v1_price_account {
             msg!("place_order_checked_pyth: oracle is not the market's pinned Pyth v1 feed");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        // And it must still be owned by Pyth's program: an account at the
+        // pinned address that was closed and recreated by someone else
+        // would pass the address check alone.
+        if *pyth_ai.owner.as_ref() != market.pyth_v1_program {
+            msg!("place_order_checked_pyth: pinned feed not owned by the pinned Pyth program");
             return Err(ProgramError::InvalidAccountData);
         }
     }
@@ -2079,11 +2087,18 @@ fn process_place_order_checked_pyth_v2(
         }
         let data = pyth_ai.try_borrow_data()?;
         match openhl_oracle::pyth_v2::parse(&data) {
-            Ok(u) if u.feed_id == market.pyth_v2_feed_id => {}
-            Ok(_) => {
+            Ok(u) if u.feed_id != market.pyth_v2_feed_id => {
                 msg!("place_order_checked_pyth_v2: price update is for another feed");
                 return Err(ProgramError::InvalidAccountData);
             }
+            // Only a fully verified update: a Partial one was checked
+            // against fewer Wormhole guardian signatures than the quorum,
+            // and Pyth's own SDK refuses it for prices (Chapter 9 §9.5).
+            Ok(u) if u.verification_level != openhl_oracle::pyth_v2::VerificationLevel::Full => {
+                msg!("place_order_checked_pyth_v2: price update is not fully verified");
+                return Err(ProgramError::InvalidAccountData);
+            }
+            Ok(_) => {}
             // The reader below reports a malformed update.
             Err(_) => {}
         }
@@ -4963,10 +4978,11 @@ fn process_slab_match(
 // SetPythFeeds — pin a market's Pyth feeds (Chapter 9 §9.5).
 // =============================================================================
 
-const SET_PYTH_FEEDS_PAYLOAD_LEN: usize = 32 + 32 + 32;
+const SET_PYTH_FEEDS_PAYLOAD_LEN: usize = 32 * 4;
 
-/// Payload: [v1 price account 32][v2 receiver program 32][v2 feed id 32].
-/// All-zero clears a pin.
+/// Payload: [v1 price account 32][v1 Pyth program 32][v2 receiver program
+/// 32][v2 feed id 32]. All-zero clears a pin. The program IDs differ between
+/// clusters, so they are data the authority supplies, not constants.
 ///
 /// Accounts:
 ///   0. `[SIGNER]` authority — must equal `market.authority`
@@ -4997,8 +5013,9 @@ fn process_set_pyth_feeds(
         return Err(ProgramError::IllegalOwner);
     }
     market.pyth_v1_price_account.copy_from_slice(&payload[0..32]);
-    market.pyth_v2_receiver.copy_from_slice(&payload[32..64]);
-    market.pyth_v2_feed_id.copy_from_slice(&payload[64..96]);
+    market.pyth_v1_program.copy_from_slice(&payload[32..64]);
+    market.pyth_v2_receiver.copy_from_slice(&payload[64..96]);
+    market.pyth_v2_feed_id.copy_from_slice(&payload[96..128]);
     msg!("set_pyth_feeds: pinned for market {}", market_ai.key);
     Ok(())
 }

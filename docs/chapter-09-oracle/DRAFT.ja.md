@@ -263,7 +263,7 @@ fn read_fresh_pyth_v1_oracle(oracle_ai: &AccountInfo) -> Result<u64, ProgramErro
 
 フラグすべき設計判断 4 つ:
 
-**1. リーダーはバイトを確かめ、ハンドラはどのアカウントかを確かめる。** モックパスは `oracle_ai.owner == program_id` を要求するが、ここのリーダーには所有者の検査がない。この章の最初の版は、検査は要らないと書いていた。「magic+version+atype ガントレットがすでにアカウントが Pyth v1 PriceAccount であることを構造的に保証する」からだ、と。保証しない。誰でも自分が所有するアカウントを作り、magic、version、account type、Trading の status、好きな価格を書き込んで渡せる。`programs/openhl-core/tests/pyth_binding.rs` のテスト `pyth_v1_reads_only_the_pinned_price_account` はまさにそれをやり、呼び出し側が選んだ価格に対して注文が通った。Pyth プログラム ID をハードコードすると mainnet 対 devnet の選択を最初から強いる(mainnet は `FsJ3...epH`、devnet は `gSbE...92s`)ので、プログラムは 2 つの選択肢のうち厳しい方を取る。市場が期待する Pyth アカウントの**pubkey** を固定し(`Market.pyth_v1_price_account`。市場の authority が `SetPythFeeds`、タグ 34 で設定する)、`PlaceOrderCheckedPyth` はそれ以外のアカウントを拒否し、何も固定されていない間は無条件に拒否する。固定したアドレスは本物の Pyth アカウントで、Pyth が所有しているので、所有者の問題もそれで片づく。資産を取り違える問題も同じだ。正しく所有された別の組のフィードは、別のアドレスだからだ。
+**1. リーダーはバイトを確かめ、ハンドラはどのアカウントかを確かめる。** モックパスは `oracle_ai.owner == program_id` を要求するが、ここのリーダーには所有者の検査がない。この章の最初の版は、検査は要らないと書いていた。「magic+version+atype ガントレットがすでにアカウントが Pyth v1 PriceAccount であることを構造的に保証する」からだ、と。保証しない。誰でも自分が所有するアカウントを作り、magic、version、account type、Trading の status、好きな価格を書き込んで渡せる。`programs/openhl-core/tests/pyth_binding.rs` のテスト `pyth_v1_reads_only_the_pinned_price_account` はまさにそれをやり、呼び出し側が選んだ価格に対して注文が通った。Pyth プログラム ID をハードコードすると mainnet 対 devnet の選択を最初から強いる(mainnet は `FsJ3...epH`、devnet は `gSbE...92s`)ので、代わりに市場が両方を保存する。市場の authority が `SetPythFeeds`(タグ 34)で設定する、期待する Pyth アカウントの**pubkey**(`Market.pyth_v1_price_account`)と、それを所有しなければならないプログラム(`Market.pyth_v1_program`)だ。`PlaceOrderCheckedPyth` は呼び出しのたびに両方を確かめ、何も固定されていない間は無条件に拒否する。アドレスだけでは足りない。そのアドレスのアカウントが閉じられ、別の誰かに作り直されることがありうる。テストの `recreated` の場合が、所有者の検査がそれを拒否するのを示す。アドレスを固定すれば、資産を取り違える問題も片づく。別の組の本物のフィードは別のアドレスだからだ。それでもプログラムが信じているのは authority の設定だ。間違ったアカウントと所有者を固定すれば、それを読む。
 
 **2. `expo` は読みログするが適用しない。** Pyth 価格は `(mantissa, expo)` ペアで来る — 本物の価格は `mantissa × 10^expo`。USD ペアでは `expo` は典型的に `-8`。モック側に expo はない（本書 `Oracle.price` は market が使うスケールでの u64）ので、本章で 2 パスを相互運用可能に保つため、mantissa を価格として扱い `expo` を観測性のためにログする。本番デプロイは正規化する: 単一サポート `expo` を固定し他を拒否するか、その場でプログラムの固定小数点規約に翻訳するか。これがマイグレーションで本物のバグを書く可能性が最も高い場所; 本章はそれを呼び出して TODO を自分で置けるようにする。
 
@@ -289,7 +289,7 @@ fn read_fresh_pyth_v1_oracle(oracle_ai: &AccountInfo) -> Result<u64, ProgramErro
 
 その 2 層を混同したら（本セクションの初期ドラフトはした）、v2 はあなたの側に ~2000 行の暗号コードが必要だと結論するだろう。そうではない。Wormhole 作業は Pyth のプログラムに住み、それは共有インフラだ; perp DEX で出荷するのは構造的に v1 リーダーと同じ、ただし異なるアカウント レイアウトに対するもの。
 
-`PlaceOrderCheckedPythV2`（タグ 33）がコンシューマ側を出荷する。リーダーの前に、ハンドラが 2 つの検査をする。リーダーにはできない検査だ。アカウントは市場が固定した receiver プログラムが所有していなければならず(`Market.pyth_v2_receiver`。その ID はクラスタごとに違うので、定数ではなくデータにする)、その `feed_id` は `Market.pyth_v2_feed_id` と等しくなければならない。1 つ目がなければ、誰でも自分のプログラムから、discriminator まで含めて `PriceUpdateV2` の形のアカウントを書ける。2 つ目がなければ、別の資産の本物の更新が通る(`pyth_v2_reads_only_the_pinned_receiver_and_feed` が両方を試す)。リーダー:
+`PlaceOrderCheckedPythV2`（タグ 33）がコンシューマ側を出荷する。リーダーの前に、ハンドラが 2 つの検査をする。リーダーにはできない検査だ。アカウントは市場が固定した receiver プログラムが所有していなければならず(`Market.pyth_v2_receiver`。その ID はクラスタごとに違うので、定数ではなくデータにする)、その `feed_id` は `Market.pyth_v2_feed_id` と等しくなければならない。1 つ目がなければ、誰でも自分のプログラムから、discriminator まで含めて `PriceUpdateV2` の形のアカウントを書ける。2 つ目がなければ、別の資産の本物の更新が通る。ハンドラはさらに、更新が完全に検証されていること(`VerificationLevel::Full`)を求める。Partial の更新は Wormhole の定足数より少ない guardian の署名で確かめられたもので、Pyth 自身の SDK も価格としては拒否する。`pyth_v2_reads_only_the_pinned_receiver_and_feed` は 3 つすべてを試し、署名 0 と 13 の Partial の更新も含む。リーダー:
 
 ```rust
 fn read_fresh_pyth_v2_oracle(oracle_ai: &AccountInfo) -> Result<u64, ProgramError> {
@@ -324,7 +324,7 @@ PriceUpdateV2 のオンチェーン レイアウト、オフセットでパー�
 offset | size | field                            | 何に使うか
 -------+------+----------------------------------+---------------------------------------
    0   |  8   | anchor_discriminator             | == [34,241,35,99,157,126,244,205]
-   8   | 32   | write_authority (Pubkey)         | （無視 — receiver の署名 PDA）
+   8   | 32   | write_authority (Pubkey)         | （確かめない — このアカウントを更新・クローズできる者）
   40   |  1   | verification_level tag           | ログ; 0=Partial、1=Full
   41   |  1   | verification_level.num_signatures| ログ（tag==Partial のときのみ）
   42   | 32   | price_message.feed_id            | == `Market.pyth_v2_feed_id`(ハンドラが確かめる)

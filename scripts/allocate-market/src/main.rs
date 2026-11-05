@@ -122,9 +122,9 @@ fn dump_market_bytes(data: &[u8]) {
         (112, 8, "tick_size          u64"),
         (120, 8, "lot_size           u64"),
         (128, 32, "pyth_v1_price_account [u8; 32]"),
-        (160, 32, "pyth_v2_receiver   [u8; 32]"),
-        (192, 32, "pyth_v2_feed_id    [u8; 32]"),
-        (224, 32, "_reserved          [u8; 32]"),
+        (160, 32, "pyth_v1_program    [u8; 32]"),
+        (192, 32, "pyth_v2_receiver   [u8; 32]"),
+        (224, 32, "pyth_v2_feed_id    [u8; 32]"),
     ];
 
     for &(off, len, label) in regions {

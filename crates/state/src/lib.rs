@@ -38,9 +38,9 @@ pub const MARKET_DISCRIMINATOR: [u8; 8] = *b"MARKET\0\0";
 /// 112  | 0x70  tick_size         u64       — min price increment (quote units)
 /// 120  | 0x78  lot_size          u64       — min size increment (base units)
 /// 128  | 0x80  pyth_v1_price_account [u8; 32] — Chapter 9 §9.5
-/// 160  | 0xA0  pyth_v2_receiver      [u8; 32]
-/// 192  | 0xC0  pyth_v2_feed_id       [u8; 32]
-/// 224  | 0xE0  _reserved             [u8; 32] — forward-compat slack
+/// 160  | 0xA0  pyth_v1_program       [u8; 32]
+/// 192  | 0xC0  pyth_v2_receiver      [u8; 32]
+/// 224  | 0xE0  pyth_v2_feed_id       [u8; 32]
 /// 256                                       — total size
 /// ```
 #[repr(C)]
@@ -55,14 +55,15 @@ pub struct Market {
     pub quote_mint: [u8; 32],
     pub tick_size: u64,
     pub lot_size: u64,
-    /// The Pyth v1 `PriceAccount` `PlaceOrderCheckedPyth` reads; all zero
-    /// until `SetPythFeeds`. (Chapter 9 §9.5.)
+    /// The Pyth v1 `PriceAccount` `PlaceOrderCheckedPyth` reads, and the
+    /// program that must own it (Pyth's oracle program; its ID differs
+    /// between clusters). All zero until `SetPythFeeds`. (Chapter 9 §9.5.)
     pub pyth_v1_price_account: [u8; 32],
+    pub pyth_v1_program: [u8; 32],
     /// The program that owns `PriceUpdateV2` accounts (pyth-solana-receiver,
     /// whose ID differs between clusters), and the feed id they must carry.
     pub pyth_v2_receiver: [u8; 32],
     pub pyth_v2_feed_id: [u8; 32],
-    pub _reserved: [u8; 32],
 }
 
 impl Market {
