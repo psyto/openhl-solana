@@ -54,7 +54,7 @@ This is the wrong choice for production for one specific reason: **best-bid / be
 
 So why pick it?
 
-- **It exposes the cost.** The CU log shows the linear scan happening. A student can run `book --place` and watch the CU drop as the book fills.
+- **It exposes the cost.** The CU log shows the linear scan happening. A student can run `book --place` and watch the CU rise as the book fills (by a few CU per order; §7.3).
 - **It is easy to verify.** Two `for` loops over an array. No invariants to break. No subtle off-by-one in tree rebalancing.
 - **It is enough for Chapter 7.** This chapter is about the data layout and the cost shape. Chapter 8 will introduce matching, and *that* is where the wrong choice becomes a real problem — at which point we have permission to refactor to a slab.
 
@@ -90,7 +90,7 @@ Why `size == 0` and not a separate `is_active: bool`?
 - A boolean field would cost a byte plus padding to maintain alignment. The `size` field already exists and a real order always has `size > 0`. Repurposing it as the active sentinel saves the extra field.
 - Zero-initialization on account creation makes the convention work for free: a newly allocated `OrderBook`'s slots are all "empty" without any explicit setup pass.
 
-The cost is a one-line invariant the program must respect: never write an `Order` with `size == 0`. Both handlers explicitly reject `size == 0` in the payload as the first guard. From `process_place_order` (lib.rs:1172–1175):
+The cost is a one-line invariant the program must respect: never write an `Order` with `size == 0`. `place_order` rejects `size == 0` in the payload as its first guard (`cancel_order` takes only an order id, and writes an all-zero `Order` on purpose to empty the slot). From `process_place_order` (lib.rs:1172–1175):
 
 ```rust
 if price == 0 || size == 0 {
@@ -109,7 +109,7 @@ That's the price of repurposing the field. Anchor's `#[derive(BorshSerialize)]` 
 
 From `programs/openhl-core/src/lib.rs:1151–1242`. The handler decomposes into three parts.
 
-**Validation** (lines 1156–1189): payload size, side byte (must be 0 or 1), price and size non-zero, user is a signer, book owner matches our program, book size matches `OrderBook::LEN`, book discriminator matches.
+**Validation** (lines 1156–1199): payload size, side byte (must be 0 or 1), price and size non-zero, user is a signer, book owner matches our program, book size matches `OrderBook::LEN`, book discriminator matches.
 
 **The linear scan** at lines 1205–1211:
 
@@ -134,13 +134,13 @@ The CU cost shape, measured (whole instruction, LiteSVM, with `fuzz/matching`'s 
 | 16 orders | 17 | 2,417 |
 | 24 orders | 25 | 2,433 |
 | 31 orders | 32 | 2,446 |
-| 32 orders (full) | 32 + error | fails |
+| 32 orders (full) | 32 + error | fails (we did not measure failed calls) |
 
 The scan is linear, and cheap: 89 CU from an empty book to 31 orders, about 3 CU per slot visited. (An earlier draft estimated about 50 CU per slot, 1,550 CU at 31 orders; it was more than ten times too high.) Almost all of the 2,357 is the fixed cost of an instruction: entry, validation, the two `sol_log_compute_units` calls and the `msg!` lines. So the *shape* is the lesson here more than the size: O(N) means the cost grows with the data, but at 32 slots and a few CU per slot it hardly shows. It shows in Chapter 8, where the scan runs once per fill, and with a bigger book. For comparison, Chapter 15's slab places an order into 1,023 others for 1,954 CU, less than this array charges at 16.
 
 **The write** (lines 1217–1231): increment `next_order_id`, increment `active_count`, copy the user pubkey into `owner`, construct an `Order` literal, drop it into the chosen slot. All O(1) once the slot is found.
 
-The CU brackets at lines 1192 (before scan) and 1239 (after write) let you read the cost from the validator log. Two `sol_log_compute_units` calls, subtract, get the actual CU consumed for "scan + write" on this particular instruction.
+The CU brackets at lines 1192 (before scan) and 1239 (after write) let you read the cost from the validator log. Two `sol_log_compute_units` calls, subtract, get the CU consumed between them: the scan and the write, plus the data borrow, the discriminator check and the logging in that range.
 
 > **Exercise §7.3.** Pre-populate the book with N orders for various N (say 0, 8, 16, 24, 31) and then place a single new order. Record the CU consumed (between the two log calls) for each N. Plot it. It should be linear in N, with a slope of a few CU per order: compare your numbers with the table above.
 
@@ -183,7 +183,7 @@ book.slots[slot_idx] = <Order as bytemuck::Zeroable>::zeroed();
 
 `Order::zeroed()` returns the all-zeros `Order`. The `<Order as bytemuck::Zeroable>::zeroed()` qualified-syntax is needed because `Order::zeroed` is not in scope as an inherent method — it comes from the `bytemuck::Zeroable` trait. Once written, the slot's `size` is 0 and the next `place_order` scanning for an empty slot will see this position as available.
 
-The CU cost is symmetric to `place_order`: best case is "matched at slot 0" (1 iteration); worst case is "not found" (N iterations + error). We measured 1,994 CU for the order in the first slot of a full book and 2,177 for the one in the last, about 6 CU per slot visited. The brackets at lines 1273 and 1313 let you measure.
+The CU cost is symmetric to `place_order`: best case is "matched at slot 0" (1 iteration); worst case is "not found" (N iterations + error). We measured 1,994 CU for the order in the first slot of a full book and 2,177 for the one in the last, about 6 CU per slot visited (the "not found" path fails, and we did not measure failed calls). The brackets at lines 1273 and 1313 let you measure.
 
 > **Exercise §7.4.** Place 10 orders, then cancel order_id 5. Then place another order. Which slot does the new order land in? Trace the slot allocation through the dump output of `book` (no flags) before and after each operation.
 
@@ -195,7 +195,7 @@ Chapter 8 implements matching. The core matching loop is "for each incoming take
 
 1. Linear-scan every taker → O(N) per taker
 2. For each match attempt, linear-scan every maker → O(N) per maker check
-3. With M takers crossing K makers, the total cost is O(M × N) just to find the right slots, before any token movement happens
+3. With M takers crossing K makers, the total cost is O(M × K × N) just to find the right slots, before any token movement happens
 
 At ORDER_CAPACITY = 32, M = 10, K = 5, this is ~1600 array-traversals per match instruction. An earlier draft priced that at about 80,000 CU of pure scanning, using the 50 CU per slot above; with the measured few CU per slot it is a few thousand. Chapter 8's matcher, which scans the book once per fill, measured 12,662 CU for 5 fills against a full book and 22,250 for 10, everything included. The default budget is 200,000.
 
