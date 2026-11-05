@@ -350,7 +350,7 @@ The CU shapes, measured in LiteSVM with `fuzz/slab`'s `grid` test (size-1 bids; 
 | op | flat (ch.7/8) | slab (ch.15) |
 |---|---|---|
 | place, empty book | 2,357 | 1,788 |
-| place, full-ish book | 2,446 (31 orders) | 1,954 (1,023 orders, 128 levels); 2,008 (a new level among 127) |
+| place, full-ish book | 2,446 (31 orders) | 1,954 (1,023 orders, 128 levels); 2,008 (a new level after 126) |
 | match, 10 fills | 22,250 (32 orders) | 14,553 (10 orders) to 15,818 (128 orders, one per level); 14,284 (1,024 orders at 128 levels), 13,921 (1,024 at 8 levels) |
 | match, 4 fills | 8,147 (4 orders), 8,500 (8), 9,276 (16) | 6,597 (4), 6,784 (8), 6,793 (16) |
 | cancel | 1,994 (first slot) – 2,174 (last of 32) | not built (Exercise §15.6) |
@@ -428,7 +428,7 @@ Match BID-taker, limit=110, size=25, max_fills=3:
 
 ### Now let a tool look for the expensive match
 
-Chapter 8 §8.6 capped the flat matcher's `max_fills` so a full book stays under a CU cap, and showed why that cap must shrink as the book grows. [`fuzz/slab/`](../../fuzz/slab) asks the same question of `SlabMatch`, with a cap of 100,000 CU (`SLAB_MATCH_CU_CAP`), on the costliest shape we could build: 128 bids at 128 prices (a side's tree holds at most 128 levels), one order per level so every fill also removes a level, and prices chosen so the best bid sits deep in the critbit. Those prices are `u64::MAX` and `u64::MAX - 2^k` for k < 63, plus 64 ordinary ones below: each next-best bid differs from the last in one lower bit, so the path to it gets one node longer, down to the 64 bits of the key. Set up as in Chapter 3 §3.7, then:
+Chapter 8 §8.6 capped the flat matcher's `max_fills` so a full book stays under a CU cap, and showed why that cap must shrink as the book grows. [`fuzz/slab/`](../../fuzz/slab) asks the same question of `SlabMatch`, with a cap of 100,000 CU (`SLAB_MATCH_CU_CAP`), on the costliest shape we could build: 128 bids at 128 prices (a side's tree holds at most 128 levels), one order per level so every fill also removes a level, and prices chosen so the best bid sits deep in the critbit. Those prices are `u64::MAX` and `u64::MAX - 2^k` for k < 63, plus 64 ordinary ones below. Every split in a critbit is on a different bit of the 64-bit key, so a path is at most 64 nodes long; these prices build one such path, with the best bids (`u64::MAX` and `u64::MAX - 1`) at its bottom and each later one hanging off it a little higher, so the first fills walk the longest paths the key allows. Set up as in Chapter 3 §3.7, then:
 
 ```bash
 cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
@@ -439,7 +439,7 @@ timeout -s INT 60 crucible run openhl_slab_fuzz invariant_ch15 \
     --binary-in target/release/invariant_test --timeout 45
 ```
 
-> **Exercise §15.7.** Run it. You should see `[FUZZ_FINDING] [cu-dos:…] ix slab_match consumed … CU (cap 100000)` lines. As in Chapter 8, the bound is the program's to set. From the `grid` numbers, what is the largest `max_fills` that keeps every shape you can think of under 100,000? Add the check to `process_slab_match`, rebuild, and run again.
+> **Exercise §15.7.** Run it. You should see `[FUZZ_FINDING] [cu-dos:…] ix slab_match consumed … CU (cap 100000)` lines. As in Chapter 8, the bound is the program's to set. From the `grid` numbers, what is the largest `max_fills` that keeps every shape you can think of under 100,000? Add the check to `process_slab_match`, rebuild, and run again. (The program as shipped has no cap, which is why the run above reports; the caps below were measured on copies with the check added.)
 >
 > Our first answer was wrong, and the way it was wrong is the lesson. We measured contiguous prices (100, 101, …) at one order per level and found 69 fills at 99,037 CU, so we capped at 69. A reviewer pointed out that a critbit is not self-balancing: its depth follows the bits of the prices, not the number of levels. On the deep prices above, 10 fills cost 35,819 CU (against about 14,500 on contiguous prices), 32 cost 100,222, and with the cap at 69 the fuzzer reported 157,245. The makers choose those prices, so the makers set how expensive the taker's match is. The largest cap that fits the deep shape is 31 (97,678 CU); with `if max_fills > 31` the fuzzer found nothing in 45 seconds.
 >

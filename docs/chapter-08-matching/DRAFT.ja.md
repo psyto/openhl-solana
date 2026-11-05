@@ -178,7 +178,7 @@ slab 実装は第 15 章に住み、下記の設計仕様から生まれたコ�
 
 ```rust
 const POOL_CAPACITY: usize = 1024;
-const TREE_CAPACITY: usize = 256;   // 木のノード数: 片側の価格水準は約 128(葉 + 内部ノード)   // 一意な価格レベル数
+const TREE_CAPACITY: usize = 256;   // 木のノード数: 片側の価格水準は約 128(葉 + 内部ノード)
 
 #[repr(C, Pod)]
 struct Slab {
