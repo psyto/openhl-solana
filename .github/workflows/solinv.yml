@@ -1,0 +1,25 @@
+# Warns on a pull request or a push that drops an account check from a
+# native program (is_signer, owner, key compared, ...), with an
+# annotation on the line. https://github.com/psyto/solinv
+name: solinv diff
+
+on:
+  pull_request:
+    paths:
+      - programs/**
+      - .github/workflows/solinv.yml
+  push:
+    branches: [main]
+    paths:
+      - programs/**
+      - .github/workflows/solinv.yml
+
+permissions:
+  contents: read
+
+jobs:
+  account-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: psyto/solinv@v0
