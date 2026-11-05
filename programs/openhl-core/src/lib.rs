@@ -1021,10 +1021,6 @@ fn process_deposit(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
     let vault_token_ai = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let token_ai = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
 
-    if !user_ai.is_signer {
-        msg!("deposit: user must sign");
-        return Err(ProgramError::MissingRequiredSignature);
-    }
     if user_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {
         msg!("deposit: user_token_acct not owned by SPL Token");
         return Err(ProgramError::IncorrectProgramId);
