@@ -305,7 +305,7 @@ Things you'd add for a real production deployment:
 Things to do with the curriculum:
 
 - **Use it.** The companion code is MIT-licensed. Fork it, deploy it, extend it. Drop the educational variants (Bench, Stats) and ship the actual primitives.
-- **Teach it.** The chapters were designed for a SolDojo internals track. Run a workshop, build a course, write follow-ups. The pedagogical framework (validated chapter format, deliberate scope-deferral with explicit honesty notes, two-language coverage) generalizes to other Solana subjects.
+- **Teach it.** The chapters were designed as a teaching track. Run a workshop, build a course, write follow-ups. The pedagogical framework (validated chapter format, deliberate scope-deferral with explicit honesty notes, two-language coverage) generalizes to other Solana subjects.
 - **Critique it.** Every chapter has design choices that another designer would make differently. Build your own version, then write up your divergences as a counter-curriculum.
 
 The pieces are in your hands.
