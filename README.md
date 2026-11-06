@@ -119,7 +119,7 @@ behaves on Solana against an EVM perp by running scenarios rather than reading c
 - Not Anchor. Every program uses `entrypoint!`, `AccountInfo`, and manual deserialization. Anchor is the abstraction this engine deliberately avoids — partly so byte layouts are pinned, partly so CU costs are inspectable without an abstraction tax.
 - Not production. No mainnet deployment, no fee capture, no governance, no keeper infra. The `match` instruction deliberately omits settlement transfers from the hot path; the mock oracle is open-auth; the `Stats` singleton is included as a parallelism counter-example, not a recommendation.
 - No upgrade path for old state. The program isn't deployed anywhere, and account layouts and instruction account lists change without migrations — for example the per-vault trading-vault token account, `BuilderProfile.fee_mint` with `RegisterBuilder`'s new mint account, and OpenPosition's quote-mint check. Deploy a fresh program; don't upgrade one that holds state created by an older version (old trading vaults, builder profiles without a fee mint, or positions opened in another mint would be stranded or unchecked).
-- Not a Solana tutorial. The depth-and-learning surface for Solana internals lives on SolDojo; this repo is product-facing. SolDojo imports some of this code as worked examples, but the curriculum framing is theirs — see [Curriculum companion](#curriculum-companion-separate-audience) for the boundary.
+- Not a Solana tutorial. This README is about using the parts; the learning path is the course built from [`docs/`](./docs/) — see [Learn it](#learn-it-the-solana-internals-course).
 
 ### Design choices worth noting
 
@@ -184,12 +184,12 @@ The full script roster is below in [Scripts as scenario surface](#scripts-as-sce
 
 ## Sandbox elements: current state
 
-Per `fabrknt/website/SANDBOX-PATTERN.md`, every Fabrknt sandbox must ship five elements. Here is `openhl-solana`'s current state:
+Every Fabrknt sandbox ships five elements. Here is `openhl-solana`'s current state:
 
 | Element | Status | Notes |
 |---|---|---|
 | (1) Pre-baked scenarios | **present** | `scenarios/` directory with 5 scenarios (`account-layout-demo`, `instruction-dispatch-demo`, `bring-up`, `matching-cu-comparison`, `liquidation-walkthrough`). More to follow as additional script combinations are scripted. |
-| (2) Business-readable output | **v2 done for v2-eligible scenarios** | Scenarios whose steps are all in-process-eligible (currently: `account-layout-demo`) take the v2 path: in-process dispatch into `run_account_layout_demo_structured`, then HEADLINE (with ✓/⚠/unverified badge per `expected_outcomes` verification), TIMELINE, DELTA, OUTCOMES, NEXT. `account-layout-demo` declares 5 outcomes that all verify ✓. Scenarios that need a real validator + deployed program (`bring-up`, `matching-cu-comparison`, `liquidation-walkthrough`) still spawn sub-processes with stdio inherited (v1); converting them requires either lib-izing the scripts or stdio-capture-and-parse — tracked in `fabrknt/website/SANDBOX-BACKLOG.md`. |
+| (2) Business-readable output | **v2 done for v2-eligible scenarios** | Scenarios whose steps are all in-process-eligible (currently: `account-layout-demo`) take the v2 path: in-process dispatch into `run_account_layout_demo_structured`, then HEADLINE (with ✓/⚠/unverified badge per `expected_outcomes` verification), TIMELINE, DELTA, OUTCOMES, NEXT. `account-layout-demo` declares 5 outcomes that all verify ✓. Scenarios that need a real validator + deployed program (`bring-up`, `matching-cu-comparison`, `liquidation-walkthrough`) still spawn sub-processes with stdio inherited (v1); converting them requires either lib-izing the scripts or stdio-capture-and-parse — not done yet. |
 | (3) Parameter dial | partial | Per-step args (e.g., `--price 80`) provide a dial. Engine-level parameters (tick size, funding interval, liquidation buffer) are still recompiled into the program. |
 | (4) Scenario replay | **present** | Each scenario file is a deterministic step list — re-running yields the same sub-process invocations. Bit-identical state requires `solana-test-validator --reset` between runs. |
 | (5) CTA | **done** | `scenario list` / `show` / `run` all render a three-option CTA footer (adopt engine / custom build / hosted access) with `product=solana-perp` for waitlist enrichment. |
@@ -211,11 +211,37 @@ The scripts under `scripts/` cover the perp DEX feature areas. The sandbox scena
 | Trading vault NAV | `vault` |
 | Builder codes / fee claim | `builder` |
 
-## Curriculum companion (separate audience)
+## Learn it: the Solana Internals course
 
-This repo's code is also imported by the **SolDojo Solana Internals** track. The chapter drafts under [`docs/chapter-XX-*/`](./docs/) and any `Chapter N` references in `crates/state` / program source are SolDojo material — they are explicitly NOT part of the Fabrknt sandbox surface. A buyer arriving via Fabrknt should never need to read them; a learner arriving via SolDojo walks them chapter-by-chapter.
+The fifteen chapters under [`docs/`](./docs/) walk this program from the account bytes up, each ending
+with an exercise you run from a clone (several with [solinv](https://github.com/psyto/solinv) fuzz
+harnesses). They are published as a free course, in English and Japanese:
+**[Solana Internals — a native perp program from the bytes up](https://fabrknt.com/dojo/courses/solana-internals-en)**
+([日本語](https://fabrknt.com/ja/dojo/courses/solana-internals-en)). Lessons 1–5 are Solana itself;
+6–15 build the trading primitives.
 
-Directories are kept at `docs/chapter-XX-*/` only so SolDojo's existing provenance imports don't break. The chapters quote the code as it was when it all lived in `programs/openhl-core/src/lib.rs`; the slab, oracle, margin, funding, fee and vault logic now lives in the crates above, and the chapters' `lib.rs:NNN` line references are not kept in sync.
+| # | Chapter | Lesson | Source |
+|---|---|---|---|
+| 1 | The Account Model from the Bytes Up | [read](https://fabrknt.com/dojo/courses/solana-internals-en/lessons/solana-internals-ch01-account-model-en) · [日本語](https://fabrknt.com/ja/dojo/courses/solana-internals-en/lessons/solana-internals-ch01-account-model-en) | [`DRAFT.en.md`](./docs/chapter-01-account-model/DRAFT.en.md) · [`ja`](./docs/chapter-01-account-model/DRAFT.ja.md) |
+| 2 | Writing a Native Program Without Anchor | [read](https://fabrknt.com/dojo/courses/solana-internals-en/lessons/solana-internals-ch02-native-program-en) · [日本語](https://fabrknt.com/ja/dojo/courses/solana-internals-en/lessons/solana-internals-ch02-native-program-en) | [`DRAFT.en.md`](./docs/chapter-02-native-program/DRAFT.en.md) · [`ja`](./docs/chapter-02-native-program/DRAFT.ja.md) |
+| 3 | PDAs from First Principles | [read](https://fabrknt.com/dojo/courses/solana-internals-en/lessons/solana-internals-ch03-pdas-en) · [日本語](https://fabrknt.com/ja/dojo/courses/solana-internals-en/lessons/solana-internals-ch03-pdas-en) | [`DRAFT.en.md`](./docs/chapter-03-pdas/DRAFT.en.md) · [`ja`](./docs/chapter-03-pdas/DRAFT.ja.md) |
+| 4 | Compute Budget and Heap Discipline | [read](https://fabrknt.com/dojo/courses/solana-internals-en/lessons/solana-internals-ch04-compute-budget-en) · [日本語](https://fabrknt.com/ja/dojo/courses/solana-internals-en/lessons/solana-internals-ch04-compute-budget-en) | [`DRAFT.en.md`](./docs/chapter-04-compute-budget/DRAFT.en.md) · [`ja`](./docs/chapter-04-compute-budget/DRAFT.ja.md) |
+| 5 | Sealevel Parallelism and Account Locks | [read](https://fabrknt.com/dojo/courses/solana-internals-en/lessons/solana-internals-ch05-sealevel-en) · [日本語](https://fabrknt.com/ja/dojo/courses/solana-internals-en/lessons/solana-internals-ch05-sealevel-en) | [`DRAFT.en.md`](./docs/chapter-05-sealevel/DRAFT.en.md) · [`ja`](./docs/chapter-05-sealevel/DRAFT.ja.md) |
+| 6 | CPI Internals via Vault Deposits | [read](https://fabrknt.com/dojo/courses/solana-internals-en/lessons/solana-internals-ch06-cpi-en) · [日本語](https://fabrknt.com/ja/dojo/courses/solana-internals-en/lessons/solana-internals-ch06-cpi-en) | [`DRAFT.en.md`](./docs/chapter-06-cpi/DRAFT.en.md) · [`ja`](./docs/chapter-06-cpi/DRAFT.ja.md) |
+| 7 | On-Chain CLOB Data Structures | [read](https://fabrknt.com/dojo/courses/solana-internals-en/lessons/solana-internals-ch07-clob-en) · [日本語](https://fabrknt.com/ja/dojo/courses/solana-internals-en/lessons/solana-internals-ch07-clob-en) | [`DRAFT.en.md`](./docs/chapter-07-clob/DRAFT.en.md) · [`ja`](./docs/chapter-07-clob/DRAFT.ja.md) |
+| 8 | Matching Engine Under CU Pressure | [read](https://fabrknt.com/dojo/courses/solana-internals-en/lessons/solana-internals-ch08-matching-en) · [日本語](https://fabrknt.com/ja/dojo/courses/solana-internals-en/lessons/solana-internals-ch08-matching-en) | [`DRAFT.en.md`](./docs/chapter-08-matching/DRAFT.en.md) · [`ja`](./docs/chapter-08-matching/DRAFT.ja.md) |
+| 9 | Oracle Ingestion: Pyth Internals | [read](https://fabrknt.com/dojo/courses/solana-internals-en/lessons/solana-internals-ch09-oracle-en) · [日本語](https://fabrknt.com/ja/dojo/courses/solana-internals-en/lessons/solana-internals-ch09-oracle-en) | [`DRAFT.en.md`](./docs/chapter-09-oracle/DRAFT.en.md) · [`ja`](./docs/chapter-09-oracle/DRAFT.ja.md) |
+| 10 | Funding Rate Mechanics | [read](https://fabrknt.com/dojo/courses/solana-internals-en/lessons/solana-internals-ch10-funding-en) · [日本語](https://fabrknt.com/ja/dojo/courses/solana-internals-en/lessons/solana-internals-ch10-funding-en) | [`DRAFT.en.md`](./docs/chapter-10-funding/DRAFT.en.md) · [`ja`](./docs/chapter-10-funding/DRAFT.ja.md) |
+| 11 | Position Lifecycle and Liquidation Engine | [read](https://fabrknt.com/dojo/courses/solana-internals-en/lessons/solana-internals-ch11-liquidation-en) · [日本語](https://fabrknt.com/ja/dojo/courses/solana-internals-en/lessons/solana-internals-ch11-liquidation-en) | [`DRAFT.en.md`](./docs/chapter-11-liquidation/DRAFT.en.md) · [`ja`](./docs/chapter-11-liquidation/DRAFT.ja.md) |
+| 12 | Native Vault Program (Pooled Trading) | [read](https://fabrknt.com/dojo/courses/solana-internals-en/lessons/solana-internals-ch12-vault-en) · [日本語](https://fabrknt.com/ja/dojo/courses/solana-internals-en/lessons/solana-internals-ch12-vault-en) | [`DRAFT.en.md`](./docs/chapter-12-vault/DRAFT.en.md) · [`ja`](./docs/chapter-12-vault/DRAFT.ja.md) |
+| 13 | Builder Codes as a Protocol Primitive | [read](https://fabrknt.com/dojo/courses/solana-internals-en/lessons/solana-internals-ch13-builder-codes-en) · [日本語](https://fabrknt.com/ja/dojo/courses/solana-internals-en/lessons/solana-internals-ch13-builder-codes-en) | [`DRAFT.en.md`](./docs/chapter-13-builder-codes/DRAFT.en.md) · [`ja`](./docs/chapter-13-builder-codes/DRAFT.ja.md) |
+| 14 | Cranks, Keepers, and Off-Chain Glue | [read](https://fabrknt.com/dojo/courses/solana-internals-en/lessons/solana-internals-ch14-cranks-keepers-en) · [日本語](https://fabrknt.com/ja/dojo/courses/solana-internals-en/lessons/solana-internals-ch14-cranks-keepers-en) | [`DRAFT.en.md`](./docs/chapter-14-cranks-keepers/DRAFT.en.md) · [`ja`](./docs/chapter-14-cranks-keepers/DRAFT.ja.md) |
+| 15 | Slab Order Book | [read](https://fabrknt.com/dojo/courses/solana-internals-en/lessons/solana-internals-ch15-slab-en) · [日本語](https://fabrknt.com/ja/dojo/courses/solana-internals-en/lessons/solana-internals-ch15-slab-en) | [`DRAFT.en.md`](./docs/chapter-15-slab/DRAFT.en.md) · [`ja`](./docs/chapter-15-slab/DRAFT.ja.md) |
+
+The course is generated from the files here at a pinned commit; fix a chapter in this repo and the
+lesson follows on the next import. The chapters quote the code as it was when it all lived in
+`programs/openhl-core/src/lib.rs`; the slab, oracle, margin, funding, fee and vault logic now lives
+in the crates above, and the chapters' `lib.rs:NNN` line references are not kept in sync.
 
 ## Build
 
@@ -227,10 +253,10 @@ cargo test --workspace                # the parts' unit tests + scenario tests
 
 ## Related
 
-- [`fabrknt/website/CONCEPT.md`](../fabrknt/website/CONCEPT.md) — the Fabrknt brand and 2x2 sandbox structure.
-- [`fabrknt/website/SANDBOX-PATTERN.md`](../fabrknt/website/SANDBOX-PATTERN.md) — cross-engine spec for the five sandbox elements.
-- Sibling Fabrknt engines: [`rdk/openhl`](../rdk/openhl/) (EVM Perp Sandbox), [`rdk/princeps`](../rdk/princeps/) (EVM Prime Broker Sandbox).
-- [`docs/`](./docs/) — chapter drafts (SolDojo material; out-of-scope for the sandbox).
+- [Solana Internals](https://fabrknt.com/dojo/courses/solana-internals-en) — the chapters in [`docs/`](./docs/) as a course (EN / JA).
+- [Reactor](https://fabrknt.com/reactor) — perp-engine sandboxes, including the EVM one built on
+  [`rdk/openhl`](https://github.com/psyto/rdk/tree/main/openhl).
+- Sibling engines in [`psyto/rdk`](https://github.com/psyto/rdk): [`openhl`](https://github.com/psyto/rdk/tree/main/openhl) (EVM perp), [`princeps`](https://github.com/psyto/rdk/tree/main/princeps) (EVM prime broker).
 
 ## License
 
