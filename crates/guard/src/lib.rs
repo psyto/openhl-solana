@@ -133,7 +133,8 @@ pub fn spend(r: &mut Rolling, now: u64, notional: u64, cap: u64, window_secs: u6
     // prev + notional <= cap, so this can't overflow.
     r.slots[i] = Slot { epoch: e, amount: prev + notional };
     if notional != 0 {
-        r.last_spend_at = now;
+        // Never backwards: reconfigure waits from here.
+        r.last_spend_at = r.last_spend_at.max(now);
         r.spent = 1;
     }
     Ok(())
@@ -151,7 +152,11 @@ pub fn reconfigure(r: &mut Rolling, now: u64, cap: u64, window_secs: u64) -> Res
     }
     if r.window_secs != 0 {
         let longer = window_secs.max(r.window_secs);
-        let ready_at = r.last_spend_at.saturating_add(longer).saturating_add(1);
+        // Never earlier than the newest bucket's start: `last_spend_at` only
+        // moves forward now, but this also bounds state from before it did.
+        let slice = r.window_secs / SLICES;
+        let newest_start = r.slots.iter().filter(|s| live(s)).map(|s| s.epoch.saturating_mul(slice)).max().unwrap_or(0);
+        let ready_at = r.last_spend_at.max(newest_start).saturating_add(longer).saturating_add(1);
         if r.spent == 1 && now < ready_at {
             return Err(GuardError::NotDrained { ready_at });
         }
@@ -242,6 +247,22 @@ mod tests {
         assert!(spend(&mut r, t, 1, 100, W).is_err());
         // Time moves on past the window as usual.
         spend(&mut r, t + W + slice, 100, 100, W).unwrap();
+    }
+
+    #[test]
+    fn a_clock_that_steps_back_cannot_hurry_a_reconfigure() {
+        // 50 at t = 1000, then 50 from a clock at 900 (counted in 1000's bucket).
+        let mut r = Rolling::default();
+        spend(&mut r, 1_000, 50, 100, W).unwrap();
+        spend(&mut r, 900, 50, 100, W).unwrap();
+        assert_eq!(r.last_spend_at, 1_000);
+        // Raising the cap must wait until 1000's bucket is out of the window.
+        assert!(matches!(reconfigure(&mut r, 961, 200, W), Err(GuardError::NotDrained { .. })));
+        assert_eq!(reconfigure(&mut r, 1_060, 200, W), Err(GuardError::NotDrained { ready_at: 1_061 }));
+        // State stored behind its newest bucket waits at least from the bucket's start.
+        r.last_spend_at = 900;
+        assert_eq!(reconfigure(&mut r, 961, 200, W), Err(GuardError::NotDrained { ready_at: 1_061 }));
+        reconfigure(&mut r, 1_061, 200, W).unwrap();
     }
 
     #[test]
