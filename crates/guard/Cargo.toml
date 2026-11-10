@@ -1,0 +1,11 @@
+[package]
+name = "openhl-guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Rolling exposure budget for a thin market on Solana: no stretch of the window settles more than the cap. no_std, Pod layout."
+
+[dependencies]
+bytemuck = { workspace = true }

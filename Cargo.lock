@@ -2430,6 +2430,13 @@ name = "openhl-funding"
 version = "0.1.0"
 
 [[package]]
+name = "openhl-guard"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "openhl-margin"
 version = "0.1.0"
 dependencies = [

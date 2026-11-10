@@ -8,6 +8,7 @@ members = [
     "crates/vault",
     "crates/oracle",
     "crates/slab",
+    "crates/guard",
     "programs/openhl-core",
     "scripts/allocate-market",
     "scripts/bench",

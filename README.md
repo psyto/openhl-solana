@@ -17,10 +17,11 @@ instructions, no Anchor) shows how the parts fit.
 | clamp a keeper's funding rate and accrue the cumulative index | `openhl-funding` | — |
 | charge a protocol fee and pay a builder (front end) its share | `openhl-fees` | — |
 | mint and burn shares of a pooled vault, track cost basis | `openhl-vault` | — |
+| cap the notional that can settle in any window of N seconds on a thin market | `openhl-guard` | — |
 | use the account layouts (`repr(C)` + `bytemuck::Pod`) of every account above | `openhl-state` | — |
 
 Outside openhl the parts use nothing except `bytemuck` (`openhl-state`, and so `openhl-slab` and
-`openhl-oracle`). Ratios are basis points; amounts are integers in your quote units. None of the
+`openhl-oracle`; and `openhl-guard`). Ratios are basis points; amounts are integers in your quote units. None of the
 parts reads the clock or an `AccountInfo`: your program passes the slot, the timestamp and the
 account bytes in, and maps the returned error to its own `ProgramError`.
 
@@ -34,6 +35,7 @@ cargo run -p openhl-slab --example slab_quickstart              # asks at two pr
 cargo run -p openhl-oracle --example oracle_quickstart          # a Pyth PriceUpdateV2 gating an order
 cargo run -p openhl-margin --example liquidation_quickstart     # a 10x long checked as the mark falls
 cargo run -p openhl-funding --example funding_quickstart        # three keeper updates, one clamped
+cargo run -p openhl-guard --example guard_quickstart            # a burst fills a 60 s budget, the next trade waits
 ```
 ```
 slab is 82000 bytes, one account
