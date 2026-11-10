@@ -15,7 +15,9 @@
 //! by under one slice.
 //!
 //! Pure integer math on a `repr(C)` + `bytemuck::Pod` struct you keep in an
-//! account. Your program passes the clock's unix timestamp in.
+//! account. Your program passes the clock's unix timestamp in. A timestamp
+//! earlier than the newest bucket is read as that bucket's time: a clock that
+//! steps back can't overwrite a newer bucket or hide what it holds.
 
 #![no_std]
 
@@ -80,11 +82,21 @@ fn check(window_secs: u64) -> Result<(), GuardError> {
     Ok(())
 }
 
+fn live(s: &Slot) -> bool {
+    !(s.epoch == 0 && s.amount == 0)
+}
+
+/// The epoch for `now`, never earlier than the newest bucket.
+fn epoch(r: &Rolling, now: u64) -> u64 {
+    let newest = r.slots.iter().filter(|s| live(s)).map(|s| s.epoch).max().unwrap_or(0);
+    (now / (r.window_secs / SLICES)).max(newest)
+}
+
 fn sum(r: &Rolling, e: u64) -> u64 {
     let first = e.saturating_sub(SLICES);
     r.slots
         .iter()
-        .filter(|s| s.epoch >= first && s.epoch <= e && !(s.epoch == 0 && s.amount == 0))
+        .filter(|s| s.epoch >= first && s.epoch <= e && live(s))
         .fold(0u64, |acc, s| acc.saturating_add(s.amount))
 }
 
@@ -93,7 +105,7 @@ pub fn used(r: &Rolling, now: u64) -> u64 {
     if r.window_secs == 0 {
         return 0;
     }
-    sum(r, now / (r.window_secs / SLICES))
+    sum(r, epoch(r, now))
 }
 
 /// Count `notional` against the budget at `now`, or refuse it. `cap` and
@@ -107,10 +119,14 @@ pub fn spend(r: &mut Rolling, now: u64, notional: u64, cap: u64, window_secs: u6
     } else if r.cap != cap || r.window_secs != window_secs {
         return Err(GuardError::ConfigChanged);
     }
-    let e = now / (window_secs / SLICES);
+    let e = epoch(r, now);
     let s = sum(r, e);
     if s > cap || notional > cap - s {
         return Err(GuardError::BudgetExceeded { used: s, requested: notional, cap });
+    }
+    // Nothing to record: writing an empty bucket could only erase one.
+    if notional == 0 {
+        return Ok(());
     }
     let i = (e % (SLICES + 1)) as usize;
     let prev = if r.slots[i].epoch == e { r.slots[i].amount } else { 0 };
@@ -208,6 +224,32 @@ mod tests {
         assert_eq!(reconfigure(&mut r, 520, 200, W), Err(GuardError::NotDrained { ready_at: 561 }));
         reconfigure(&mut r, 561, 200, W).unwrap();
         spend(&mut r, 561, 200, 200, W).unwrap();
+    }
+
+    #[test]
+    fn a_clock_that_steps_back_cannot_erase_a_newer_bucket() {
+        // Seven slices back lands on the same ring slot as the newest spend.
+        let mut r = Rolling::default();
+        let slice = W / SLICES;
+        let t = 10_000 * slice;
+        spend(&mut r, t, 100, 100, W).unwrap();
+        let back = t - (SLICES + 1) * slice;
+        // Neither a zero spend nor a real one from the earlier clock frees the budget.
+        spend(&mut r, back, 0, 100, W).unwrap();
+        assert_eq!(used(&r, back), 100);
+        assert!(spend(&mut r, back, 1, 100, W).is_err());
+        assert_eq!(used(&r, t), 100);
+        assert!(spend(&mut r, t, 1, 100, W).is_err());
+        // Time moves on past the window as usual.
+        spend(&mut r, t + W + slice, 100, 100, W).unwrap();
+    }
+
+    #[test]
+    fn a_zero_spend_records_nothing() {
+        let mut r = Rolling::default();
+        spend(&mut r, 1_000, 0, 100, W).unwrap();
+        assert_eq!((r.cap, r.window_secs, r.spent), (100, W, 0));
+        assert!(r.slots.iter().all(|s| *s == Slot::default()));
     }
 
     #[test]
