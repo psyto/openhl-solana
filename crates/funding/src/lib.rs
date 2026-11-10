@@ -90,9 +90,33 @@ pub fn funding_pnl(size: i64, snapshot: i64, index_now: i64) -> i128 {
     delta * (size as i128) / FUNDING_INDEX_SCALE
 }
 
+/// [`funding_pnl`] rounded toward negative infinity: a position never
+/// receives more, nor pays less, than the exact amount. Use it when the
+/// counterparty is a pool whose depositors must not fund rounding.
+#[inline]
+pub fn funding_pnl_floor(size: i64, snapshot: i64, index_now: i64) -> i128 {
+    let x = ((index_now as i128) - (snapshot as i128)) * (size as i128);
+    let q = x / FUNDING_INDEX_SCALE;
+    if x % FUNDING_INDEX_SCALE != 0 && x < 0 {
+        q - 1
+    } else {
+        q
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floor_never_favours_the_position() {
+        // A long owes 1.5 units: funding_pnl truncates to -1, the floor makes it -2.
+        assert_eq!(funding_pnl(3, 0, -FUNDING_INDEX_SCALE as i64 / 2), -1);
+        assert_eq!(funding_pnl_floor(3, 0, -FUNDING_INDEX_SCALE as i64 / 2), -2);
+        // Receiving 1.5 units: both give 1.
+        assert_eq!(funding_pnl_floor(3, 0, FUNDING_INDEX_SCALE as i64 / 2), 1);
+        assert_eq!(funding_pnl_floor(4, 0, FUNDING_INDEX_SCALE as i64 / 2), 2);
+    }
 
     #[test]
     fn clamp_caps_both_sides() {
