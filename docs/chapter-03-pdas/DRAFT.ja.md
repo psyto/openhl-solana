@@ -1,10 +1,12 @@
-# 第3章 — PDA を原理から組み立てる
+# 第3章 — Solana の PDA を原理から理解する
 
 > 状態: ドラフト (v0.1)。
 > 教材コード: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_market` ハンドラ）、[`scripts/create-market/src/main.rs`](../../scripts/create-market/src/main.rs)、[`fuzz/basics/src/main.rs`](../../fuzz/basics/src/main.rs)（§3.7 の solinv ハーネス）。
 > 検証対象バージョン: solana-pubkey 2.4.0、solana-cpi 2.2.1、solana-system-interface 1.0.0、solana-program 2.3.0。
 
 ---
+
+**要点:** PDA(program-derived address)は、seed、1 バイトの bump、プログラム ID、固定の目印を sha256 でハッシュし、結果が ed25519 の曲線の外に出るまで bump を変えて求めるアドレスです。そのため秘密鍵がありません。署名できるのは、そのプログラムだけです(`invoke_signed` を通します)。この章では `find_program_address` と `invoke_signed` をソースで読み、PDA にマーケットのアカウントを作ります。
 
 ## §3.0  はじめに
 

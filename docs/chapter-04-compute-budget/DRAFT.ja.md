@@ -1,10 +1,12 @@
-# 第4章 — コンピュートバジェットとヒープの規律
+# 第4章 — Solana のコンピュートユニット、コンピュートバジェットとヒープ
 
 > 状態: ドラフト (v0.1)。
 > 教材コード: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_bench`、693–739 行）、[`scripts/bench/src/main.rs`](../../scripts/bench/src/main.rs)、[`fuzz/basics/src/main.rs`](../../fuzz/basics/src/main.rs)（§4.7 の solinv ハーネス）。
 > 検証対象バージョン: solana-program 2.3.0、solana-program-entrypoint 2.3.0、solana-compute-budget-interface 2.2.2。
 
 ---
+
+**要点:** Solana は実行の量をコンピュートユニット(CU)で数えます。既定ではトランザクション内の命令 1 つにつき 200,000 CU、トランザクション全体で最大 1.4M CU で、トランザクションごとに `ComputeBudgetInstruction` で CU の上限を設定できます。プログラムのヒープは既定で 32 KiB で、そのアロケータはメモリを解放しません。この章では `sol_log_compute_units` で CU を測り、それぞれの上限をソースで読みます。
 
 ## §4.0  はじめに
 

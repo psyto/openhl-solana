@@ -1,10 +1,12 @@
-# 第5章 — Sealevel 並列性とアカウントロック
+# 第5章 — Sealevel: Solana の並列実行とアカウントロック
 
 > 状態: ドラフト (v0.1)。
 > 教材コード: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_stats` 442–501 行、`process_bump_stats` 503–540 行）、[`scripts/stats/src/main.rs`](../../scripts/stats/src/main.rs)、[`scripts/create-market/src/main.rs`](../../scripts/create-market/src/main.rs)。
 > 検証対象バージョン: solana-instruction 2.3.3、solana-program 2.3.0。
 
 ---
+
+**要点:** Sealevel は、各命令の `AccountMeta` の並びをロックの宣言として読み、Solana のトランザクションを並列に走らせます。2 つのトランザクションは同時に走れます。ただし、一方が書き込むアカウントを他方が読むか書く場合は、順番に走ります。この章では `AccountMeta` を読み、共有のカウンタ 1 つでプログラムが直列になる様子を見ます。
 
 ## §5.0  はじめに
 

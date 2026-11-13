@@ -1,10 +1,12 @@
-# 第6章 — Vault Deposits で歩く CPI 内部
+# 第6章 — Solana の CPI の内部を、Vault への入金を例に
 
 > 状態: ドラフト (v0.1)。
 > 教材コード: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)（`process_create_vault` 892–1001 行、`process_deposit` 1008–1076 行）、[`scripts/create-vault/src/main.rs`](../../scripts/create-vault/src/main.rs)、[`scripts/deposit/src/main.rs`](../../scripts/deposit/src/main.rs)、[`fuzz/basics/src/main.rs`](../../fuzz/basics/src/main.rs)（§6.6 の solinv ハーネス）。
 > 検証対象バージョン: solana-cpi 2.2.1、solana-program 2.3.0、SPL Token プログラム（TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA）。
 
 ---
+
+**要点:** CPI(cross-program invocation)は、あるプログラムが別のプログラムを呼ぶことです。`invoke` を使い、PDA が署名する必要があるときは `invoke_signed` を使います。外側のトランザクションの署名者は、CPI に渡されれば呼ばれた側でも署名者のままです。この章では、SPL Token の vault と入金を、両方の呼び方を使って手で作ります。
 
 ## §6.0  はじめに
 

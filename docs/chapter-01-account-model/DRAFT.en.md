@@ -1,10 +1,12 @@
-# Chapter 1 — The Account Model from the Bytes Up
+# Chapter 1 — The Solana Account Model from the Bytes Up
 
 > Status: draft (v0.1).
 > Companion code: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs), [`scripts/allocate-market/src/main.rs`](../../scripts/allocate-market/src/main.rs).
 > Tested against: solana-sdk 2.3.1, solana-rent 2.2.1, solana-account 2.2.1, solana-system-interface 1.0.0.
 
 ---
+
+**In short:** every Solana account has five fields — lamports, data, owner, executable and rent epoch. Its data size sets the balance that makes it rent-exempt, and only its owner program may change its data. This chapter reads those fields in the source, computes a rent-exempt balance by hand, and hex-dumps a real account.
 
 ## §1.0  Framing
 

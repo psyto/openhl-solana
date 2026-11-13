@@ -1,10 +1,12 @@
-# Chapter 6 — CPI Internals via Vault Deposits
+# Chapter 6 — Solana CPI Internals, by Example: Vault Deposits
 
 > Status: draft (v0.1).
 > Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_vault` at lines 892–1001, `process_deposit` at lines 1008–1076), [`scripts/create-vault/src/main.rs`](../../scripts/create-vault/src/main.rs), [`scripts/deposit/src/main.rs`](../../scripts/deposit/src/main.rs), [`fuzz/basics/src/main.rs`](../../fuzz/basics/src/main.rs) (the solinv harness for §6.6).
 > Tested against: solana-cpi 2.2.1, solana-program 2.3.0, SPL Token program (TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA).
 
 ---
+
+**In short:** a CPI (cross-program invocation) is one program calling another — with `invoke`, or with `invoke_signed` when a PDA has to sign. A signer of the outer transaction that is passed into the CPI stays a signer for the callee. This chapter builds an SPL Token vault and a deposit by hand, using both calls.
 
 ## §6.0  Framing
 

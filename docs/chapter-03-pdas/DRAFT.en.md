@@ -1,10 +1,12 @@
-# Chapter 3 — PDAs from First Principles
+# Chapter 3 — Solana PDAs Explained from First Principles
 
 > Status: draft (v0.1).
 > Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (the `process_create_market` handler), [`scripts/create-market/src/main.rs`](../../scripts/create-market/src/main.rs), [`fuzz/basics/src/main.rs`](../../fuzz/basics/src/main.rs) (the solinv harness for §3.7).
 > Tested against: solana-pubkey 2.4.0, solana-cpi 2.2.1, solana-system-interface 1.0.0, solana-program 2.3.0.
 
 ---
+
+**In short:** a PDA (program-derived address) is an address computed by hashing the seeds, a one-byte bump, the program ID and a fixed marker with sha256, trying bumps until the result falls off the ed25519 curve — so it has no private key, and only the program it belongs to can sign for it, through `invoke_signed`. This chapter reads `find_program_address` and `invoke_signed` in the source and creates a market account at a PDA.
 
 ## §3.0  Framing
 

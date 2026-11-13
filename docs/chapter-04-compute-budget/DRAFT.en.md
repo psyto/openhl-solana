@@ -1,10 +1,12 @@
-# Chapter 4 — Compute Budget and Heap Discipline
+# Chapter 4 — Solana Compute Units, the Compute Budget and the Heap
 
 > Status: draft (v0.1).
 > Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_bench` at lines 693–739), [`scripts/bench/src/main.rs`](../../scripts/bench/src/main.rs), [`fuzz/basics/src/main.rs`](../../fuzz/basics/src/main.rs) (the solinv harness for §4.7).
 > Tested against: solana-program 2.3.0, solana-program-entrypoint 2.3.0, solana-compute-budget-interface 2.2.2.
 
 ---
+
+**In short:** Solana meters execution in compute units (CU): by default 200,000 CU for each instruction in a transaction and 1.4M CU per transaction at most, with the limit set per transaction by the `ComputeBudgetInstruction` that sets a compute unit limit. A program's heap is 32 KiB by default, and its allocator never frees. This chapter measures CU with `sol_log_compute_units` and reads each limit in the source.
 
 ## §4.0  Framing
 

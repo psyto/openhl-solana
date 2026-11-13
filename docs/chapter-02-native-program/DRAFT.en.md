@@ -1,10 +1,12 @@
-# Chapter 2 — Writing a Native Program Without Anchor
+# Chapter 2 — A Native Solana Program Without Anchor
 
 > Status: draft (v0.1).
 > Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs), [`scripts/init-market/src/main.rs`](../../scripts/init-market/src/main.rs).
 > Tested against: solana-program 2.3.0, solana-program-entrypoint 2.3.0, solana-account-info 2.3.0, solana-program-error 2.2.2, solana-system-interface 1.0.0.
 
 ---
+
+**In short:** a Solana program does not need Anchor. `entrypoint!`, a slice of `AccountInfo`, a hand-written instruction decode and an owner check are the whole skeleton. This chapter writes one in about 160 lines of Rust and maps each part to what Anchor's `#[program]` and `#[derive(Accounts)]` would generate.
 
 ## §2.0  Framing
 

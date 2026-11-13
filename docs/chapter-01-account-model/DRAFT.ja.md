@@ -1,10 +1,12 @@
-# 第1章 — バイトから組み立てるアカウントモデル
+# 第1章 — Solana のアカウントモデルをバイトから組み立てる
 
 > 状態: ドラフト (v0.1)。
 > 教材コード: [`crates/state/src/lib.rs`](../../crates/state/src/lib.rs)、[`scripts/allocate-market/src/main.rs`](../../scripts/allocate-market/src/main.rs)。
 > 検証対象バージョン: solana-sdk 2.3.1、solana-rent 2.2.1、solana-account 2.2.1、solana-system-interface 1.0.0。
 
 ---
+
+**要点:** Solana のアカウントは、lamports・data・owner・executable・rent epoch の 5 つのフィールドを持ちます。data のサイズによって、レント免除になる残高の額が決まります。また、data を書き換えられるのは owner のプログラムだけです。この章では、これらのフィールドをソースで読み、レント免除の額を手で計算し、実際のアカウントを 16 進ダンプで確かめます。
 
 ## §1.0  はじめに
 

@@ -1,10 +1,12 @@
-# 第2章 — Anchor を使わずネイティブプログラムを書く
+# 第2章 — Anchor を使わずに Solana のネイティブプログラムを書く
 
 > 状態: ドラフト (v0.1)。
 > 教材コード: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs)、[`scripts/init-market/src/main.rs`](../../scripts/init-market/src/main.rs)。
 > 検証対象バージョン: solana-program 2.3.0、solana-program-entrypoint 2.3.0、solana-account-info 2.3.0、solana-program-error 2.2.2、solana-system-interface 1.0.0。
 
 ---
+
+**要点:** Solana のプログラムに Anchor は必須ではありません。`entrypoint!`、`AccountInfo` のスライス、手書きの命令のデコード、owner の検査があれば骨組みはそろいます。この章では約 160 行の Rust で 1 本を書き、それぞれの部分が Anchor の `#[program]` と `#[derive(Accounts)]` なら何を生成するかと対応させます。
 
 ## §2.0  はじめに
 

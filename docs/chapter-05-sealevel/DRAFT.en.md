@@ -1,10 +1,12 @@
-# Chapter 5 — Sealevel Parallelism and Account Locks
+# Chapter 5 — Sealevel: Solana's Parallel Execution and Account Locks
 
 > Status: draft (v0.1).
 > Companion code: [`programs/openhl-core/src/lib.rs`](../../programs/openhl-core/src/lib.rs) (`process_create_stats` at lines 442–501, `process_bump_stats` at lines 503–540), [`scripts/stats/src/main.rs`](../../scripts/stats/src/main.rs), [`scripts/create-market/src/main.rs`](../../scripts/create-market/src/main.rs).
 > Tested against: solana-instruction 2.3.3, solana-program 2.3.0.
 
 ---
+
+**In short:** Sealevel runs Solana transactions in parallel by reading each instruction's `AccountMeta` list as lock declarations. Two transactions can run at the same time unless one of them writes an account the other reads or writes; then they run one after the other. This chapter reads `AccountMeta` and shows how one shared counter makes a program serialize.
 
 ## §5.0  Framing
 

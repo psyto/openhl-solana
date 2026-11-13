@@ -1,4 +1,4 @@
-//! Chapter 1 worked example — "The Account Model from the Bytes Up".
+//! Chapter 1 worked example — "The Solana Account Model from the Bytes Up".
 //!
 //! Allocates a `Market`-sized account on a Solana cluster via the
 //! System program, then fetches and hex-dumps its bytes with offsets
