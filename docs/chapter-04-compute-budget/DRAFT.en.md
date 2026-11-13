@@ -10,7 +10,7 @@
 
 ## §4.0  Framing
 
-So far every instruction we have written has cost roughly the same amount of compute: a few thousand units. The runtime's per-transaction ceiling — 200,000 compute units (CU) by default — has not even been visible. We could afford anything we wrote because we wrote very little.
+So far every instruction we have written has cost roughly the same amount of compute: a few thousand units. The runtime's default ceiling — 200,000 compute units (CU) for each instruction in the transaction — has not even been visible. We could afford anything we wrote because we wrote very little.
 
 That free ride ends the moment you do something proportional to anything. A hash inside a loop. A linear scan of an order book. A Borsh decode of a non-trivial struct. Each of these has a CU profile that grows with input, and that profile is the first thing that breaks before any other constraint does.
 
@@ -29,7 +29,7 @@ By the end you will be able to predict, before you ship anything, whether an ins
 
 ## §4.1  The compute unit and where it comes from
 
-Solana's VM is a sandboxed BPF interpreter. Every instruction executed inside that VM has a fixed compute-unit cost: simple ALU ops cost 1, a hash syscall costs more, a CPI to another program costs more still. The runtime keeps a per-transaction counter, starts it at the limit (default 200,000), and decrements as each operation executes. When it hits zero, the transaction aborts with `ComputationalBudgetExceeded`.
+Solana's VM is a sandboxed BPF interpreter. Everything executed inside that VM costs compute units: a simple BPF instruction costs 1, a hash syscall costs more (and more again for a longer input), a CPI to another program costs more still. The runtime keeps a per-transaction counter, starts it at the transaction's limit (by default 200,000 CU per instruction, so 200,000 for the one-instruction transactions in this chapter), and decrements as each operation executes. When it hits zero, the transaction aborts with `ComputationalBudgetExceeded`.
 
 These are not real-world milliseconds. They are an abstract economic unit that exists so the runtime can:
 
@@ -37,7 +37,7 @@ These are not real-world milliseconds. They are an abstract economic unit that e
 2. **Bound transaction execution time** without timing the host clock (which would be non-deterministic across validators).
 3. **Make scheduling predictable** — the runtime can decide ahead of time whether a transaction fits in a block.
 
-The default per-transaction limit is 200,000 CU. The maximum a transaction can request is 1,400,000 CU. Both are network constants that have changed over time; they are not in any single Rust file (they live in runtime feature gates), so the right place to look them up is the validator's CLI: `solana program-buffer-info` and friends, or the official docs.
+By default a transaction gets 200,000 CU for each of its instructions (instructions to the Compute Budget program itself don't count), capped at 1,400,000 CU. The maximum a transaction can request is 1,400,000 CU. Both are network constants that have changed over time, enforced by the validator rather than by anything in your program's crates, so check the official docs for the current values.
 
 What *is* in code, and what programs use to measure themselves, is `sol_log_compute_units` at `solana-program-2.3.0/src/log.rs:92–101`:
 

@@ -12,7 +12,7 @@
 
 In Chapters 1 and 2 every account we touched was identified by an *ad-hoc* keypair — a `Keypair::new()` generated client-side, used to sign the create/assign transactions, then discarded. That works for a single-account demo. It does not work for anything else.
 
-Consider how a user, three weeks from now, looks up the market account for `(SOL, USDC)`. They didn't make the market; they don't have its keypair. There is no on-chain registry of "all markets" to scan. The only way to find the account is for the program to **dictate** where it lives — to derive its address from the parameters that identify it (`base_mint`, `quote_mint`, the program ID) in a way that anyone can recompute. Pubic key derivation, with no corresponding private key, attached to your program.
+Consider how a user, three weeks from now, looks up the market account for `(SOL, USDC)`. They didn't make the market; they don't have its keypair. There is no on-chain registry of "all markets" to scan. The only way to find the account is for the program to **dictate** where it lives — to derive its address from the parameters that identify it (`base_mint`, `quote_mint`, the program ID) in a way that anyone can recompute. Public key derivation, with no corresponding private key, attached to your program.
 
 That is a Program-Derived Address (PDA). In this chapter we will:
 
