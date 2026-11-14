@@ -14,3 +14,4 @@ test-ledger/
 *.json
 !Cargo.json
 !scenarios/*.json
+!.mcp.json
