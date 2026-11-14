@@ -1,0 +1,166 @@
+# The table in Chapter 11, Exercise §11.7, as data: for each check, what
+# deleting it does. `tools/claims` deletes each one in turn, rebuilds, runs the
+# tests, the fuzzer and the probe, and fails if a row no longer reads the way
+# the chapter prints it.
+#
+#   cargo run --release --manifest-path tools/claims/Cargo.toml -- fuzz/positions/claims.toml
+#
+# A deletion is `find` -> `replace` inside `in_fn`. `false && ` turns a check
+# off without touching what follows; mind the precedence when the condition
+# is chained with `||` (§11.7 tells how that misled us once).
+
+root = "../.."
+docs = ["docs/chapter-11-liquidation/DRAFT.en.md", "docs/chapter-11-liquidation/DRAFT.ja.md"]
+prepare = ["cd fuzz/positions && cargo build --release --features invariant_ch11"]
+build = "cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml"
+test = "cd fuzz/positions && cargo test --release --features invariant_ch11"
+fuzz = "cd fuzz/positions && crucible run openhl_positions_fuzz invariant_ch11 --binary-in target/release/invariant_test --timeout 600"
+fuzz_seconds = 45
+probe = "cd fuzz/positions && cargo test --release --features invariant_ch11 -- --ignored --nocapture probe"
+
+# ── OpenPosition ────────────────────────────────────────────────────────────
+
+[[claim]]
+row = "Open: `user_ai.is_signer`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_open_position("
+find = "if !user_ai.is_signer {"
+replace = "if false && !user_ai.is_signer {"
+refused = { probe = "open_position | signer off", log = "unauthorized signer" }
+
+[[claim]]
+row = "Open: `market_ai.owner == program_id`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_open_position("
+find = "if market_ai.owner != program_id {"
+replace = "if false && market_ai.owner != program_id {"
+refused = { probe = "open_position | slot 1 swapped", log = "market is not a Market account" }
+
+[[claim]]
+row = "Open: `verify_vault_token_account`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_open_position("
+find = "verify_vault_token_account(vault_token_ai, market_ai.key, mint_ai.key, program_id)?;"
+replace = ""
+fuzz = ["account-swap", "open_position", "account 7 swapped"]
+
+[[claim]]
+row = "Open: the position PDA"
+also = ["Open: ポジションの PDA"]
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_open_position("
+find = "if position_ai.key != &expected {"
+replace = "if false && position_ai.key != &expected {"
+refused = { probe = "open_position | slot 2 swapped", log = "unauthorized signer" }
+
+[[claim]]
+row = "Open: `verify_market_oracle_and_funding`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_open_position("
+find = "verify_market_oracle_and_funding(oracle_ai, funding_ai, market_ai.key, program_id)?;"
+replace = ""
+fuzz = ["account-swap", "open_position", "account 3 swapped"]
+
+[[claim]]
+row = "Open: the initial margin check"
+also = ["Open: 初期証拠金の検査"]
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_open_position("
+find = "if (collateral as u128) < im_required {"
+replace = "if false && (collateral as u128) < im_required {"
+tests_fail = ["open_below_initial_margin_is_refused"]
+
+# ── ClosePosition ───────────────────────────────────────────────────────────
+
+[[claim]]
+row = "Close: `user_ai.is_signer`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_close_position("
+find = "if !user_ai.is_signer {"
+replace = "if false && !user_ai.is_signer {"
+fuzz = ["signer-skip", "close_position"]
+
+[[claim]]
+row = "Close: `position.user == user`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_close_position("
+find = "if position.user != *user_ai.key.as_ref() {"
+replace = "if false && position.user != *user_ai.key.as_ref() {"
+fuzz = ["account-swap", "close_position", "account 1 swapped"]
+
+[[claim]]
+row = "Close: `position.market == market`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_close_position("
+find = "if position.market != *market_ai.key.as_ref() {"
+replace = "if false && position.market != *market_ai.key.as_ref() {"
+fuzz = ["account-swap", "close_position", "together"]  # one of the sets in invariant_ch11
+
+[[claim]]
+row = "Close: `verify_vault_token_account`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_close_position("
+find = "verify_vault_token_account(vault_token_ai, market_ai.key, mint_ai.key, program_id)?;"
+replace = ""
+refused = { probe = "close_position | slot 7 swapped", log = "owner does not match" }
+
+[[claim]]
+row = "Close: `verify_market_oracle_and_funding`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_close_position("
+find = "verify_market_oracle_and_funding(oracle_ai, funding_ai, market_ai.key, program_id)?;"
+replace = ""
+fuzz = ["account-swap", "close_position", "account 2 swapped"]
+tests_fail = ["close_refuses_another_markets_oracle"]
+
+[[claim]]
+row = "Close: `fund.market == market`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_close_position("
+find = "if fund.market != *market_ai.key.as_ref() {"
+replace = "if false && fund.market != *market_ai.key.as_ref() {"
+fuzz = ["account-swap", "close_position", "account 10 swapped"]
+
+# ── Liquidate ───────────────────────────────────────────────────────────────
+
+[[claim]]
+row = "Liquidate: `liquidator_ai.is_signer`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_liquidate("
+find = "if !liquidator_ai.is_signer {"
+replace = "if false && !liquidator_ai.is_signer {"
+fuzz = ["signer-skip", "liquidate"]
+
+[[claim]]
+row = "Liquidate: `position.market == market`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_liquidate("
+find = "if position.market != *market_ai.key.as_ref() {"
+replace = "if false && position.market != *market_ai.key.as_ref() {"
+fuzz = ["account-swap", "liquidate", "together"]
+
+[[claim]]
+row = "Liquidate: the owner's token account"
+also = ["Liquidate: 所有者のトークン口座"]
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_liquidate("
+find = "|| owner_token[32..64] != position.user"
+replace = "|| false"
+fuzz = ["account-swap", "liquidate", "account 6 swapped"]
+
+[[claim]]
+row = "Liquidate: `is_liquidatable`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_liquidate("
+find = "if !openhl_margin::is_liquidatable(equity, maint_required) {"
+replace = "if false && !openhl_margin::is_liquidatable(equity, maint_required) {"
+tests_fail = ["healthy_position_is_not_liquidatable"]
+
+[[claim]]
+row = "Liquidate: `verify_market_oracle_and_funding`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_liquidate("
+find = "verify_market_oracle_and_funding(oracle_ai, funding_ai, market_ai.key, program_id)?;"
+replace = ""
+fuzz = ["account-swap", "liquidate", "account 2 swapped"]
+tests_fail = ["liquidate_refuses_another_markets_oracle"]

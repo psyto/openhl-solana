@@ -1,0 +1,12 @@
+[package]
+name = "claims"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: a tool for the chapters, not part of the program's workspace.
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

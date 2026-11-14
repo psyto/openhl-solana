@@ -7,6 +7,18 @@
 
 ---
 
+## How to read this chapter
+
+The three handlers this chapter walks through were written on 2026-05-23 in one session with Claude (Opus 4.7); 92 of this repository's first 104 commits name Claude as a co-author. They compiled, their tests passed, and the first version of this chapter explained them. Five and a half months later a fuzzer found that all three would take another market's oracle: 200 in, 1,200 out (§11.3).
+
+More and more code will be read this way: an AI writes it, and you come to understand it by checking what it claims. So the chapter has two halves. §11.1–§11.6 walk through the code as it is. §11.7 lists the checks in it and asks, for each one, what happens if it is deleted. Predict, delete, run, compare with the table. The rows you got wrong are what you did not yet understand.
+
+The table is not a one-off measurement. [`fuzz/positions/claims.toml`](../../fuzz/positions/claims.toml) holds each row as data, and [`tools/claims`](../../tools/claims) deletes each check in turn, reruns the tests, the fuzzer and the probe, and fails CI if a row no longer reads the way this page says. If the code changes and the chapter does not, the build says so.
+
+> **A question to carry through the chapter.** On 2026-02-15 the lending protocol Moonwell priced cbETH at about $1.12 instead of about $2,200, and the liquidations that followed left $1,779,044.83 of bad debt ([The Block](https://www.theblock.co/post/390302/defi-lending-protocol-moonwell-hit-with-1-8-million-bad-debt-after-oracle-misconfiguration)). The feeds were honest; the configuration used the cbETH/ETH exchange rate as a dollar price and never multiplied by ETH/USD. The pull request's commits were co-authored by Claude Opus 4.6, an auditor pointed out; Moonwell has not attributed the incident to AI, and it is a mistake a person could make too. The hole in §11.3 is of the same family: every price in it is honest, it is just another market's. Which check here stops that, what would catch its deletion, and how would you know it is still there next month?
+
+---
+
 ## §11.0  Framing
 
 This is the convergence chapter. Every other Phase A and Phase B primitive — oracle, funding, vault, matcher, parallelism — exists so this chapter can be written. A perp DEX without `OpenPosition` / `ClosePosition` / `Liquidate` is a collection of pieces; a perp DEX with them is a perp DEX.
@@ -488,7 +500,7 @@ On the program as it is, no `[FUZZ_FINDING]` line appears. On the program before
 
 Slot 3 is the oracle. Crucible stops an iteration at the first finding, so Close and Liquidate never got their turn; the tests `close_refuses_another_markets_oracle` and `liquidate_refuses_another_markets_oracle` pin those two.
 
-> **Exercise §11.7.** Delete each check in turn, rebuild, run, and predict first. Here is what we measured, 45 seconds each; for the "no" rows, the last column is what refused the swapped call instead, read from its logs (the `probe` test prints them):
+> **Exercise §11.7.** Delete each check in turn, rebuild, run, and predict first. Here is what we measured, 45 seconds each; for the "no" rows, the last column is what refused the swapped call instead, read from its logs (the `probe` test prints them). The same rows are in [`claims.toml`](../../fuzz/positions/claims.toml), and CI re-measures every one of them on each pull request that touches the program, the harness or this chapter (`cargo run --release --manifest-path tools/claims/Cargo.toml -- fuzz/positions/claims.toml` runs it locally, about 15 minutes):
 >
 > | Check deleted | Caught? | How, or what refused it instead |
 > |---|---|---|

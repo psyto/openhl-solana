@@ -1,0 +1,58 @@
+# Re-measures the "delete this check: is it caught?" table in Chapter 11
+# (Exercise §11.7) on every pull request that touches the program, the
+# harness, the chapter or the tool: each check in fuzz/positions/claims.toml
+# is deleted in turn, the program rebuilt, and the tests, the fuzzer and the
+# probe run again. Fails if any row no longer reads the way the chapter says.
+name: claims positions
+
+on:
+  pull_request:
+    paths:
+      - programs/openhl-core/**
+      - crates/**
+      - fuzz/positions/**
+      - tools/claims/**
+      - docs/chapter-11-liquidation/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/claims-positions.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  claims:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.local/share/solana
+            ~/.cache/solana
+          key: fuzz-tools-${{ runner.os }}-agave-4.1.2-crucible-v0.1.0
+
+      - name: Install the Solana toolchain
+        run: |
+          if [ ! -x ~/.local/share/solana/install/active_release/bin/cargo-build-sbf ]; then
+            sh -c "$(curl -sSfL https://release.anza.xyz/v4.1.2/install)"
+          fi
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Install the Crucible CLI
+        run: |
+          command -v crucible || cargo install --locked \
+            --git https://github.com/asymmetric-research/crucible --tag v0.1.0 crucible-fuzz-cli
+
+      - name: Build the tool
+        run: cargo build --release --manifest-path tools/claims/Cargo.toml
+
+      - name: Re-measure the §11.7 table
+        run: tools/claims/target/release/claims fuzz/positions/claims.toml
