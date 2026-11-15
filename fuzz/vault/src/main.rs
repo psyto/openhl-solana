@@ -8,8 +8,11 @@
 //! A's deposit into K's vault and A's withdrawal from it, and solinv swaps in
 //! B's share account, A's share account in the other vault, the other vault,
 //! the other vault's token account, or a token account B holds. A two-slot
-//! set points C's junk withdrawal at K's token account. Any swap that
-//! succeeds and changes state is a finding.
+//! set points C's junk withdrawal at K's token account. K's update of its
+//! vault's NAV is sent with the signer cleared and with A's vault in its
+//! place, and B's first deposit into A's vault with another account named
+//! as the system program. Any swap that succeeds and changes state is a
+//! finding.
 
 use crucible_fuzzer::*;
 use solana_account::Account;
@@ -33,6 +36,7 @@ const TOKEN_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const IX_CREATE_TRADING_VAULT: u8 = 19;
 const IX_VAULT_DEPOSIT: u8 = 20;
 const IX_VAULT_WITHDRAW: u8 = 21;
+const IX_VAULT_UPDATE_NAV: u8 = 22;
 
 const START_BALANCE: u64 = 1_000_000;
 const START_DEPOSIT: u64 = 100_000;
@@ -82,6 +86,8 @@ struct VaultFixture {
     payer: Arc<Keypair>,
     a: Arc<Keypair>,
     b: Arc<Keypair>,
+    /// The manager of K's vault.
+    k: Arc<Keypair>,
     market: Pubkey,
     mint: Pubkey,
     /// K's vault, where A and B both hold shares.
@@ -96,6 +102,8 @@ struct VaultFixture {
     c_vault: Pubkey,
     c_junk: Pubkey,
     c_real: Pubkey,
+    /// An account that is no program, named where a program id goes.
+    not_a_program: Pubkey,
 }
 
 impl VaultFixture {
@@ -151,6 +159,14 @@ impl VaultFixture {
     fn junk_metas(&self, mut metas: Vec<AccountMeta>, mint_ix: usize) -> Vec<AccountMeta> {
         metas[mint_ix] = AccountMeta::new_readonly(self.junk, false);
         metas
+    }
+
+    fn update_nav_metas(&self, vault: &Pubkey, manager: &Pubkey) -> Vec<AccountMeta> {
+        vec![AccountMeta::new_readonly(*manager, true), AccountMeta::new(*vault, false)]
+    }
+
+    fn ix(&self, accounts: Vec<AccountMeta>, data: Vec<u8>) -> Instruction {
+        Instruction { program_id: CORE_ID, accounts, data }
     }
 
     fn create_vault(&mut self, manager: Arc<Keypair>, mint: Pubkey, vault: Pubkey, what: &str) {
@@ -230,6 +246,7 @@ impl VaultFixture {
             payer: Arc::clone(&payer),
             a: Arc::clone(&a),
             b: Arc::clone(&b),
+            k: Arc::clone(&k),
             market,
             mint,
             vault: trading_vault(&market, &k.pubkey()),
@@ -241,6 +258,7 @@ impl VaultFixture {
             c_vault: trading_vault(&market, &c.pubkey()),
             c_junk: Keypair::new().pubkey(),
             c_real: Keypair::new().pubkey(),
+            not_a_program: Keypair::new().pubkey(),
         };
 
         // The vault handlers read only the market's key and owner, so the
@@ -266,6 +284,8 @@ impl VaultFixture {
         f.put(junk, token(), mint_data(6));
         f.put(cj, token(), token_account_data(&junk, &c.pubkey(), START_BALANCE));
         f.put(cr, token(), token_account_data(&mint, &c.pubkey(), 0));
+        let np = f.not_a_program;
+        f.put(np, SYSTEM_ID, vec![]);
         f.create_vault(Arc::clone(&c), junk, cv, "C opens a junk-mint vault");
         let ix = Instruction {
             program_id: CORE_ID,
@@ -338,7 +358,7 @@ impl HasInstructionSet for VaultFixture {
                     vault_token(&self.a_vault),  // A's vault's token account
                     self.b_ata,                  // "vault" account B holds
                 ],
-                vec![],
+                vec![self.not_a_program],        // as the token program
             ],
             data_sample: amount_data(IX_VAULT_DEPOSIT, 10),
             signers: vec![Arc::clone(&self.a)],
@@ -375,7 +395,7 @@ impl HasInstructionSet for VaultFixture {
                     vault_token(&self.a_vault),      // A's vault's token account
                     self.b_ata,                      // "vault" account B holds
                 ],
-                vec![],
+                vec![self.not_a_program],            // as the token program
             ],
             data_sample: amount_data(IX_VAULT_WITHDRAW, 10),
             signers: vec![Arc::clone(&self.a)],
@@ -395,7 +415,42 @@ impl HasInstructionSet for VaultFixture {
             signers: vec![Arc::clone(&self.c)],
             ..withdraw.clone()
         };
-        vec![deposit, withdraw, junk_withdraw]
+        // B's first deposit into A's vault: the share account does not exist
+        // yet, so this is the call that uses the system program.
+        let mut first_deposit_swaps = vec![vec![]; 9];
+        first_deposit_swaps[3] = vec![self.not_a_program];
+        let first_deposit = InstructionSpec {
+            name: "vault_deposit_first".into(),
+            accounts: self.deposit_metas(&self.a_vault, &b, &self.b_ata),
+            swap_alternates: first_deposit_swaps,
+            signers: vec![Arc::clone(&self.b)],
+            ..deposit.clone()
+        };
+        // K, the manager of K's vault, reports its NAV.
+        let update_nav = InstructionSpec {
+            program_id: CORE_ID,
+            name: "vault_update_nav".into(),
+            accounts: self.update_nav_metas(&self.vault, &self.k.pubkey()),
+            signer_indices: vec![0],
+            optional_signer_indices: vec![],
+            expected_owners: vec![None, c],
+            expected_discriminators: vec![None; 2],
+            expected_pda_seeds: vec![None; 2],
+            creates_indices: vec![],
+            swap_alternates: vec![
+                vec![],
+                vec![self.a_vault], // A's vault, which K does not manage
+            ],
+            data_sample: amount_data(IX_VAULT_UPDATE_NAV, 3 * START_DEPOSIT),
+            signers: vec![Arc::clone(&self.k)],
+            state_invariants: vec![],
+            cu_budget: None,
+            cpi_reentrancy: None,
+            realloc_check: None,
+            bump_seed_check: None,
+            guards: vec![],
+        };
+        vec![deposit, first_deposit, withdraw, junk_withdraw, update_nav]
     }
 }
 
@@ -418,8 +473,6 @@ fn invariant_vault(fixture: &mut VaultFixture) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const IX_VAULT_UPDATE_NAV: u8 = 22;
 
     /// A manages its own vault in the same market, so it can mint itself
     /// shares there for almost nothing (report NAV 1, then deposit 2), and
@@ -507,5 +560,70 @@ mod tests {
         // SPL Token refuses: the vault's own account holds only 100,000.
         assert!(out.contains("insufficient funds"), "refused for another reason: {out}");
         assert_eq!(k_left, 2 * START_DEPOSIT, "K's token account changed");
+    }
+
+    /// A holds 100,000 of the 200,000 shares in K's vault and asks to burn
+    /// all 200,000. The program refuses. Without that check `share.shares -=`
+    /// wraps (the program is built without overflow checks), and A takes
+    /// B's 100,000 too. The fuzzer's amounts stay under 10,000, so only this
+    /// test states the rule.
+    #[test]
+    fn withdraw_refuses_more_shares_than_held() {
+        let mut f = VaultFixture::setup();
+        let (a, vault, a_ata) = (Arc::clone(&f.a), f.vault, f.a_ata);
+        let before = f.ctx.token_balance(&a_ata);
+        let ix = f.ix(f.withdraw_metas(&vault, &a.pubkey(), &a_ata), amount_data(IX_VAULT_WITHDRAW, 2 * START_DEPOSIT));
+        let (ok, out) = f.send_logged(ix, Arc::clone(&a));
+        let taken = f.ctx.token_balance(&a_ata) - before;
+        let left = f.ctx.token_balance(&vault_token(&vault));
+        assert!(!ok, "A held {START_DEPOSIT} shares and took {taken}; {left} left in K's token account");
+        assert!(out.contains("insufficient shares"), "refused for another reason: {out}");
+    }
+
+    /// Not a check: sends each spec once with its signer flag cleared, with
+    /// each single-slot swap, with each account the program expects to be
+    /// owned by a given program handed to another owner (same address, same
+    /// bytes, so no seed check stands in the way), and with an amount of 0,
+    /// and prints how it ended. Used for the "refused" rows in §12.7
+    /// (`cargo test --release --features invariant_vault -- --ignored --nocapture probe`).
+    #[test]
+    #[ignore]
+    fn probe() {
+        let f0 = VaultFixture::setup();
+        for spec in f0.instructions() {
+            let mut variants: Vec<(String, Vec<AccountMeta>, Vec<u8>, Option<usize>)> = vec![];
+            let mut m = spec.accounts.clone();
+            m[0].is_signer = false;
+            variants.push(("signer off".into(), m, spec.data_sample.clone(), None));
+            for (i, alts) in spec.swap_alternates.iter().enumerate() {
+                for (j, alt) in alts.iter().enumerate() {
+                    let mut m = spec.accounts.clone();
+                    m[i].pubkey = *alt;
+                    let what = if j == 0 { format!("slot {i} swapped") } else { format!("slot {i} swapped, alternate {}", j + 1) };
+                    variants.push((what, m, spec.data_sample.clone(), None));
+                }
+            }
+            for (i, owner) in spec.expected_owners.iter().enumerate() {
+                if owner.is_some() && f0.ctx.account_exists(&spec.accounts[i].pubkey) {
+                    variants.push((format!("slot {i} owner changed"), spec.accounts.clone(), spec.data_sample.clone(), Some(i)));
+                }
+            }
+            variants.push(("amount 0".into(), spec.accounts.clone(), vec![spec.data_sample[0], 0, 0, 0, 0, 0, 0, 0, 0], None));
+            for (what, metas, data, reown) in variants {
+                let mut f = f0.clone();
+                if let Some(i) = reown {
+                    let key = spec.accounts[i].pubkey;
+                    let mut acct = f.ctx.get_account(&key).expect("account to re-own");
+                    acct.owner = Pubkey::new_from_array([9u8; 32]);
+                    f.ctx.write_account(&key, acct).expect("write account");
+                }
+                let signer = Arc::clone(&spec.signers[0]);
+                let (ok, out) = f.send_logged(f.ix(metas, data), signer);
+                let lines: Vec<&str> = out.split("\", \"").collect();
+                let log = lines.iter().rev().find(|l| l.starts_with("Program log:")).copied().unwrap_or("-");
+                let fail = lines.iter().rev().find(|l| l.contains(" failed: ")).map(|l| l.split(" failed: ").last().unwrap_or("")).unwrap_or("-");
+                println!("PROBE {} | {what} | ok={ok} | {} | {}", spec.name, log.chars().take(100).collect::<String>(), fail.split('"').next().unwrap_or(""));
+            }
+        }
     }
 }

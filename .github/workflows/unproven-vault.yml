@@ -1,0 +1,61 @@
+# Re-measures the "delete this check: what notices?" table in Chapter 12
+# (Exercise §12.7) on every pull request that touches the program, the
+# harness or the chapter: unproven deletes each check in
+# fuzz/vault/unproven.toml in turn, rebuilds the program, and runs the tests,
+# the fuzzer and the probe again. Fails if any row no longer reads the way the
+# chapter says.
+name: unproven vault
+
+on:
+  pull_request:
+    paths:
+      - programs/openhl-core/**
+      - crates/**
+      - fuzz/vault/**
+      - docs/chapter-12-vault/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/unproven-vault.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unproven:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.local/share/solana
+            ~/.cache/solana
+          key: unproven-tools-${{ runner.os }}-agave-4.1.2-crucible-v0.1.0-unproven-9b9c1f0
+
+      - name: Install the Solana toolchain
+        run: |
+          if [ ! -x ~/.local/share/solana/install/active_release/bin/cargo-build-sbf ]; then
+            sh -c "$(curl -sSfL https://release.anza.xyz/v4.1.2/install)"
+          fi
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Install the Crucible CLI
+        run: |
+          command -v crucible || cargo install --locked \
+            --git https://github.com/asymmetric-research/crucible --tag v0.1.0 crucible-fuzz-cli
+
+      # unproven has no release tag yet; pinned to the commit its 0.1 is.
+      - name: Install unproven
+        run: |
+          command -v unproven || cargo install --locked \
+            --git https://github.com/fabrknt/unproven --rev 9b9c1f0a824cfa240fb75d5f8a4bf4202b100ad5
+
+      - name: Re-measure the §12.7 table
+        run: unproven fuzz/vault/unproven.toml

@@ -1,0 +1,273 @@
+# The table in Chapter 12, Exercise §12.7, as data: for each check in
+# VaultDeposit, VaultWithdraw and VaultUpdateNAV, what deleting it does.
+# `unproven` deletes each one in turn, rebuilds, runs the tests, the fuzzer
+# and the probe, and fails if a row no longer reads the way the chapter
+# prints it.
+#
+#   unproven fuzz/vault/unproven.toml
+#
+# A deletion is `find` -> `replace` inside `in_fn`. `false && ` turns a check
+# off; where two conditions share one `if` with `||`, the one under test is
+# replaced by `false` instead, so the other stays.
+
+root = "../.."
+docs = ["docs/chapter-12-vault/DRAFT.en.md", "docs/chapter-12-vault/DRAFT.ja.md"]
+prepare = ["cd fuzz/vault && cargo build --release --features invariant_vault"]
+build = "cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml"
+test = "cd fuzz/vault && cargo test --release --features invariant_vault"
+fuzz = "cd fuzz/vault && crucible run openhl_vault_fuzz invariant_vault --binary-in target/release/invariant_test --timeout 600"
+fuzz_seconds = 60
+probe = "cd fuzz/vault && cargo test --release --features invariant_vault -- --ignored --nocapture probe"
+
+# ── VaultDeposit ────────────────────────────────────────────────────────────
+
+[[claim]]
+row = "Deposit: `assets != 0`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_deposit("
+find = "if assets == 0 {"
+replace = "if false && assets == 0 {"
+refused = { probe = "vault_deposit | amount 0", log = "would mint 0 shares" }
+
+[[claim]]
+row = "Deposit: `depositor.is_signer`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_deposit("
+find = "if !depositor_ai.is_signer {"
+replace = "if false && !depositor_ai.is_signer {"
+refused = { probe = "vault_deposit | signer off", log = "Cross-program invocation with unauthorized signer" }
+
+[[claim]]
+row = "Deposit: `vault.owner == program_id`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_deposit("
+find = "if vault_ai.owner != program_id || vault_ai.data_len() != TradingVault::LEN {"
+replace = "if false || vault_ai.data_len() != TradingVault::LEN {"
+refused = { probe = "vault_deposit | slot 1 owner changed", log = "instruction modified data of an account it does not own" }
+
+[[claim]]
+row = "Deposit: the system program's id"
+also = ["Deposit: システムプログラムの id"]
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_deposit("
+find = "if system_ai.key != &system_program::ID {"
+replace = "if false && system_ai.key != &system_program::ID {"
+refused = { probe = "vault_deposit_first | slot 3 swapped", log = "An account required by the instruction is missing" }
+
+[[claim]]
+row = "Deposit: the token program's id"
+also = ["Deposit: トークンプログラムの id"]
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_deposit("
+find = "if token_ai.key != &SPL_TOKEN_PROGRAM_ID {"
+replace = "if false && token_ai.key != &SPL_TOKEN_PROGRAM_ID {"
+refused = { probe = "vault_deposit | slot 8 swapped", log = "An account required by the instruction is missing" }
+
+[[claim]]
+row = "Deposit: `depositor_token.owner == SPL Token`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_deposit("
+find = "if depositor_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {"
+replace = "if false && depositor_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {"
+refused = { probe = "vault_deposit | slot 6 owner changed", log = "Instruction: Transfer | instruction modified data of an account it does not own" }
+
+[[claim]]
+row = "Deposit: `verify_trading_vault_token`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_deposit("
+find = "verify_trading_vault_token(vault_token_ai, vault_ai.key, program_id)?;"
+replace = ""
+fuzz = ["account-swap", "ix vault_deposit succeeded", "account 7 swapped"]
+
+[[claim]]
+row = "Deposit: the share PDA"
+also = ["Deposit: 持ち分の PDA"]
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_deposit("
+find = "if share_ai.key != &expected_share {"
+replace = "if false && share_ai.key != &expected_share {"
+fuzz = ["account-swap", "ix vault_deposit succeeded", "account 2 swapped"]
+
+[[claim]]
+row = "Deposit: the vault's discriminator"
+also = ["Deposit: vault の discriminator"]
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_deposit("
+find = "if vault.discriminator != TRADING_VAULT_DISCRIMINATOR {"
+replace = "if false && vault.discriminator != TRADING_VAULT_DISCRIMINATOR {"
+
+[[claim]]
+row = "Deposit: `vault.market == market`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_deposit("
+find = "if vault.market != *market_ai.key.as_ref() {"
+replace = "if false && vault.market != *market_ai.key.as_ref() {"
+
+[[claim]]
+row = "Deposit: `vault.mint == mint`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_deposit("
+find = "if vault.mint != *mint_ai.key.as_ref() {"
+replace = "if false && vault.mint != *mint_ai.key.as_ref() {"
+
+[[claim]]
+row = "Deposit: the share's discriminator"
+also = ["Deposit: 持ち分の discriminator"]
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_deposit("
+find = "if share.discriminator != VAULT_SHARE_DISCRIMINATOR {"
+replace = "if false && share.discriminator != VAULT_SHARE_DISCRIMINATOR {"
+
+# ── VaultWithdraw ───────────────────────────────────────────────────────────
+
+[[claim]]
+row = "Withdraw: `shares != 0`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_withdraw("
+find = "if shares_to_burn == 0 {"
+replace = "if false && shares_to_burn == 0 {"
+
+[[claim]]
+row = "Withdraw: `owner.is_signer`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_withdraw("
+find = "if !owner_ai.is_signer {"
+replace = "if false && !owner_ai.is_signer {"
+fuzz = ["signer-skip", "ix vault_withdraw "]
+
+[[claim]]
+row = "Withdraw: `vault.owner == program_id`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_withdraw("
+find = "if vault_ai.owner != program_id || vault_ai.data_len() != TradingVault::LEN {"
+replace = "if false || vault_ai.data_len() != TradingVault::LEN {"
+refused = { probe = "vault_withdraw | slot 1 owner changed", log = "instruction modified data of an account it does not own" }
+
+[[claim]]
+row = "Withdraw: `share.owner == program_id`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_withdraw("
+find = "if share_ai.owner != program_id || share_ai.data_len() != VaultShare::LEN {"
+replace = "if false || share_ai.data_len() != VaultShare::LEN {"
+refused = { probe = "vault_withdraw | slot 2 owner changed", log = "instruction modified data of an account it does not own" }
+
+[[claim]]
+row = "Withdraw: the token program's id"
+also = ["Withdraw: トークンプログラムの id"]
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_withdraw("
+find = "if token_ai.key != &SPL_TOKEN_PROGRAM_ID {"
+replace = "if false && token_ai.key != &SPL_TOKEN_PROGRAM_ID {"
+refused = { probe = "vault_withdraw | slot 7 swapped", log = "An account required by the instruction is missing" }
+
+[[claim]]
+row = "Withdraw: `owner_token.owner == SPL Token`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_withdraw("
+find = "if owner_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {"
+replace = "if false && owner_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {"
+refused = { probe = "vault_withdraw | slot 5 owner changed", log = "Instruction: Transfer | instruction modified data of an account it does not own" }
+
+[[claim]]
+row = "Withdraw: `verify_trading_vault_token`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_withdraw("
+find = "verify_trading_vault_token(vault_token_ai, vault_ai.key, program_id)?;"
+replace = ""
+tests_fail = ["withdraw_refuses_the_token_account_of_another_vault"]
+
+[[claim]]
+row = "Withdraw: the vault's discriminator"
+also = ["Withdraw: vault の discriminator"]
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_withdraw("
+find = "if vault.discriminator != TRADING_VAULT_DISCRIMINATOR {"
+replace = "if false && vault.discriminator != TRADING_VAULT_DISCRIMINATOR {"
+
+[[claim]]
+row = "Withdraw: `vault.total_shares != 0`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_withdraw("
+find = "if vault.total_shares == 0 {"
+replace = "if false && vault.total_shares == 0 {"
+
+[[claim]]
+row = "Withdraw: `vault.market == market`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_withdraw("
+find = "if vault.market != *market_ai.key.as_ref() {"
+replace = "if false && vault.market != *market_ai.key.as_ref() {"
+
+[[claim]]
+row = "Withdraw: `vault.mint == mint`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_withdraw("
+find = "if vault.mint != *mint_ai.key.as_ref() {"
+replace = "if false && vault.mint != *mint_ai.key.as_ref() {"
+
+[[claim]]
+row = "Withdraw: the share's discriminator"
+also = ["Withdraw: 持ち分の discriminator"]
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_withdraw("
+find = "if share.discriminator != VAULT_SHARE_DISCRIMINATOR {"
+replace = "if false && share.discriminator != VAULT_SHARE_DISCRIMINATOR {"
+
+[[claim]]
+row = "Withdraw: `share.vault == vault`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_withdraw("
+find = "if share.vault != *vault_ai.key.as_ref() {"
+replace = "if false && share.vault != *vault_ai.key.as_ref() {"
+fuzz = ["account-swap", "ix vault_withdraw succeeded", "account 2 swapped"]
+tests_fail = ["withdraw_refuses_a_share_from_another_vault"]
+
+[[claim]]
+row = "Withdraw: `share.owner == owner`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_withdraw("
+find = "if share.owner != *owner_ai.key.as_ref() {"
+replace = "if false && share.owner != *owner_ai.key.as_ref() {"
+fuzz = ["account-swap", "ix vault_withdraw succeeded", "account 2 swapped"]
+
+[[claim]]
+row = "Withdraw: `share.shares >= shares`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_withdraw("
+find = "if share.shares < shares_to_burn {"
+replace = "if false && share.shares < shares_to_burn {"
+tests_fail = ["withdraw_refuses_more_shares_than_held"]
+
+# ── VaultUpdateNAV ──────────────────────────────────────────────────────────
+
+[[claim]]
+row = "UpdateNAV: `manager.is_signer`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_update_nav("
+find = "if !manager_ai.is_signer {"
+replace = "if false && !manager_ai.is_signer {"
+fuzz = ["signer-skip", "ix vault_update_nav "]
+
+[[claim]]
+row = "UpdateNAV: `vault.owner == program_id`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_update_nav("
+find = "if vault_ai.owner != program_id || vault_ai.data_len() != TradingVault::LEN {"
+replace = "if false || vault_ai.data_len() != TradingVault::LEN {"
+refused = { probe = "vault_update_nav | slot 1 owner changed", log = "instruction modified data of an account it does not own" }
+
+[[claim]]
+row = "UpdateNAV: the vault's discriminator"
+also = ["UpdateNAV: vault の discriminator"]
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_update_nav("
+find = "if vault.discriminator != TRADING_VAULT_DISCRIMINATOR {"
+replace = "if false && vault.discriminator != TRADING_VAULT_DISCRIMINATOR {"
+
+[[claim]]
+row = "UpdateNAV: `vault.manager == manager`"
+file = "programs/openhl-core/src/lib.rs"
+in_fn = "fn process_vault_update_nav("
+find = "if vault.manager != *manager_ai.key.as_ref() {"
+replace = "if false && vault.manager != *manager_ai.key.as_ref() {"
+fuzz = ["account-swap", "ix vault_update_nav succeeded", "account 1 swapped"]

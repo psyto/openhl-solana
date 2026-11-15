@@ -7,6 +7,14 @@
 
 ---
 
+## この章の読み方
+
+この章で読む 4 つのハンドラは、2026-05-23 に Claude(Opus 4.7)と 1 つのコミットで書かれ、その SPL Token の預かりも同じ日に書かれた。このリポジトリの 106 コミットのうち 94 が Claude を共著者に挙げている。コンパイルは通り、テストも通り、この章の最初の版はそれを説明していた。その後の確認で、3 つの誤りが見つかっている。2026-11-04、solinv は、withdraw が別の vault の持ち分をこの vault の価格で焼けることを見つけた(§12.4)。同じ日にレビュアーが、市場のすべての vault が 1 つのトークン口座から払い出しており、NAV を水増しして申告したマネージャが他の vault のお金を持ち出せることを見つけた(§12.5)。どちらの修正も Claude(Opus 5.5)と書いた。そして 2026-11-15、検査を 1 つずつ消して確かめたところ(§12.7)、焼く持ち分を預金者が本当に持っているかの検査は、消してもリポジトリの何も気づかず、それがなければ 1 人の預金者が vault を空にできると分かった。今はテストで押さえてある。
+
+だから §12.1〜§12.6 はコードの主張として読み、§12.7 をその確認として読んでほしい。deposit・withdraw・NAV 更新のすべての検査を 1 つずつ消し、何が気づくかを見る。表は 1 回きりの測定ではない。[`fuzz/vault/unproven.toml`](../../fuzz/vault/unproven.toml) が各行をデータとして持ち、[unproven](https://github.com/fabrknt/unproven) が検査を 1 つずつ消してテスト・fuzzer・probe を走らせ直し、行がこのページの通りに読めなくなったら CI を落とす。
+
+---
+
 ## §12.0  はじめに — 名前についての明確化
 
 「vault」という単語はこのコードベースに 2 回登場する。
@@ -432,7 +440,7 @@ Vault ライフサイクル:
 
 上の 3 項目は計算を確かめる。アカウントの検査、つまり §12.3 と §12.4 にある、呼び出し側が**どの**アカウントを渡してよいかを決める `if ... { return Err(...) }` の行は、どれも確かめない。§12.4 の `share.vault` の行のように、そういう検査を 1 つ忘れても、書こうと思いつくテストはどれも落ちない。[solinv](https://github.com/psyto/solinv) は、ネイティブのプログラムに対してまさにこれを fuzz する。攻撃者が代わりに渡せるアカウント(他の預金者の share、別の vault、vault が持っていないトークン口座)を教えると、各命令でそのうち 1 つを差し替えて送る(組を宣言すれば、複数を一緒に差し替える)。差し替えた呼び出しが成功して状態が変われば、それが検出である。
 
-`fuzz/vault/` がこの章のためのハーネスである。1 つの市場に vault を 3 つ用意し、それぞれが自分のトークン口座を持つ。A と B が shares を持つ K の vault、A 自身の vault、屑の mint で作った C の vault だ。solinv は、README が誰にでも勧めている入れ方(git の rev)で入れてある。Solana のツールチェーンと Crucible CLI(`cargo install --locked --git https://github.com/asymmetric-research/crucible --tag v0.1.0 crucible-fuzz-cli`)が要る:
+`fuzz/vault/` がこの章のためのハーネスである。1 つの市場に vault を 3 つ用意し、それぞれが自分のトークン口座を持つ。A と B が shares を持つ K の vault、A 自身の vault、屑の mint で作った C の vault だ。K の vault での A の預け入れと引き出し、B の A の vault への最初の預け入れ、K の NAV 更新を送る。solinv は、README が誰にでも勧めている入れ方(git の rev)で入れてある。Solana のツールチェーンと Crucible CLI(`cargo install --locked --git https://github.com/asymmetric-research/crucible --tag v0.1.0 crucible-fuzz-cli`)が要る:
 
 ```bash
 cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
@@ -448,30 +456,58 @@ timeout -s INT 90 crucible run openhl_vault_fuzz invariant_vault \
 > **演習 §12.7.** `process_vault_withdraw` から `share.vault` の検査を消し、プログラムを作り直して(最初のコマンド)、fuzzer をもう一度走らせよ。数秒で次が出るはずだ:
 >
 > ```
-> [FUZZ_FINDING] [account-swap:…] ix vault_withdraw succeeded with account 1 swapped from <K's vault> to <A's vault> (different context, same shape)
+> [FUZZ_FINDING] [account-swap:…] ix vault_withdraw succeeded with account 2 swapped from <A's share of K's vault> to <A's share of A's vault> (different context, same shape)
 > ```
 >
-> `cargo test` も落ち、A がいくら持ち出したかが出る。検査を戻したら、ほかの検査も 1 つずつ消し、走らせる前に結果を予想せよ。私たちが各 60 秒で測った結果:
+> `cargo test` も落ち、A がいくら持ち出したかが出る。検査を戻したら、ほかの検査も 1 つずつ消し、走らせる前に結果を予想せよ。
 >
-> | 消した検査 | 捕まったか |
-> |---|---|
-> | withdraw: `owner.is_signer` | はい、signer-skip、slot 0 |
-> | withdraw: `share.vault == vault` | はい、account-swap、slot 1 |
-> | withdraw: `share.owner == owner` | はい、account-swap、slot 2 |
-> | deposit: share の PDA の導き直し | はい、account-swap、slot 1 |
-> | deposit: `verify_trading_vault_token` | はい、account-swap、slot 7 |
-> | deposit: `depositor.is_signer` | いいえ |
-> | withdraw: `vault.owner == program_id` | いいえ |
-> | withdraw: `share.owner == program_id` | いいえ |
-> | withdraw: `verify_trading_vault_token` | いいえ。下の 2 つの slot の組でも出ない |
+> deposit・withdraw・NAV 更新にあるすべての検査と、それを消したときに何が気づくかを示す。fuzz は各 60 秒。「拒否」は、リポジトリの何も気づかないが、別の仕組みが呼び出しを断ることを意味する。何が断ったかは最後の列に、ログから読んで書いた(`probe` テストが出力する)。「なし」は、ここにある何から見ても、検査がなくてもプログラムが同じに振る舞うことを意味する。同じ行が [`unproven.toml`](../../fuzz/vault/unproven.toml) にあり、プログラム・ハーネス・この章に触れる pull request のたびに CI が全行を測り直す(手元では `unproven fuzz/vault/unproven.toml`、約 30 分):
 >
-> 先を読む前に、「いいえ」の 4 行がなぜ「いいえ」なのかを考えよ。
+> | 消した検査 | 何が気づくか | どう気づいたか、または代わりに拒否したもの |
+> |---|---|---|
+> | Deposit: `assets != 0` | 拒否 | `shares_for_deposit`: `would mint 0 shares` |
+> | Deposit: `depositor.is_signer` | 拒否 | ランタイム: `Cross-program invocation with unauthorized signer`(`Transfer` には預金者の署名が要る) |
+> | Deposit: `vault.owner == program_id` | 拒否 | ランタイム: `instruction modified data of an account it does not own` |
+> | Deposit: システムプログラムの id | 拒否 | ランタイム: `An account required by the instruction is missing`(最初の預け入れで `create_account` は本物のシステムプログラムを名指すが、呼び出しがそれを持っていない) |
+> | Deposit: トークンプログラムの id | 拒否 | ランタイム: SPL Token について同じ |
+> | Deposit: `depositor_token.owner == SPL Token` | 拒否 | SPL Token の `Transfer` の中でランタイムが: `instruction modified data of an account it does not own` |
+> | Deposit: `verify_trading_vault_token` | **fuzzer**、account-swap、slot 7 | A の預け入れが A の vault のトークン口座に入り、K の vault に記帳された |
+> | Deposit: 持ち分の PDA | **fuzzer**、account-swap、slot 2 | A の預け入れが B の持ち分に記帳された |
+> | Deposit: vault の discriminator | なし | 今は届かない: プログラムが持つ 160 バイトのアカウントはすべて `TradingVault` |
+> | Deposit: `vault.market == market` | なし | 穴ではない: ハンドラは market のアカウントをほかに何にも使わない |
+> | Deposit: `vault.mint == mint` | なし | 穴ではない: mint も同じ。トークン口座の mint は SPL Token が照合する |
+> | Deposit: 持ち分の discriminator | なし | 今は届かない: プログラムが持つ 128 バイトのアカウントはすべて `VaultShare` |
+> | Withdraw: `shares != 0` | なし | 穴ではない: 0 を焼き、0 を払う |
+> | Withdraw: `owner.is_signer` | **fuzzer**、signer-skip | 誰でも A の持ち分を引き出せた |
+> | Withdraw: `vault.owner == program_id` | 拒否 | ランタイム: `instruction modified data of an account it does not own` |
+> | Withdraw: `share.owner == program_id` | 拒否 | ランタイム: 同じ |
+> | Withdraw: トークンプログラムの id | 拒否 | ランタイム: `An account required by the instruction is missing` |
+> | Withdraw: `owner_token.owner == SPL Token` | 拒否 | SPL Token の `Transfer` の中でランタイムが: `instruction modified data of an account it does not own` |
+> | Withdraw: `verify_trading_vault_token` | テスト | `withdraw_refuses_the_token_account_of_another_vault` がメッセージの照合で落ちる。呼び出し自体は SPL Token の authority の照合で今も拒否される |
+> | Withdraw: vault の discriminator | なし | Deposit と同じく、今は届かない |
+> | Withdraw: `vault.total_shares != 0` | なし | 空の vault は `assets_for_withdraw` も断る(`NoShares`)。ハーネスに空の vault はない |
+> | Withdraw: `vault.market == market` | なし | 穴ではない: vault は渡された market ではなく、自分のアカウントから読んだ seeds で署名する |
+> | Withdraw: `vault.mint == mint` | なし | 穴ではない: vault のトークン口座は PDA で決まっている |
+> | Withdraw: 持ち分の discriminator | なし | Deposit と同じく、今は届かない |
+> | Withdraw: `share.vault == vault` | **fuzzer**、account-swap、slot 2 | A の vault の A の持ち分が K の vault に対して焼かれた。`withdraw_refuses_a_share_from_another_vault` も落ちる |
+> | Withdraw: `share.owner == owner` | **fuzzer**、account-swap、slot 2 | A が B の持ち分を焼いた |
+> | Withdraw: `share.shares >= shares` | テスト(2026-11-15 に追加) | `withdraw_refuses_more_shares_than_held`: 100,000 持つ A が 200,000 を焼き、K のトークン 200,000 をすべて持ち出す |
+> | UpdateNAV: `manager.is_signer` | **fuzzer**、signer-skip | 誰でも K の NAV を書き換えられた |
+> | UpdateNAV: `vault.owner == program_id` | 拒否 | ランタイム: `instruction modified data of an account it does not own` |
+> | UpdateNAV: vault の discriminator | なし | Deposit と同じく、今は届かない |
+> | UpdateNAV: `vault.manager == manager` | **fuzzer**、account-swap、slot 1 | K が A の vault の NAV を書き換えた |
 >
-> 4 つとも、別の仕組みが裏で支えている。これらは攻撃を試しておらず、通り道が見つからなかっただけだ。2 つの所有者チェックは、ランタイム自身が支えている(第 1 章)。withdraw は両方のアカウントに書き込み、プログラムは自分が所有していないアカウントを変えられないので、すり替えたアカウントは次の CPI か命令の最後で落ちる。deposit の署名チェックは、ランタイムの署名の規則が支えている(第 6 章 §6.2)。deposit が呼ぶ SPL Token の `Transfer` は預金者を署名者として扱うが、プログラムは自分が受け取った署名しか渡せないので、SPL Token が動く前に CPI が落ちる(`Cross-program invocation with unauthorized signer`)。この 3 つも、早く、分かりやすいエラーで落ちるので、検査として残す価値はある。
+> fuzzer が 7、テストだけが 2、別の仕組みの拒否が 11、なしが 11。先を読む前に、「なし」の行を 1 つずつ取り、それが穴かどうかを考えよ。
 >
-> 4 つ目は SPL Token の authority の照合が支えている。vault は自分としてしか署名せず、各 vault のトークン口座はその vault にしか従わないので、払い出し元に別の vault のトークン口座を指定すると `OwnerMismatch` で落ちる。最初からそうだったわけではない。この章の最初の版では、市場のトークン口座はすべて 1 つの `vault_authority` の PDA(`[VAULT_AUTH_SEED, market]`)に従っており、この行は本物の穴だった。C は屑の mint で vault を開き、屑を 300,000 入れ、払い出し元に本物の mint のトークン口座を、送り先に C 自身の本物の mint の口座を指定して引き出し、屑 300,000 を本物 300,000 に換えた。これは**2 つ**のアカウントを同時に変える必要がある。solinv のふつうの account-swap は 1 度に 1 つの slot しか変えないので、最初の表はこの行を「いいえ」とし、害はないと書いていた。攻撃を見つけたのはレビュアーである。ハーネスは今もこの組を宣言しており(`check_sets`: C の屑の引き出しで、送り先と払い出し元を一緒に差し替える。払い出し元は今は K のトークン口座)、テスト `withdraw_refuses_the_token_account_of_another_vault` でも押さえてある。このテストがわざと K の残高より少ない 100,000 を求めているのには理由がある。K の口座の残高より多い 300,000 を求めると、SPL Token は authority を見る前に残高で拒否する。するとプログラムの照合を消しても出るのは「insufficient funds」で、この行を SPL Token が支えているかどうかは分からない。100,000 なら `OwnerMismatch` が出る。拒否から何かを結論するときは、**どの**拒否なのかを確かめよ。そして fuzzer の「いいえ」は、あなたが書いた差し替えでは通り道が見つからなかったという意味でしかない。通り道がないという意味ではない。
+> 1 つは穴だった。2026-11-15 まで `share.shares >= shares` の行は「なし」で、これが表でいちばん悪い行だ。プログラムはオーバーフロー検査なしでビルドされるので、比較がなければ `share.shares -= shares_to_burn` は失敗せずに桁が回り、払い出しは持っている持ち分ではなく焼いた持ち分で値付けされる。fuzzer が見つけなかったのは、その引き出しが最大 10,000 しか求めず、A が 100,000 持っているからだ。これは数についての規則で、アカウントを差し替える fuzzer が探すのは欠けた結び付けである。テストが書くまで、リポジトリの何もこの規則を述べていなかった。残る 10 の「なし」は、最後の列の理由で穴ではない。4 つは discriminator の検査で、プログラムが持つほかの型に同じ大きさのものがない限り届かない。そういう型ができた日に本物になり、ここにある何もそれを告げない。4 つは、ハンドラがほかの誰にも渡さないアカウントを比べているだけだ。残る 2 つのうち 1 つは害がなく(0 を焼き 0 を払う)、もう 1 つは空の vault を断る持ち分の計算が支えている。
 >
-> このハーネスが扱わないもの: §12.5 のマネージャが申告する NAV。嘘の NAV を申告するマネージャは、自分が渡してよいアカウントしか渡さないので、アカウントを差し替える fuzzer には差し替える物がない。市場全体に及ぶ形のこの穴は、9 つの検査がすべてそろっていても開いていた。塞いだのは 1 行ではなく設計の変更(vault ごとのトークン口座)である。残っているもの、つまりマネージャが自分の vault の預金者に嘘をつくことも、fuzzer からは同じく見えない。こういう穴を見つけるには、行を消すのではなく設計を読む必要がある。
+> 「拒否」の行は、ランタイムと SPL Token が支えている。所有者チェックはランタイム自身が支えている(第 1 章)。どのハンドラもそのアカウントに書き込み、プログラムは自分が所有していないアカウントを変えられない。probe はこれを、本物のアカウントを同じアドレスのまま別の所有者に渡して確かめる。solinv の owner-skip は写しを新しいアドレスに置くので、アドレスが PDA のアカウントでは seeds の照合が先に断り、所有者チェックについては何も分からない。deposit の署名チェックは、ランタイムの署名の規則が支えている(第 6 章 §6.2)。deposit が呼ぶ SPL Token の `Transfer` は預金者を署名者として扱うが、プログラムは自分が受け取った署名しか渡せない。プログラム id の検査は、CPI が呼ぶプログラムを id で名指していることが支えている。そのプログラムを持たない呼び出しは、何かが動く前に落ちる。どれも、早く、分かりやすいエラーで落ちるので、検査として残す価値はある。
+>
+> withdraw の `verify_trading_vault_token` の行は SPL Token の authority の照合が支えている。vault は自分としてしか署名せず、各 vault のトークン口座はその vault にしか従わないので、払い出し元に別の vault のトークン口座を指定すると落ちる。テストが削除に気づくのは、**どの**拒否だったかを確かめているからにすぎない。最初からそうだったわけではない。この章の最初の版では、市場のトークン口座はすべて 1 つの `vault_authority` の PDA(`[VAULT_AUTH_SEED, market]`)に従っており、この行は本物の穴だった。C は屑の mint で vault を開き、屑を 300,000 入れ、払い出し元に本物の mint のトークン口座を、送り先に C 自身の本物の mint の口座を指定して引き出し、屑 300,000 を本物 300,000 に換えた。これは**2 つ**のアカウントを同時に変える必要がある。solinv のふつうの account-swap は 1 度に 1 つの slot しか変えないので、最初の表はこの行を「いいえ」とし、害はないと書いていた。攻撃を見つけたのはレビュアーである。ハーネスは今もこの組を宣言している(`check_sets`: C の屑の引き出しで、送り先と払い出し元を一緒に差し替える。払い出し元は今は K のトークン口座)。テストがわざと K の残高より少ない 100,000 を求めているのには理由がある。K の口座の残高より多い 300,000 を求めると、SPL Token は authority を見る前に残高で拒否する。するとプログラムの照合を消しても出るのは「insufficient funds」で、この行を SPL Token が支えているかどうかは分からない。拒否から何かを結論するときは、**どの**拒否なのかを確かめよ。そして fuzzer の「いいえ」は、あなたが書いた差し替えでは通り道が見つからなかったという意味でしかない。通り道がないという意味ではない。
+>
+> 表は一度、誰も気づかないうちにずれていた。手で測った最初の版は、deposit の持ち分の PDA と withdraw の `share.vault` の検査が slot 1(vault)で捕まると書いていた。測ったのは、まだすべての vault が 1 つのトークン口座を共有していた同じ日のことだ。vault ごとにトークン口座ができてからは、差し替えた vault はどちらの検査に届く前に `verify_trading_vault_token` で落ち、両方とも表の通り slot 2(持ち分)で捕まる。上の演習も同じ slot を書いており、どちらも 11 日間古いままだった。表を CI が測るデータにしたのはそのためだ。
+>
+> このハーネスが扱わないもの: §12.5 のマネージャが申告する NAV と、表にない `CreateTradingVault`。嘘の NAV を申告するマネージャは、自分が渡してよいアカウントしか渡さないので、アカウントを差し替える fuzzer には差し替える物がない。市場全体に及ぶ形のこの穴は、上の検査がすべてそろっていても開いていた。塞いだのは 1 行ではなく設計の変更(vault ごとのトークン口座)である。残っているもの、つまりマネージャが自分の vault の預金者に嘘をつくことも、fuzzer からは同じく見えない。こういう穴を見つけるには、行を消すのではなく設計を読む必要がある。
 
 ---
 
