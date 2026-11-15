@@ -7,6 +7,18 @@
 
 ---
 
+## この章の読み方
+
+この章で読む 3 つのハンドラは、2026-05-23 に Claude(Opus 4.7)との 1 回の作業で書かれた。このリポジトリの最初の 104 コミットのうち 92 が Claude を共著者に挙げている。コンパイルは通り、テストも通り、この章の最初の版はそれを説明していた。5 か月半後、fuzzer が 3 つとも別の市場のオラクルを受け入れることを見つけた。200 入れて 1,200 出せた(§11.3)。
+
+これからのコードは、多くがこう読まれる。AI が書き、人はその主張を確かめることで理解する。だからこの章は 2 つに分かれている。§11.1〜§11.6 は今のコードを読む。§11.7 はコードの中の検査を並べ、それぞれ消したら何が起きるかを問う。予想し、消し、走らせ、表と比べる。外れた行が、まだ理解していなかったところだ。
+
+表は 1 回きりの測定ではない。[`fuzz/positions/unproven.toml`](../../fuzz/positions/unproven.toml) が各行をデータとして持ち、[unproven](https://github.com/fabrknt/unproven) が検査を 1 つずつ消してテスト・fuzzer・probe を走らせ直し、行がこのページの通りに読めなくなったら CI を落とす。コードが変わって章が変わらなければ、ビルドがそれを告げる。
+
+> **章を通して持っておく問い。** 2026-02-15、貸し借りのプロトコル Moonwell は cbETH を約 2,200 ドルではなく約 1.12 ドルと値付けし、続く清算で 1,779,044.83 ドルの不良債権が残った([The Block](https://www.theblock.co/post/390302/defi-lending-protocol-moonwell-hit-with-1-8-million-bad-debt-after-oracle-misconfiguration))。価格フィードは正直だった。設定が cbETH/ETH の交換比率をドル建ての価格として使い、ETH/USD を掛けていなかった。監査人が、その pull request のコミットは Claude Opus 4.6 との共著だと指摘した。Moonwell 自身は AI のせいとはしておらず、人でも起こしうる間違いだ。§11.3 の穴は同じ系統にある。どの価格も正直で、ただ別の市場のものだった。ここでそれを止めている検査はどれか、それが消えたら何が捕まえるか、来月もそれが残っているとどうやってわかるか。
+
+---
+
 ## §11.0  はじめに
 
 これが収束の章だ。他のすべての Phase A と Phase B のプリミティブ — オラクル、ファンディング、vault、マッチャ、並列性 — はこの章が書けるために存在する。`OpenPosition` / `ClosePosition` / `Liquidate` のない perp DEX は piece の寄せ集めで、それらを持つ perp DEX は perp DEX だ。
@@ -488,7 +500,7 @@ timeout -s INT 60 crucible run openhl_positions_fuzz invariant_ch11 \
 
 slot 3 はオラクルだ。Crucible は最初の検出で 1 回の実行を止めるので、Close と Liquidate には順番が回ってこなかった。その 2 つはテスト `close_refuses_another_markets_oracle` と `liquidate_refuses_another_markets_oracle` で押さえてある。
 
-> **演習 §11.7.** 検査を 1 つずつ消し、作り直して走らせよ。先に予想すること。私たちが各 45 秒で測った結果を示す。「いいえ」の行の最後の列は、差し替えた呼び出しを代わりに拒否したもので、ログから読んだ(`probe` テストが出力する):
+> **演習 §11.7.** 検査を 1 つずつ消し、作り直して走らせよ。先に予想すること。私たちが各 45 秒で測った結果を示す。「いいえ」の行の最後の列は、差し替えた呼び出しを代わりに拒否したもので、ログから読んだ(`probe` テストが出力する)。同じ行が [`unproven.toml`](../../fuzz/positions/unproven.toml) にあり、プログラム・ハーネス・この章に触れる pull request のたびに CI が全行を測り直す(手元では `unproven fuzz/positions/unproven.toml`、約 15 分):
 >
 > | 消した検査 | 捕まったか | どう捕まったか、または代わりに拒否したもの |
 > |---|---|---|

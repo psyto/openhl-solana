@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "solinv": {
+      "type": "stdio",
+      "command": "solinv",
+      "args": [
+        "mcp"
+      ],
+      "env": {}
+    }
+  }
+}

@@ -7,6 +7,14 @@
 
 ---
 
+## How to read this chapter
+
+The four handlers this chapter walks through were written on 2026-05-23 with Claude (Opus 4.7), in one commit, and their SPL Token escrow the same day; 94 of this repository's 106 commits name Claude as a co-author. They compiled, their tests passed, and the first version of this chapter explained them. Checking has since found three things wrong. On 2026-11-04 solinv found that withdraw would burn a share of another vault at this vault's price (§12.4), and a reviewer found that every vault in a market paid out of one token account, so a manager who over-reported NAV took other vaults' money (§12.5). Both fixes were written with Claude too (Opus 5.5). And on 2026-11-15, deleting each check in turn (§12.7) found that nothing in the repository noticed when the check that a depositor holds the shares they burn was gone, and that without it one depositor could empty the vault. It is now pinned by a test.
+
+So read §12.1–§12.6 as what the code claims, and §12.7 as the checking of it: every check in deposit, withdraw and NAV update, deleted one at a time, and what notices. The table is not a one-off measurement. [`fuzz/vault/unproven.toml`](../../fuzz/vault/unproven.toml) holds each row as data, and [unproven](https://github.com/fabrknt/unproven) deletes each check, reruns the tests, the fuzzer and the probe, and fails CI if a row no longer reads the way this page says.
+
+---
+
 ## §12.0  Framing — and a naming clarification
 
 The word "vault" appears twice in this codebase:
@@ -434,7 +442,7 @@ Singleton-write reassertion (Ch.5 redux):
 
 Three exercises check the arithmetic. None of them checks the account checks: the `if ... { return Err(...) }` lines in §12.3 and §12.4 that decide *which* accounts a caller may pass. Forgetting one of those fails no test you would think to write, as §12.4's `share.vault` line shows. [solinv](https://github.com/psyto/solinv) fuzzes a native program for exactly this. You tell it which accounts an attacker could pass instead (another depositor's share, another vault, a token account the vault doesn't hold), and it sends each instruction with one of them swapped in, or, for a set you declare, several together. If a swapped call succeeds and changes state, that is a finding.
 
-`fuzz/vault/` is that harness for this chapter. It sets up one market with three vaults, each with its own token account: K's, where A and B hold shares, A's own, and C's in a junk mint. It installs solinv the way its README tells anyone to, by git rev. You need the Solana toolchain and the Crucible CLI (`cargo install --locked --git https://github.com/asymmetric-research/crucible --tag v0.1.0 crucible-fuzz-cli`):
+`fuzz/vault/` is that harness for this chapter. It sets up one market with three vaults, each with its own token account: K's, where A and B hold shares, A's own, and C's in a junk mint. It sends A's deposit and withdrawal in K's vault, B's first deposit into A's vault, and K's NAV update. It installs solinv the way its README tells anyone to, by git rev. You need the Solana toolchain and the Crucible CLI (`cargo install --locked --git https://github.com/asymmetric-research/crucible --tag v0.1.0 crucible-fuzz-cli`):
 
 ```bash
 cargo build-sbf --manifest-path programs/openhl-core/Cargo.toml
@@ -450,30 +458,58 @@ On the program as it is, no `[FUZZ_FINDING]` line appears. (Crucible checks `--t
 > **Exercise §12.7.** Delete the `share.vault` check from `process_vault_withdraw`, rebuild the program (the first command), and run the fuzzer again. Within a few seconds you should see:
 >
 > ```
-> [FUZZ_FINDING] [account-swap:…] ix vault_withdraw succeeded with account 1 swapped from <K's vault> to <A's vault> (different context, same shape)
+> [FUZZ_FINDING] [account-swap:…] ix vault_withdraw succeeded with account 2 swapped from <A's share of K's vault> to <A's share of A's vault> (different context, same shape)
 > ```
 >
-> `cargo test` fails too, and its message tells you how much A took. Put the check back. Then delete the others one at a time and predict the result before you run it. Here is what we measured, 60 seconds each:
+> `cargo test` fails too, and its message tells you how much A took. Put the check back. Then delete the others one at a time and predict the result before you run it.
 >
-> | Check deleted | Caught? |
-> |---|---|
-> | withdraw: `owner.is_signer` | yes, signer-skip, slot 0 |
-> | withdraw: `share.vault == vault` | yes, account-swap, slot 1 |
-> | withdraw: `share.owner == owner` | yes, account-swap, slot 2 |
-> | deposit: the share PDA re-derivation | yes, account-swap, slot 1 |
-> | deposit: `verify_trading_vault_token` | yes, account-swap, slot 7 |
-> | deposit: `depositor.is_signer` | no |
-> | withdraw: `vault.owner == program_id` | no |
-> | withdraw: `share.owner == program_id` | no |
-> | withdraw: `verify_trading_vault_token` | no, not even with the two-slot set below |
+> Here is every check in deposit, withdraw and NAV update, and what notices when it is deleted, 60 seconds of fuzzing each. "Refused" means nothing in the repository notices, because something else turns the call down; the last column, read from the logs (the `probe` test prints them), says what. "Nothing" means the program behaves the same without the check, as far as anything here can tell. The same rows are in [`unproven.toml`](../../fuzz/vault/unproven.toml), and CI re-measures every one on each pull request that touches the program, the harness or this chapter (`unproven fuzz/vault/unproven.toml` runs it locally, about 30 minutes):
 >
-> Before reading on, work out why the four "no" rows come back "no".
+> | Check deleted | What notices | How, or what refused it instead |
+> |---|---|---|
+> | Deposit: `assets != 0` | refused | `shares_for_deposit`: `would mint 0 shares` |
+> | Deposit: `depositor.is_signer` | refused | the runtime: `Cross-program invocation with unauthorized signer` (the `Transfer` needs the depositor's signature) |
+> | Deposit: `vault.owner == program_id` | refused | the runtime: `instruction modified data of an account it does not own` |
+> | Deposit: the system program's id | refused | the runtime: `An account required by the instruction is missing` (on a first deposit, `create_account` names the real system program, and the call does not carry it) |
+> | Deposit: the token program's id | refused | the runtime: the same, for SPL Token |
+> | Deposit: `depositor_token.owner == SPL Token` | refused | the runtime, inside SPL Token's `Transfer`: `instruction modified data of an account it does not own` |
+> | Deposit: `verify_trading_vault_token` | **the fuzzer**, account-swap, slot 7 | A's deposit paid into A's vault's token account, credited in K's |
+> | Deposit: the share PDA | **the fuzzer**, account-swap, slot 2 | A's deposit credited to B's share |
+> | Deposit: the vault's discriminator | nothing | not reachable today: every 160-byte account the program owns is a `TradingVault` |
+> | Deposit: `vault.market == market` | nothing | not a hole: the handler uses the market account for nothing else |
+> | Deposit: `vault.mint == mint` | nothing | not a hole: the same for the mint; SPL Token checks the token accounts' mints |
+> | Deposit: the share's discriminator | nothing | not reachable today: every 128-byte account the program owns is a `VaultShare` |
+> | Withdraw: `shares != 0` | nothing | not a hole: burns 0 shares, pays 0 |
+> | Withdraw: `owner.is_signer` | **the fuzzer**, signer-skip | anyone could withdraw A's shares |
+> | Withdraw: `vault.owner == program_id` | refused | the runtime: `instruction modified data of an account it does not own` |
+> | Withdraw: `share.owner == program_id` | refused | the runtime: the same |
+> | Withdraw: the token program's id | refused | the runtime: `An account required by the instruction is missing` |
+> | Withdraw: `owner_token.owner == SPL Token` | refused | the runtime, inside SPL Token's `Transfer`: `instruction modified data of an account it does not own` |
+> | Withdraw: `verify_trading_vault_token` | a test | `withdraw_refuses_the_token_account_of_another_vault` fails on its message; the call is still refused, by SPL Token's authority check |
+> | Withdraw: the vault's discriminator | nothing | not reachable today, as for Deposit |
+> | Withdraw: `vault.total_shares != 0` | nothing | `assets_for_withdraw` refuses an empty vault too (`NoShares`); no vault in the harness is empty |
+> | Withdraw: `vault.market == market` | nothing | not a hole: the vault signs with seeds read from its own account, not from the market passed |
+> | Withdraw: `vault.mint == mint` | nothing | not a hole: the vault's token account is fixed by its PDA |
+> | Withdraw: the share's discriminator | nothing | not reachable today, as for Deposit |
+> | Withdraw: `share.vault == vault` | **the fuzzer**, account-swap, slot 2 | A's share of A's vault burned against K's; `withdraw_refuses_a_share_from_another_vault` fails |
+> | Withdraw: `share.owner == owner` | **the fuzzer**, account-swap, slot 2 | A burned B's shares |
+> | Withdraw: `share.shares >= shares` | a test (added 2026-11-15) | `withdraw_refuses_more_shares_than_held`: A, holding 100,000 shares, burns 200,000 and takes all of K's 200,000 tokens |
+> | UpdateNAV: `manager.is_signer` | **the fuzzer**, signer-skip | anyone could set K's NAV |
+> | UpdateNAV: `vault.owner == program_id` | refused | the runtime: `instruction modified data of an account it does not own` |
+> | UpdateNAV: the vault's discriminator | nothing | not reachable today, as for Deposit |
+> | UpdateNAV: `vault.manager == manager` | **the fuzzer**, account-swap, slot 1 | K set the NAV of A's vault |
 >
-> All four are backed by something else. We did not try to exploit these, we only found no way through. The two owner checks are backed by the runtime itself (Chapter 1): withdraw writes both accounts, and a program cannot change an account it does not own, so a substituted account fails at the next CPI or at the end of the instruction. The deposit signer check is backed by the runtime's signer rule (Chapter 6 §6.2): deposit's SPL Token `Transfer` marks the depositor as a signer, and a program can pass on only the signatures it was given, so the CPI fails (`Cross-program invocation with unauthorized signer`) before SPL Token runs. These three are still worth keeping, because they fail earlier and with a clearer error.
+> Seven by the fuzzer, two by a test only, eleven refused by something else, eleven by nothing. Before reading on, take the "nothing" rows and ask of each: is that a hole?
 >
-> The fourth is backed by SPL Token's authority check. A vault signs only as itself, and each vault's token account answers only to its own vault, so naming another vault's token account as the source fails with `OwnerMismatch`. It was not always so. In the first version of this chapter every token account in the market answered to one `vault_authority` PDA, `[VAULT_AUTH_SEED, market]`, and this row was a real hole: C opened a vault in a junk mint, deposited 300,000 junk, and withdrew it naming the real mint's token account as the source and C's own real-mint account as the destination, swapping 300,000 junk for 300,000 real. That takes *two* accounts changed together. solinv's plain account-swap changes one slot at a time, our first table listed the row as "no" and called it harmless, and a reviewer found the attack. The harness still declares that pair (`check_sets`: C's junk withdrawal with the destination and the source swapped together, now for K's token account), and the test `withdraw_refuses_the_token_account_of_another_vault` pins it. That test asks for 100,000, under K's balance, on purpose. Asking for 300,000, more than K's account holds, SPL Token refuses on the balance before it looks at the authority, so with the program's check deleted you would see "insufficient funds" and learn nothing about whether SPL Token backs the row. With 100,000 you see `OwnerMismatch`. When you reason from a refusal, check *which* refusal. And a "no" from a fuzzer means only that the swaps you described found no way through. It does not mean there is none.
+> One was. Until 2026-11-15 the `share.shares >= shares` row read "nothing", and it is the worst row in the table. The program is built without overflow checks, so without the comparison `share.shares -= shares_to_burn` wraps around instead of failing, and the payout is priced on the shares burned, not the shares held. The fuzzer did not find it because its withdrawals ask for at most 10,000 shares and A holds 100,000; it is a rule about numbers, and a fuzzer that swaps accounts looks for missing bindings. Nothing in the repository stated the rule until the test did. The other eleven "nothing" rows are not holes, for the reasons in the last column. Five are discriminator checks that cannot be reached while no other account type the program owns has the same size; they become real the day one does, and nothing here would say so. Four compare an account the handler passes on to no one. Of the last two, one is harmless (it burns 0 shares and pays 0), and the other is backed by the share math, which refuses an empty vault too.
 >
-> What the harness does not cover: §12.5's manager-reported NAV. A manager who reports a false NAV passes only accounts they are entitled to pass, so a fuzzer that swaps accounts has nothing to swap. The market-wide version of that hole survived all nine checks; closing it took a design change (one token account per vault), not a line. What is left, a manager misreporting to their own depositors, is just as invisible to the fuzzer. Finding these takes reading the design, not deleting lines.
+> The refused rows are backed by the runtime and by SPL Token. The owner checks are backed by the runtime itself (Chapter 1): each handler writes the account, and a program cannot change an account it does not own. The probe tests this by handing the real account to another owner at the same address. solinv's owner-skip puts the copy at a new address instead, so for an account whose address is a PDA the seed check refuses it first, and you learn nothing about the owner check. The deposit signer check is backed by the runtime's signer rule (Chapter 6 §6.2): deposit's SPL Token `Transfer` marks the depositor as a signer, and a program can pass on only the signatures it was given. The program-id checks are backed by the CPI naming its program by id: a call that does not carry that program fails before anything runs. All of these are still worth keeping, because they fail earlier and with a clearer error.
+>
+> The withdraw `verify_trading_vault_token` row is backed by SPL Token's authority check. A vault signs only as itself, and each vault's token account answers only to its own vault, so naming another vault's token account as the source fails. The test notices the deletion only because it asserts *which* refusal it got. It was not always so. In the first version of this chapter every token account in the market answered to one `vault_authority` PDA, `[VAULT_AUTH_SEED, market]`, and this row was a real hole: C opened a vault in a junk mint, deposited 300,000 junk, and withdrew it naming the real mint's token account as the source and C's own real-mint account as the destination, swapping 300,000 junk for 300,000 real. That takes *two* accounts changed together. solinv's plain account-swap changes one slot at a time, our first table listed the row as "no" and called it harmless, and a reviewer found the attack. The harness still declares that pair (`check_sets`: C's junk withdrawal with the destination and the source swapped together, now for K's token account). The test asks for 100,000, under K's balance, on purpose. Asking for 300,000, more than K's account holds, SPL Token refuses on the balance before it looks at the authority, so with the program's check deleted you would see "insufficient funds" and learn nothing about whether SPL Token backs the row. When you reason from a refusal, check *which* refusal. And a "no" from a fuzzer means only that the swaps you described found no way through. It does not mean there is none.
+>
+> The table also drifted once without anyone noticing. Its first version, measured by hand, said the deposit share PDA and the withdraw `share.vault` check were caught at slot 1, the vault. It was measured while every vault still shared one token account, the same day. Once each vault had its own, a swapped vault fails `verify_trading_vault_token` before it reaches either check, and both are now caught at slot 2, the share, as the table says. The exercise above printed the same slot, and both stayed stale for eleven days. That is why the table is now data that CI measures.
+>
+> What the harness does not cover: §12.5's manager-reported NAV, and `CreateTradingVault`, which is not in the table. A manager who reports a false NAV passes only accounts they are entitled to pass, so a fuzzer that swaps accounts has nothing to swap. The market-wide version of that hole survived every check above; closing it took a design change (one token account per vault), not a line. What is left, a manager misreporting to their own depositors, is just as invisible to the fuzzer. Finding these takes reading the design, not deleting lines.
 
 ---
 
