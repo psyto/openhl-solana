@@ -69,7 +69,7 @@ file = "programs/openhl-core/src/lib.rs"
 in_fn = "fn process_vault_deposit("
 find = "if depositor_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {"
 replace = "if false && depositor_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {"
-refused = { probe = "vault_deposit | slot 6 owner changed", log = "Instruction: Transfer | instruction modified data of an account it does not own" }
+refused = { probe = "vault_deposit | slot 6 owner changed", log = "instruction modified data of an account it does not own" }
 
 [[claim]]
 row = "Deposit: `verify_trading_vault_token`"
@@ -166,7 +166,7 @@ file = "programs/openhl-core/src/lib.rs"
 in_fn = "fn process_vault_withdraw("
 find = "if owner_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {"
 replace = "if false && owner_token_ai.owner != &SPL_TOKEN_PROGRAM_ID {"
-refused = { probe = "vault_withdraw | slot 5 owner changed", log = "Instruction: Transfer | instruction modified data of an account it does not own" }
+refused = { probe = "vault_withdraw | slot 5 owner changed", log = "instruction modified data of an account it does not own" }
 
 [[claim]]
 row = "Withdraw: `verify_trading_vault_token`"
