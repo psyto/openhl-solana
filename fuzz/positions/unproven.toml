@@ -1,9 +1,9 @@
 # The table in Chapter 11, Exercise §11.7, as data: for each check, what
-# deleting it does. `tools/claims` deletes each one in turn, rebuilds, runs the
+# deleting it does. [unproven](https://github.com/fabrknt/unproven) deletes each one in turn, rebuilds, runs the
 # tests, the fuzzer and the probe, and fails if a row no longer reads the way
 # the chapter prints it.
 #
-#   cargo run --release --manifest-path tools/claims/Cargo.toml -- fuzz/positions/claims.toml
+#   unproven fuzz/positions/unproven.toml
 #
 # A deletion is `find` -> `replace` inside `in_fn`. `false && ` turns a check
 # off without touching what follows; mind the precedence when the condition

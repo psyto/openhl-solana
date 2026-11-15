@@ -15,3 +15,9 @@ test-ledger/
 !Cargo.json
 !scenarios/*.json
 !.mcp.json
+
+# unproven (fabrknt/unproven) holds this while it runs
+.unproven.lock
+*.unproven-orig
+*.unproven-orig.partial
+*.unproven-restore

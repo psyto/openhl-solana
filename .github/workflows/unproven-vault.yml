@@ -37,7 +37,7 @@ jobs:
             ~/.cargo/git
             ~/.local/share/solana
             ~/.cache/solana
-          key: unproven-tools-${{ runner.os }}-agave-4.1.2-crucible-v0.1.0-unproven-9b9c1f0
+          key: unproven-tools-${{ runner.os }}-agave-4.1.2-crucible-v0.1.0-unproven-v0.1.0
 
       - name: Install the Solana toolchain
         run: |
@@ -51,11 +51,10 @@ jobs:
           command -v crucible || cargo install --locked \
             --git https://github.com/asymmetric-research/crucible --tag v0.1.0 crucible-fuzz-cli
 
-      # unproven has no release tag yet; pinned to the commit its 0.1 is.
       - name: Install unproven
         run: |
           command -v unproven || cargo install --locked \
-            --git https://github.com/fabrknt/unproven --rev 9b9c1f0a824cfa240fb75d5f8a4bf4202b100ad5
+            --git https://github.com/fabrknt/unproven --tag v0.1.0
 
       - name: Re-measure the §12.7 table
         run: unproven fuzz/vault/unproven.toml

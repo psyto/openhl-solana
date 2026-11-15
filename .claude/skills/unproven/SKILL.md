@@ -30,8 +30,10 @@ has found since, including what was wrong.
 
 Pick one unit (a handler, an instruction, a contract function). List every check in it: each
 condition that returns an error or reverts, each binding of one account or argument to another,
-each call to a `verify_*` / `require*` helper. For a Solana program, `solinv map` lists the account
-checks for you if it is installed.
+each call to a `verify_*` / `require*` helper. For a Solana program, `solinv mutate plan --src
+<file> --only-fn <fn> ...` lists candidates if solinv is installed, but read the function anyway:
+it does not list every comparison (a numeric `if a < b { return Err }`) or helper call, and the
+one it misses may be the one that matters.
 
 ## 2. Write a row for each
 
@@ -48,12 +50,16 @@ fuzz = ["account-swap", "close_position", "account 1 swapped"]   # or tests_fail
 ```
 
 Turn a check off with the smallest edit: `if false && <cond> {`, or delete a `verify_*(...)?;`
-line. Each row says what notices, in one of four ways:
+line. `in_fn` must occur once in the file and `find` once inside that function (to its matching
+closing brace); if not, the CLI stops rather than guess, so add context to make them unique. Each row says what notices, in one of four ways:
 
 - `fuzz = [...]`: a fuzzer finding containing every piece of text.
-- `tests_fail = [...]`: exactly these tests fail, every other passes.
-- `refused = { probe = "...", log = "..." }`: nothing above notices, because something else
-  refuses the call (the runtime, another check, the token program); `log` names it.
+- `tests_fail = [...]`: exactly these tests fail, every other passes. Name each by its full
+  path (`tests::x`) or by its bare name if no other failing test ends the same way.
+- `refused = { probe = "<spec> | <variant>", log = "..." }`: nothing above notices, because
+  something else refuses the call (the runtime, another check, the token program). The probe
+  command prints one line per call, `PROBE <spec> | <variant> | ok=<bool> | <log>...`; the line
+  is picked by spec and variant exactly, must say `ok=false`, and `log` names what refused it.
 - none of these: **unproven**. Nothing in the repository notices the check is gone.
 
 ## 3. Predict, then measure
@@ -64,7 +70,8 @@ Write your prediction for a row before you run it. Then:
 unproven unproven.toml --no-baseline --only "<part of the row>"
 ```
 
-On `MISMATCH` the CLI prints what it saw. Read it, find out why, and fix the row or your
+On `ok` the CLI prints what it was decided on (the finding, the failed tests, or the probe line);
+copy the wording for the table from there. On `MISMATCH` it prints what it saw. Read it, find out why, and fix the row or your
 understanding, not the CLI's verdict. The rows you predicted wrong are what you did not
 understand yet; say so in what you write.
 
@@ -81,6 +88,12 @@ understand yet; say so in what you write.
 - **A fuzzer's "no" is not "no hole".** A fuzzer that swaps accounts finds missing bindings, not
   numeric rules (margins, limits, fees). A rule nothing writes down shows up as unproven or as
   refused; write a test that states the rule, and the row becomes `tests_fail`.
+- **A test that only checks the message.** A row reads "test" when the test fails, even if it
+  fails only because the error text changed while the call is still refused by something else.
+  Say which in the table.
+- **A wide input range hides nothing; a narrow one can.** If the fuzzer's amounts are small, an
+  overflow past a deleted bound never happens. An unproven numeric check deserves one test with
+  the extreme value before you call it harmless.
 - **A finding that is not a hole.** A permissionless call whose signer check is deleted is caught
   (signer-skip) but lets in no one who was not already allowed. Keep the row, and say why it is
   not a hole.
